@@ -26,4 +26,5 @@
 ## 入口
 
 安装后，启动Koreader，你的Koreader书籍列表中的第一本书会变成【微信读书】，点击即进入
+
 <img width="295" height="480" alt="image" src="https://github.com/user-attachments/assets/1f5b0254-e7e2-4ccf-9d2f-4e0aafb417c1" />
