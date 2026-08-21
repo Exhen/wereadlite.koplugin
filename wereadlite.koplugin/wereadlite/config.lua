@@ -1,6 +1,6 @@
 local C = {
     NAME = "微信读书",
-    VERSION = "0.1.0",
+    VERSION = "0.1.1",
     PLUGIN_DIR = "wereadlite.koplugin",
     SETTINGS_FILE = "wereadlite.lua",
     ENTRY_FILENAME = "微信读书.epub",
@@ -23,6 +23,8 @@ local C = {
     CATALOG_MORE_URL = "https://weread.qq.com/wrwebsimplenjlogic/api/catalogloadmore",
     READER_FONT_URL = "https://cdn.weread.qq.com/app/assets/test-font/fzys_reversed.ttf",
     BOOKREAD_URL = "https://weread.qq.com/wrwebsimplenjlogic/api/bookread?platform=desktop",
+    ADD_BOOKMARK_URL = "https://weread.qq.com/wrwebsimplenjlogic/api/addbookmark?platform=desktop",
+    REMOVE_BOOKMARK_URL = "https://weread.qq.com/wrwebsimplenjlogic/api/removebookmark?platform=desktop",
     SKILL_PAGE = "https://weread.qq.com/r/weread-skills",
     SKILL_APIKEY_URL = "https://weread.qq.com/api/skills/apikeyGet",
     SKILL_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway",

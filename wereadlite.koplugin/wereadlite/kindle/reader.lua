@@ -412,6 +412,7 @@ function Reader.parse(html)
         chapter_offset = chapter_offset,
         chapter_count = count,
         need_pay = paid,
+        book_version = as_number(book_info.version or book_info.bookVersion),
         token = tostring(html or ""):match('reader:{bookId:[%w_]+,token:"([^"]+)"') or "",
         env = env,
     }
@@ -710,6 +711,9 @@ function Reader.load(url, book, on_progress)
         end
         if book.author and as_text(state.book_info.author) == "" then
             state.book_info.author = book.author
+        end
+        if (not state.book_version or state.book_version == 0) then
+            state.book_version = as_number(state.book_info.version or state.book_info.bookVersion)
         end
         pcall(BookDb.save, state.book_info)
     end

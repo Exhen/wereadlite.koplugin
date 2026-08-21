@@ -16,6 +16,9 @@ local Settings = {
     CARD_RADIUS_MIN = 0,
     CARD_RADIUS_MAX = 24,
     CARD_RADIUS_DEFAULT = 0,
+    GRID_FONT_MIN = 12,
+    GRID_FONT_MAX = 28,
+    GRID_FONT_DEFAULT = 18,
     IMAGE_CONCURRENCY_MIN = 1,
     IMAGE_CONCURRENCY_MAX = 8,
     IMAGE_CONCURRENCY_DEFAULT = 4,
@@ -728,6 +731,70 @@ function Settings.set_show_book_title(value)
     return value
 end
 
+-- Base size for grid meta text (maps to former xx_smallinfofont ≈ 18).
+function Settings.grid_font_size()
+    local data = Settings.load()
+    return clamp(
+        data:readSetting("grid_font_size"),
+        Settings.GRID_FONT_MIN,
+        Settings.GRID_FONT_MAX,
+        Settings.GRID_FONT_DEFAULT
+    )
+end
+
+function Settings.set_grid_font_size(value)
+    value = clamp(
+        value,
+        Settings.GRID_FONT_MIN,
+        Settings.GRID_FONT_MAX,
+        Settings.GRID_FONT_DEFAULT
+    )
+    local data = Settings.load()
+    data:saveSetting("grid_font_size", value)
+    data:flush()
+    Log.info("settings", "grid_font_size", { value = value })
+    return value
+end
+
+-- kind: "meta" | "body" | "title"
+function Settings.grid_face(kind)
+    local Font = require("ui/font")
+    local base = Settings.grid_font_size()
+    local size = base
+    if kind == "body" then
+        size = base + 2
+    elseif kind == "title" then
+        size = base + 6
+    end
+    return Font:getFace("infofont", size)
+end
+
+function Settings.show_grid_font_dialog(on_changed)
+    local SpinWidget = require("ui/widget/spinwidget")
+    UIManager:show(SpinWidget:new{
+        title_text = "宫格字号",
+        info_text = "调整首页宫格内文字大小（书名、功能卡片等）",
+        value = Settings.grid_font_size(),
+        value_min = Settings.GRID_FONT_MIN,
+        value_max = Settings.GRID_FONT_MAX,
+        default_value = Settings.GRID_FONT_DEFAULT,
+        value_step = 1,
+        value_hold_step = 2,
+        precision = "%d",
+        ok_text = "应用",
+        cancel_text = "取消",
+        ok_always_enabled = true,
+        default_text = string.format("恢复默认 %d", Settings.GRID_FONT_DEFAULT),
+        callback = function(spin)
+            local old = Settings.grid_font_size()
+            local value = Settings.set_grid_font_size(spin.value)
+            if value ~= old and on_changed then
+                on_changed()
+            end
+        end,
+    })
+end
+
 function Settings.show_book_title_dialog(on_changed)
     local dialog
     local current = Settings.show_book_title()
@@ -792,6 +859,15 @@ function Settings.show_menu(on_changed, on_search)
                     callback = function()
                         UIManager:close(menu)
                         Settings.show_book_title_dialog(on_changed)
+                    end,
+                },
+            },
+            {
+                {
+                    text = string.format("宫格字号  %d", Settings.grid_font_size()),
+                    callback = function()
+                        UIManager:close(menu)
+                        Settings.show_grid_font_dialog(on_changed)
                     end,
                 },
             },

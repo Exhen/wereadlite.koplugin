@@ -6,6 +6,7 @@ local Log = require("wereadlite.log")
 local Reader = require("wereadlite.kindle.reader")
 local BookDb = require("wereadlite.book_db")
 local Heartbeat = require("wereadlite.kindle.heartbeat")
+local Bookmark = require("wereadlite.kindle.bookmark")
 
 local Reading = {
     book = nil,
@@ -676,11 +677,76 @@ local function install_toc_hook()
     Log.dbg("reading", "hook", { name = "toc" })
 end
 
+local function install_highlight_hook()
+    local ok, ReaderHighlight = pcall(require, "apps/reader/modules/readerhighlight")
+    if not ok or not ReaderHighlight or ReaderHighlight._wereadlite_hl_hooked then
+        return
+    end
+    ReaderHighlight._wereadlite_hl_hooked = true
+    local original_save = ReaderHighlight.saveHighlight
+    function ReaderHighlight:saveHighlight(extend_to_sentence)
+        local index = original_save(self, extend_to_sentence)
+        local file = self.ui and self.ui.document and self.ui.document.file
+        if not Reading.is_ours(file) or not index then
+            return index
+        end
+        local item
+        pcall(function()
+            item = self.ui.annotation.annotations[index]
+        end)
+        if type(item) ~= "table" or not item.text or item.text == "" then
+            return index
+        end
+        local state = Reading.state
+        UIManager:nextTick(function()
+            if Reading.state ~= state then
+                return
+            end
+            Bookmark.sync_highlight(item, state)
+        end)
+        return index
+    end
+    local original_delete = ReaderHighlight.deleteHighlight
+    function ReaderHighlight:deleteHighlight(index)
+        local file = self.ui and self.ui.document and self.ui.document.file
+        local item
+        if Reading.is_ours(file) then
+            pcall(function()
+                item = self.ui.annotation.annotations[index]
+            end)
+            if type(item) == "table" then
+                -- Snapshot fields before local removal.
+                item = {
+                    text = item.text,
+                    wereadlite_bookmark_id = item.wereadlite_bookmark_id,
+                    wereadlite_range = item.wereadlite_range,
+                    wereadlite_chapter_uid = item.wereadlite_chapter_uid,
+                }
+            else
+                item = nil
+            end
+        end
+        local result = original_delete(self, index)
+        if item then
+            local state = Reading.state
+            UIManager:nextTick(function()
+                if Reading.state ~= state then
+                    return
+                end
+                Bookmark.sync_delete(item, state)
+            end)
+        end
+        return result
+    end
+    Log.dbg("reading", "hook", { name = "highlight" })
+end
+
 function Reading.install_hook()
     install_end_of_book_hook()
     install_close_hook()
     install_exit_hook()
     install_toc_hook()
+    install_highlight_hook()
 end
 
 return Reading

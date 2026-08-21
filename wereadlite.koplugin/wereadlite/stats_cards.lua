@@ -11,6 +11,7 @@ local TextWidget = require("ui/widget/textwidget")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Settings = require("wereadlite.settings")
 
 local Screen = Device.screen
 
@@ -300,7 +301,7 @@ function HeatCalendar:paintTo(bb, x, y)
     self.dimen = Geom:new{ x = x, y = y, w = self.width, h = self.height }
     local width = math.max(1, self.width)
     local height = math.max(1, self.height)
-    local face = Font:getFace("xx_smallinfofont")
+    local face = Settings.grid_face("meta")
     local label_h = 0
     local cell_gap = math.max(1, Screen:scaleBySize(2))
     local show_label = height >= Screen:scaleBySize(70)
@@ -311,8 +312,8 @@ function HeatCalendar:paintTo(bb, x, y)
     local weeks = math.max(1, math.ceil(#self.days / 7))
     local cell_w = math.max(4, math.floor((width - cell_gap * 6) / 7))
     local cell_h = math.max(4, math.floor((height - label_h - cell_gap * math.max(0, weeks - 1)) / weeks))
-    local date_size = math.max(8, math.min(12, math.floor(math.min(cell_w, cell_h) * 0.55)))
-    local date_face = Font:getFace("cfont", date_size)
+    local date_size = math.max(8, math.min(Settings.grid_font_size() - 4, math.floor(math.min(cell_w, cell_h) * 0.55)))
+    local date_face = Font:getFace("infofont", date_size)
     if show_label then
         for col = 0, 6 do
             local label = TextWidget:new{
@@ -408,7 +409,7 @@ function BarList:paintTo(bb, x, y)
     if #items == 0 then
         local empty = TextWidget:new{
             text = "暂无排行",
-            face = Font:getFace("xx_smallinfofont"),
+            face = Settings.grid_face("meta"),
             max_width = self.width,
         }
         empty:paintTo(bb, x, y)
@@ -420,7 +421,7 @@ function BarList:paintTo(bb, x, y)
     for _, item in ipairs(items) do
         max_v = math.max(max_v, item.value or 0)
     end
-    local face = Font:getFace("xx_smallinfofont")
+    local face = Settings.grid_face("meta")
     local pad = math.max(1, Screen:scaleBySize(2))
     local bar_h = math.max(4, math.min(Screen:scaleBySize(10), math.floor(row_h / 3)))
     for i, item in ipairs(items) do
@@ -476,7 +477,7 @@ end
 function FormList:paintTo(bb, x, y)
     self.dimen = Geom:new{ x = x, y = y, w = self.width, h = self.height }
     local rows = self.rows or {}
-    local face = Font:getFace("xx_smallinfofont")
+    local face = Settings.grid_face("meta")
     if #rows == 0 then
         local empty = TextWidget:new{
             text = self.empty or "暂无数据",
@@ -579,7 +580,7 @@ local function arrow_widget(icon, size)
     end
     return TextWidget:new{
         text = icon:find("left", 1, true) and "‹" or "›",
-        face = Font:getFace("cfont", 16),
+        face = Settings.grid_face("body"),
     }
 end
 
@@ -602,7 +603,7 @@ function ConnectedTabs:paintTo(bb, x, y)
         return
     end
     local sep = math.max(1, Size.border.default)
-    local face = Font:getFace("xx_smallinfofont")
+    local face = Settings.grid_face("meta")
     local x_off = 0
     for i, item in ipairs(items) do
         local w
@@ -720,13 +721,13 @@ function StatsCards.build(opts)
     if opts.loading then
         inner = TextWidget:new{
             text = "加载中",
-            face = Font:getFace("xx_smallinfofont"),
+            face = Settings.grid_face("meta"),
             max_width = content_w,
         }
     elseif opts.error then
         inner = TextBoxWidget:new{
             text = "加载失败\n点按重试",
-            face = Font:getFace("xx_smallinfofont"),
+            face = Settings.grid_face("meta"),
             width = content_w,
             height = inner_h,
             alignment = "center",

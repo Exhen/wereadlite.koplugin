@@ -1,8 +1,8 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
-local Font = require("ui/font")
 local TextWidget = require("ui/widget/textwidget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local Settings = require("wereadlite.settings")
 
 local Screen = Device.screen
 
@@ -168,7 +168,7 @@ function SevenClock:paintTo(bb, x, y)
     local date_h = 0
     local date_widgets = {}
     if height >= Screen:scaleBySize(56) then
-        local face = Font:getFace("xx_smallinfofont")
+        local face = Settings.grid_face("meta")
         local line_gap = math.max(1, Screen:scaleBySize(2))
         local single = TextWidget:new{
             text = date_line .. " " .. week_line,

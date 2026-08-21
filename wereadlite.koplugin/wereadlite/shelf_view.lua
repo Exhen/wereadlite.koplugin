@@ -787,11 +787,11 @@ function ShelfView:_user_row(width, height)
     -- Prefer fitting inside the card: margins first, then distribute leftover.
     local min_gap = 1
     local max_gap = math.max(min_gap, Screen:scaleBySize(6))
-    local name_face = Font:getFace("x_smallinfofont")
-    local meta_face = Font:getFace("xx_smallinfofont")
+    local name_face = Settings.grid_face("body")
+    local meta_face = Settings.grid_face("meta")
     if height >= Screen:scaleBySize(120) then
-        name_face = Font:getFace("infofont")
-        meta_face = Font:getFace("x_smallinfofont")
+        name_face = Settings.grid_face("title")
+        meta_face = Settings.grid_face("body")
     end
 
     local function make_text(text, face, bold)
@@ -878,9 +878,9 @@ function ShelfView:_recent_row(width, height, book)
         caption = ""
     end
 
-    local title_face = (stacked or not wide) and Font:getFace("x_smallinfofont")
-        or Font:getFace("infofont")
-    local meta_face = Font:getFace("xx_smallinfofont")
+    local title_face = (stacked or not wide) and Settings.grid_face("body")
+        or Settings.grid_face("title")
+    local meta_face = Settings.grid_face("meta")
     local line_gap = math.max(2, Screen:scaleBySize(wide and 4 or 3))
 
     local cover_w, cover_h
@@ -1020,7 +1020,7 @@ function ShelfView:_book_cell(book, cell_w, cell_h)
         title_gap = math.max(1, Screen:scaleBySize(2))
         title = TextWidget:new{
             text = tostring(book.title or ""),
-            face = Font:getFace("x_smallinfofont"),
+            face = Settings.grid_face("body"),
             max_width = math.max(1, cell_w),
         }
         title_h = title:getSize().h or 0
