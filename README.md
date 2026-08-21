@@ -1,4 +1,4 @@
-# Koreader 微信读书 青春版
+<img width="641" height="898" alt="image" src="https://github.com/user-attachments/assets/fea75d92-03b0-4f8d-84de-33fe817cf69e" /># Koreader 微信读书 青春版
 
 ## 仅供学习交流，请于下载24小时后删除
 
@@ -21,4 +21,5 @@
 
 ## 入口
 
-安装后，启动Koreader，你的Koreader书籍列表中的第一本书会变成【微信读书】
+安装后，启动Koreader，你的Koreader书籍列表中的第一本书会变成【微信读书】，点击即进入
+<img width="644" height="996" alt="image" src="https://github.com/user-attachments/assets/89b43352-a39a-4cda-bec7-d46d6f62506a" />
