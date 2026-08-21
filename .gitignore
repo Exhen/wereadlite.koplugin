@@ -1,0 +1,14 @@
+dist/
+release.env
+*.zip
+*.sha256
+.DS_Store
+
+# Upstream MiuRead plugin kept locally as implementation reference.
+.reference/
+
+# Persistent session data (cookies, db, covers). Never commit.
+wereadlite.koplugin/data
+
+# Ephemeral HTTP / QR cache. Recreated at runtime.
+wereadlite.koplugin/cache
