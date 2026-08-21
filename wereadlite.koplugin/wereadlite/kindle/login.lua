@@ -7,9 +7,13 @@ local Log = require("wereadlite.log")
 local Login = {}
 
 local CONFIRM_PREFIX = "https://weread.qq.com/web/confirm?pf=2&uid="
+-- getlogininfo is a server-side long-poll (~55s) that returns credentials when
+-- the QR is confirmed, or {"scan":0} when the ticket expires. Short client
+-- timeouts create gaps with no waiter and drop the first successful scan.
 local WAIT_SECONDS = 60
-local INFO_TIMEOUT = 5
-local INFO_TRIES = 12
+local INFO_TIMEOUT = 58
+local INFO_TRIES = 2
+local INFO_RETRY_DELAY = 0.3
 
 local B64 = {
     ["A"] = 0, ["B"] = 1, ["C"] = 2, ["D"] = 3, ["E"] = 4, ["F"] = 5, ["G"] = 6, ["H"] = 7,
@@ -118,6 +122,10 @@ function Login.fingerprint()
 end
 
 function Login.cgi_key()
+    if not Login._rng_seeded then
+        Login._rng_seeded = true
+        pcall(math.randomseed, os.time() + (os.clock() * 1000000))
+    end
     return tostring(math.random(0, 999))
 end
 
@@ -139,13 +147,14 @@ local function save_qr(b64)
     return dest
 end
 
-function Login.fetch_qr(on_done)
+function Login.fetch_qr(on_done, on_uid)
     Login.cancel()
     local gen = Session.gen
     if not Http.available() then
         on_done("curl missing")
         return
     end
+    Login.fingerprint()
     track(Http.request(kindle_opts({
         url = Config.LOGIN_GETUID_URL,
         accept = "application/json, */*",
@@ -165,7 +174,11 @@ function Login.fetch_qr(on_done)
             on_done("empty uid")
             return
         end
+        local cgi_key = Login.cgi_key()
         Log.info("login", "getuid", { ok = true })
+        if type(on_uid) == "function" then
+            on_uid(nil, { uid = uid, cgi_key = cgi_key })
+        end
         local confirm = CONFIRM_PREFIX .. uid
         local url = string.format(
             "%s?url=%s&platform=desktop",
@@ -175,8 +188,7 @@ function Login.fetch_qr(on_done)
         track(Http.request(kindle_opts({
             url = url,
             accept = "application/json, */*",
-            send_cookie = false,
-            absorb_cookies = false,
+            absorb_cookies = true,
             timeout = 12,
         }), function(qr_res)
             if not alive(gen) then
@@ -202,7 +214,6 @@ function Login.fetch_qr(on_done)
                 on_done(err)
                 return
             end
-            local cgi_key = Login.cgi_key()
             Log.info("login", "qrcode", { ok = true })
             on_done(nil, {
                 uid = uid,
@@ -240,7 +251,6 @@ function Login.wait_scan(uid, cgi_key, on_done)
             tries = INFO_TRIES,
             timeout = INFO_TIMEOUT,
         })
-        local started = os.time()
         local function again(reason)
             if not alive(gen) then
                 return
@@ -249,12 +259,8 @@ function Login.wait_scan(uid, cgi_key, on_done)
                 on_done(reason or "timeout")
                 return
             end
-            local wait = INFO_TIMEOUT - (os.time() - started)
-            if wait < 0.2 then
-                wait = 0.2
-            end
             local UIManager = require("ui/uimanager")
-            UIManager:scheduleIn(wait, poll)
+            UIManager:scheduleIn(INFO_RETRY_DELAY, poll)
         end
         track(Http.request(kindle_opts({
             url = Config.LOGIN_INFO_URL,
@@ -277,6 +283,8 @@ function Login.wait_scan(uid, cgi_key, on_done)
                 on_done("expired")
                 return
             end
+            -- Network blip / client abort: keep one short retry so a waiter
+            -- is almost always attached for the QR lifetime.
             again((res and res.err) or "pending")
         end))
     end

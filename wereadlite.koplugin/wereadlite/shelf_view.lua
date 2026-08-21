@@ -1547,6 +1547,15 @@ function ShelfView:_open_settings()
         if not self._closed then
             self:_open_search()
         end
+    end, function()
+        if self._closed then
+            return
+        end
+        if self.on_auth_expired then
+            self.on_auth_expired()
+        else
+            self:onClose()
+        end
     end)
 end
 

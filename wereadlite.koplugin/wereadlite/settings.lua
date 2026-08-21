@@ -826,7 +826,41 @@ function Settings.show_book_title_dialog(on_changed)
     UIManager:show(dialog)
 end
 
-function Settings.show_menu(on_changed, on_search)
+function Settings.show_logout_dialog(on_logout)
+    local dialog
+    dialog = ButtonDialog:new{
+        name = "wereadlite_logout",
+        title = "退出登录？",
+        title_align = "center",
+        use_info_style = false,
+        buttons = {
+            {
+                {
+                    text = "取消",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = "退出",
+                    callback = function()
+                        UIManager:close(dialog)
+                        Settings.set_skill_apikey("")
+                        local Session = require("wereadlite.session")
+                        Session.clear_auth()
+                        Log.info("settings", "logout")
+                        if type(on_logout) == "function" then
+                            on_logout()
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function Settings.show_menu(on_changed, on_search, on_logout)
     local SkillView = require("wereadlite.skill_view")
     local menu
     menu = ButtonDialog:new{
@@ -908,6 +942,15 @@ function Settings.show_menu(on_changed, on_search)
                     callback = function()
                         UIManager:close(menu)
                         SkillView.show_stats()
+                    end,
+                },
+            },
+            {
+                {
+                    text = "退出登录",
+                    callback = function()
+                        UIManager:close(menu)
+                        Settings.show_logout_dialog(on_logout)
                     end,
                 },
             },

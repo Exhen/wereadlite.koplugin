@@ -225,6 +225,7 @@ function LoginView:_start()
     self._qr_path = nil
     self._uid = nil
     self._cgi_key = nil
+    self._wait_started = false
     self._expired = false
     self._phase = "loading"
     self._status = "二维码加载中"
@@ -235,6 +236,9 @@ function LoginView:_start()
         end
         if err or not payload then
             Log.warn("login", "qr_fail", { err = err })
+            pcall(function()
+                Login.cancel()
+            end)
             self:_fail(gen, "二维码加载失败")
             return
         end
@@ -245,12 +249,20 @@ function LoginView:_start()
         self._expired = false
         self._status = "请使用微信扫描二维码登录"
         self:_paint()
-        UIManager:scheduleIn(1, function()
-            if self._closed or gen ~= self._gen then
-                return
-            end
+        if not self._wait_started then
+            self._wait_started = true
             self:_begin_wait(gen)
-        end)
+        end
+    end, function(err, early)
+        if self._closed or gen ~= self._gen or err or not early then
+            return
+        end
+        self._uid = early.uid
+        self._cgi_key = early.cgi_key
+        if not self._wait_started then
+            self._wait_started = true
+            self:_begin_wait(gen)
+        end
     end)
 end
 
