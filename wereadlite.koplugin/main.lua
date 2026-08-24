@@ -2,12 +2,15 @@ local DocumentRegistry = require("document/documentregistry")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Config = require("wereadlite.config")
+local Http = require("wereadlite.async_http")
 local CookieStore = require("wereadlite.cookie_store")
 local Entry = require("wereadlite.entry")
 local Gate = require("wereadlite.gate")
 local Log = require("wereadlite.log")
+local Net = require("wereadlite.net")
 local Paths = require("wereadlite.paths")
 local Reading = require("wereadlite.reading")
+local Heartbeat = require("wereadlite.kindle.heartbeat")
 local Settings = require("wereadlite.settings")
 
 local Plugin = WidgetContainer:extend{
@@ -15,6 +18,8 @@ local Plugin = WidgetContainer:extend{
     is_doc_only = false,
     version = Config.VERSION,
 }
+
+local RESUME_DELAY = 3
 
 function Plugin:init()
     if not (self.ui and self.ui.document) then
@@ -85,10 +90,52 @@ end
 
 function Plugin:onNetworkConnected()
     Gate.on_network_changed()
+    self:_scheduleHeartbeatResume("network_connected")
 end
 
 function Plugin:onNetworkDisconnected()
+    self:_cancelHeartbeatResume()
+    Reading.cancel_load()
+    Heartbeat.pause("network_disconnected")
     Gate.on_network_changed()
+end
+
+function Plugin:_cancelHeartbeatResume()
+    if self._heartbeat_resume_task then
+        UIManager:unschedule(self._heartbeat_resume_task)
+        self._heartbeat_resume_task = nil
+    end
+end
+
+function Plugin:_scheduleHeartbeatResume(reason)
+    self:_cancelHeartbeatResume()
+    local function resume_task()
+        self._heartbeat_resume_task = nil
+        if Reading.is_active() and Net.is_online() then
+            Heartbeat.resume()
+        else
+            Log.info("plugin", "heartbeat_resume_skip", {
+                reason = reason,
+                reading = Reading.is_active(),
+                online = Net.is_online(),
+            })
+        end
+    end
+    self._heartbeat_resume_task = resume_task
+    UIManager:scheduleIn(RESUME_DELAY, resume_task)
+end
+
+function Plugin:onSuspend()
+    self:_cancelHeartbeatResume()
+    Reading.cancel_load()
+    Heartbeat.pause("suspend")
+    local cancelled = Http.cancel_all()
+    Log.info("plugin", "suspend", { cancelled_http = cancelled })
+end
+
+function Plugin:onResume()
+    Log.info("plugin", "resume")
+    self:_scheduleHeartbeatResume("resume")
 end
 
 return Plugin

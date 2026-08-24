@@ -547,6 +547,26 @@ function Codec.inner_by_id(html, id)
     end
 end
 
+local function remove_css_property(css, name)
+    return css:gsub(name .. "%s*:%s*[^;}]*;?", "")
+end
+
+local function strip_reader_typography(css)
+    css = remove_css_property(css, "[fF][oO][nN][tT]%-[fF][aA][mM][iI][lL][yY]")
+    css = remove_css_property(css, "[fF][oO][nN][tT]%-[sS][iI][zZ][eE]")
+    css = remove_css_property(css, "[lL][iI][nN][eE]%-[hH][eE][iI][gG][hH][tT]")
+    css = remove_css_property(css, "[lL][eE][tT][tT][eE][rR]%-[sS][pP][aA][cC][iI][nN][gG]")
+    css = remove_css_property(css, "[wW][oO][rR][dD]%-[sS][pP][aA][cC][iI][nN][gG]")
+    css = remove_css_property(css, "[tT][eE][xX][tT]%-[iI][nN][dD][eE][nN][tT]")
+    return remove_css_property(css, "%f[%a][fF][oO][nN][tT]%f[^%w-]")
+end
+
+local function strip_inline_typography(html)
+    return tostring(html or ""):gsub("<[^>]+>", function(tag)
+        return strip_reader_typography(tag)
+    end)
+end
+
 function Codec.reader_content(html, decode)
     local inner = Codec.inner_by_id(html, "readerContent")
         or Codec.inner_by_id(html, "readerContentRenderContainer")
@@ -554,7 +574,8 @@ function Codec.reader_content(html, decode)
         error("readerContent missing")
     end
     local text = inner:gsub("<!%-%-.-%-%->", ""):gsub("<[^>]+>", ""):gsub("%s+", "")
-    if text == "" then
+    local has_image = inner:find("<[iI][mM][gG]%f[%s/>]") ~= nil
+    if text == "" and not has_image then
         error("readerContent empty")
     end
     if Codec.looks_like_shards(inner) then
@@ -568,9 +589,50 @@ function Codec.reader_content(html, decode)
         inner = Codec.decode_html(inner)
     end
     if decode == false then
-        return inner
+        return strip_inline_typography(inner)
     end
-    return Codec.convert_footnotes(inner)
+    return strip_inline_typography(Codec.convert_footnotes(inner))
+end
+
+function Codec.reader_styles(html)
+    local function rewrite_bleed(value)
+        value = tostring(value or ""):lower()
+        local out = { "page-break-inside:avoid" }
+        local left = value:find("left", 1, true) ~= nil
+        local right = value:find("right", 1, true) ~= nil
+        if left then
+            out[#out + 1] = "margin-left:-6.5% !important"
+        end
+        if right then
+            out[#out + 1] = "margin-right:-6.5% !important"
+        end
+        if left and right then
+            out[#out + 1] = "width:113% !important"
+        elseif left or right then
+            out[#out + 1] = "width:106.5% !important"
+        end
+        if value:find("top", 1, true) then
+            out[#out + 1] = "margin-top:-6.5% !important"
+        end
+        if value:find("bottom", 1, true) then
+            out[#out + 1] = "margin-bottom:-6.5% !important"
+        end
+        return table.concat(out, ";") .. ";"
+    end
+
+    local styles = {}
+    for css in tostring(html or ""):gmatch("<[sS][tT][yY][lL][eE][^>]*>(.-)</[sS][tT][yY][lL][eE]%s*>") do
+        css = css:gsub("&quot;", '"'):gsub("&apos;", "'"):gsub("&#39;", "'")
+        css = css:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">")
+        css = css:gsub("[qQ][rR][fF][uU][lL][lL][pP][aA][gG][eE]%s*:%s*[^;}]*;?",
+            "page-break-before:always;page-break-after:always;page-break-inside:avoid;text-align:center;")
+        css = css:gsub("[qQ][rR][bB][lL][eE][eE][dD]%s*:%s*([^;}]*);?", rewrite_bleed)
+
+        -- Let KOReader's reader settings own typography and paragraph spacing.
+        css = strip_reader_typography(css)
+        styles[#styles + 1] = css
+    end
+    return table.concat(styles, "\n")
 end
 
 function Codec.font_path()
@@ -626,6 +688,7 @@ function Codec.wrap_html(opts)
     })
     local body = tostring(opts.body or "")
     local font_path = opts.font_path or ""
+    local source_css = tostring(opts.source_css or "")
     local decoded = Codec.has_map()
     local font_css = ""
     if font_path ~= "" and not decoded then
@@ -640,8 +703,12 @@ function Codec.wrap_html(opts)
     return table.concat({
         '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8"/>\n<title>',
         title,
-        '</title>\n<style>\nbody { margin: 6%; line-height: 1.7; }\nimg { max-width: 100%; height: auto; }\n',
-        'h1, h2, .firstTitle { text-align: center; }\n',
+        '</title>\n<style>\n',
+        source_css,
+        '\nbody { margin: 6%; line-height: 1.7; }\nimg { max-width: 100%; height: auto; }\n',
+        'h1, h2, .firstTitle { text-align: center; page-break-before: avoid !important; break-before: avoid !important; }\n',
+        'body h1:first-child, body h2:first-child, body .firstTitle:first-child { margin-top: 0 !important; padding-top: 0 !important; }\n',
+        '.frontCover:first-child, .qqreader-fullimg:first-child { page-break-before: avoid !important; }\n',
         '.fn-ref { font-size: 0.75em; vertical-align: super; line-height: 0; }\n',
         '.fn-ref a { text-decoration: none; }\n',
         'aside.footnote { -cr-hint: footnote-inpage; margin: 0.4em 0; font-size: 0.85em; text-indent: 0; }\n',
@@ -649,8 +716,9 @@ function Codec.wrap_html(opts)
         '.fn-num { font-weight: bold; margin-right: 0.3em; text-decoration: none; color: inherit; }\n',
         font_css,
         '\n</style>\n</head>\n<body>\n<!-- wereadlite -->\n',
+        '<div id="readerContentRenderContainer" class="readerContentRenderContainer randomFont">\n',
         body,
-        '\n</body>\n</html>\n',
+        '\n</div>\n</body>\n</html>\n',
     })
 end
 

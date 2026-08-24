@@ -13,6 +13,9 @@ local Reading = {
     state = nil,
     chapters = {},
     catalog_complete = false,
+    _load_generation = 0,
+    _load_task = nil,
+    _load_bar = nil,
 }
 
 local function show_error(text)
@@ -149,16 +152,99 @@ function Reading.is_ours(file)
             or file:find("微信阅读", 1, true) ~= nil)
 end
 
+local function history_item_path(item)
+    if type(item) == "table" then
+        return item.file or item.path or item.filename
+    end
+    return item
+end
+
+function Reading.remove_from_history(path)
+    path = tostring(path or "")
+    if path == "" then
+        return false
+    end
+    local ok, history = pcall(require, "readhistory")
+    if not ok or not history or type(history.removeItemByPath) ~= "function" then
+        return false
+    end
+    local removed, err = pcall(history.removeItemByPath, history, path)
+    if not removed then
+        Log.warn("reading", "history_remove", { file = path, err = err })
+        return false
+    end
+    return true
+end
+
+function Reading.purge_history()
+    local ok, history = pcall(require, "readhistory")
+    if not ok or not history then
+        return 0
+    end
+    local paths, seen = {}, {}
+    local rows = history.hist or history.history or history.items
+    if type(rows) == "table" then
+        for _, item in pairs(rows) do
+            local path = tostring(history_item_path(item) or "")
+            if path ~= "" and Reading.is_ours(path) and not seen[path] then
+                seen[path] = true
+                paths[#paths + 1] = path
+            end
+        end
+    end
+    if type(history.removeItemByPath) == "function" then
+        for _, path in ipairs(paths) do
+            pcall(history.removeItemByPath, history, path)
+        end
+    end
+    if #paths > 0 then
+        Log.info("reading", "history_purge", { count = #paths })
+    end
+    return #paths
+end
+
+
+local function install_history_filter()
+    local ok, history = pcall(require, "readhistory")
+    if not ok or not history or history._wereadlite_filtered then
+        return
+    end
+    history._wereadlite_filtered = true
+    local function filter_method(name)
+        local original = history[name]
+        if type(original) ~= "function" then
+            return
+        end
+        history[name] = function(...)
+            for i = 1, select("#", ...) do
+                local path = history_item_path(select(i, ...))
+                if Reading.is_ours(path) then
+                    Log.dbg("reading", "history_block", { file = path, method = name })
+                    return
+                end
+            end
+            return original(...)
+        end
+    end
+    filter_method("addItem")
+    filter_method("updateItem")
+    Reading.purge_history()
+end
+
 function Reading.is_last()
     return Reader.is_last(Reading.state)
 end
 
-local function open_document(path, resume)
+local function open_document(path, resume, state)
+    -- These HTML files are regenerated from the remote chapter. A previous
+    -- KOReader sidecar must not override the position selected below.
+    Reader.clear_sidecars(path)
     local function after_open()
+        Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
         if type(resume) == "table" then
             UIManager:scheduleIn(0.35, function()
-                Reading.goto_resume(resume)
+                Reading.goto_resume(resume, path, state)
             end)
         end
     end
@@ -170,16 +256,29 @@ local function open_document(path, resume)
     end
 end
 
-function Reading.goto_resume(resume)
+function Reading.goto_resume(resume, expected_path, expected_state)
     resume = resume or {}
     local ok, ReaderUI = pcall(require, "apps/reader/readerui")
     local ui = ok and ReaderUI and ReaderUI.instance
     if not ui then
         return
     end
+    local current_path = ui.document and ui.document.file
+    if expected_state and Reading.state ~= expected_state then
+        Log.dbg("reading", "resume_stale", { reason = "state" })
+        return
+    end
+    if expected_path and tostring(current_path or "") ~= tostring(expected_path) then
+        Log.dbg("reading", "resume_stale", {
+            reason = "document",
+            expected = expected_path,
+            current = current_path,
+        })
+        return
+    end
     local percent = tonumber(resume.percent) or 0
     local anchor = resume.anchor
-    -- Prefer CRE anchor at the saved section start.
+    -- Use the CRE section anchor only when no precise offset was available.
     if anchor and ui.document and ui.document.isXPointerInDocument then
         local candidates = {
             "#" .. anchor,
@@ -208,56 +307,107 @@ function Reading.goto_resume(resume)
     end
 end
 
-function Reading.open_url(url, book)
+function Reading.open_url(url, book, opts)
+    opts = opts or {}
+    Reading.cancel_load()
+    Reading._load_generation = Reading._load_generation + 1
+    local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
     local ok_bar, bar = pcall(LoadProgress.open)
     if not ok_bar then
         Log.warn("reading", "progress_ui", { err = bar })
         bar = nil
     end
+    Reading._load_bar = bar
     local function report(stage, done, total)
         if bar then
             pcall(bar.update, bar, stage, done, total)
         end
     end
-    local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report)
-    if bar then
-        pcall(bar.close, bar)
+    local function close_bar()
+        if Reading._load_bar == bar then
+            Reading._load_bar = nil
+        end
+        if bar then
+            pcall(bar.close, bar)
+            bar = nil
+        end
     end
+
+    local function complete(state, status, err)
+        if my_generation ~= Reading._load_generation then
+            if state and state.html_path then
+                Reader.remove_chapter(state.html_path)
+            end
+            return
+        end
+        Reading._load_task = nil
+        close_bar()
+        if not state then
+            Log.warn("reading", "open_async", { status = status, err = err })
+            show_error(status == "offline" and "网络不可用" or "打开章节失败")
+            return
+        end
+        if book then
+            Reading.book = book
+        end
+        merge_chapters(state)
+        ensure_catalog(state)
+        Reading.state = state
+        local resume
+        if opts.resume == true then
+            resume = { percent = state.resume_percent, anchor = state.resume_anchor }
+        end
+        local opened, open_err = pcall(open_document, state.html_path, resume, state)
+        if not opened then
+            Reader.remove_chapter(state.html_path)
+            show_error("打开章节失败")
+            Log.warn("reading", "open_document", { err = open_err })
+            return
+        end
+        pcall(BookDb.save_last_read, Reading.book, {
+            book_info = state.book_info,
+            chapter_title = state.chapter_title or (state.cur and state.cur.title),
+        })
+        Heartbeat.start(state)
+        Log.dbg("reading", "open_ok", {
+            book_id = state.book_id,
+            uid = state.cur and state.cur.uid,
+            html = state.html_path,
+            resume_percent = state.resume_percent,
+            resume_anchor = state.resume_anchor,
+        })
+    end
+
+    local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete)
     if not called then
+        close_bar()
         return nil, "http_error", state
     end
+    if status == "pending" then
+        Reading._load_task = err
+        return true, "pending"
+    end
+    close_bar()
     if not state then
         return nil, status, err
     end
-    if book then
-        Reading.book = book
-    end
-    merge_chapters(state)
-    ensure_catalog(state)
-    Reading.state = state
-    local resume = {
-        percent = state.resume_percent,
-        anchor = state.resume_anchor,
-    }
-    local opened, open_err = pcall(open_document, state.html_path, resume)
-    if not opened then
-        Reader.remove_chapter(state.html_path)
-        return nil, "http_error", open_err
-    end
-    pcall(BookDb.save_last_read, Reading.book, {
-        book_info = state.book_info,
-        chapter_title = state.chapter_title or (state.cur and state.cur.title),
-    })
-    Heartbeat.start(state)
-    Log.dbg("reading", "open_ok", {
-        book_id = state.book_id,
-        uid = state.cur and state.cur.uid,
-        html = state.html_path,
-        resume_percent = state.resume_percent,
-        resume_anchor = state.resume_anchor,
-    })
+    complete(state)
     return state
+end
+
+function Reading.cancel_load()
+    Reading._load_generation = (Reading._load_generation or 0) + 1
+    local task = Reading._load_task
+    Reading._load_task = nil
+    if task and type(task.cancel) == "function" then
+        pcall(task.cancel, task)
+    end
+    local bar = Reading._load_bar
+    Reading._load_bar = nil
+    if bar then
+        pcall(bar.close, bar)
+    end
 end
 
 function Reading.open_book(book)
@@ -265,6 +415,7 @@ function Reading.open_book(book)
         show_error("缺少阅读参数")
         return
     end
+    Reading.cancel_load()
     Reading.book = book
     Reading.chapters = {}
     Reading.state = nil
@@ -272,7 +423,7 @@ function Reading.open_book(book)
     Heartbeat.stop(true)
     Reader.cleanup_reading()
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(Reader.url_for(book.reader_param), book)
+        local ok, status, err = Reading.open_url(Reader.url_for(book.reader_param), book, { resume = true })
         if ok then
             return
         end
@@ -295,7 +446,7 @@ function Reading.open_next()
         return false
     end
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, Reading.book)
+        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
         if ok then
             return
         end
@@ -316,6 +467,7 @@ function Reading.show_wechat_shelf()
         return
     end
     Reading._returning = true
+    Reading.cancel_load()
     Heartbeat.stop(true)
     Reader.cleanup_reading()
     local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
@@ -422,7 +574,7 @@ function Reading.open_toc_item(item)
         return
     end
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, Reading.book)
+        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
         if ok then
             return
         end
@@ -440,8 +592,19 @@ function Reading.open_toc_item(item)
 end
 
 function Reading.cleanup_temp()
+    Reading.cancel_load()
     Heartbeat.stop(true)
     Reader.cleanup_reading()
+end
+
+function Reading.is_active()
+    if not Reading.state then
+        return false
+    end
+    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+    local ui = ok and ReaderUI and ReaderUI.instance
+    local file = ui and ui.document and ui.document.file
+    return Reading.is_ours(file)
 end
 
 local function ours_from_toc(toc)
@@ -486,6 +649,7 @@ local function install_close_hook()
             result = original(self, full_refresh)
         end
         if ours then
+            Reading.remove_from_history(file)
             Reader.remove_chapter(file)
         end
         return result
@@ -742,6 +906,7 @@ local function install_highlight_hook()
 end
 
 function Reading.install_hook()
+    install_history_filter()
     install_end_of_book_hook()
     install_close_hook()
     install_exit_hook()

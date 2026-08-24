@@ -1,10 +1,14 @@
 local Config = require("wereadlite.config")
 local Log = require("wereadlite.log")
 local Settings = require("wereadlite.settings")
+local UIManager = require("ui/uimanager")
 
 local Images = {}
 
 local IMAGE_EXTS = { "jpg", "jpeg", "png", "webp", "gif" }
+local sniff_ext
+local replace_all
+local apply_local
 
 local function mkdir(path)
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
@@ -40,6 +44,17 @@ end
 local function is_remote(url)
     url = tostring(url or "")
     return url:find("^https?://") ~= nil
+end
+
+local function canonical_url(url)
+    url = unescape_url(url)
+    -- A fragment never changes the downloaded image.  Normalize the scheme
+    -- and host as well so equivalent CSS/HTML references share one job.
+    url = url:gsub("#.*$", "")
+    url = url:gsub("^(https?)://([^/]+)", function(scheme, host)
+        return scheme:lower() .. "://" .. host:lower()
+    end)
+    return url
 end
 
 local function digest(text)
@@ -81,40 +96,215 @@ end
 
 local function collect_urls(html)
     local urls, seen = {}, {}
-    local function add(raw)
+    local function add(raw, kind)
         raw = tostring(raw or "")
         local url = unescape_url(raw)
-        if is_remote(url) and not seen[url] then
-            seen[url] = true
-            urls[#urls + 1] = { raw = raw, url = url }
+        local key = canonical_url(url)
+        if is_remote(key) and key ~= "" and not seen[key] then
+            seen[key] = true
+            urls[#urls + 1] = { raw = raw, url = key, kind = kind }
         end
     end
     html = tostring(html or "")
-    for url in html:gmatch('[sS][rR][cC]%s*=%s*"([^"]+)"') do
-        add(url)
+    local style_blocks = {}
+    for css in html:gmatch("<[sS][tT][yY][lL][eE][^>]*>(.-)</[sS][tT][yY][lL][eE]%s*>") do
+        style_blocks[#style_blocks + 1] = css
     end
-    for url in html:gmatch("[sS][rR][cC]%s*=%s*'([^']+)'") do
-        add(url)
+    local styles = table.concat(style_blocks, "\n")
+    local markup = html:gsub("<[sS][tT][yY][lL][eE][^>]*>.-</[sS][tT][yY][lL][eE]%s*>", "")
+    local used_classes = {}
+    for quoted in markup:gmatch('[cC][lL][aA][sS][sS]%s*=%s*"([^"]+)"') do
+        for name in quoted:gmatch("[^%s]+") do
+            used_classes[name] = true
+        end
     end
-    for url in html:gmatch('[dD]ata%-[sS][rR][cC]%s*=%s*"([^"]+)"') do
-        add(url)
+    for quoted in markup:gmatch("[cC][lL][aA][sS][sS]%s*=%s*'([^']+)'") do
+        for name in quoted:gmatch("[^%s]+") do
+            used_classes[name] = true
+        end
     end
-    for url in html:gmatch("url%(%s*&quot;([^&]+)&quot;%s*%)") do
-        add(url)
+    for attrs in html:gmatch("<[iI][mM][gG]%f[%s/>]([^>]*)>") do
+        local src = attrs:match('%f[%w][sS][rR][cC]%s*=%s*"([^"]+)"')
+            or attrs:match("%f[%w][sS][rR][cC]%s*=%s*'([^']+)'")
+        local lazy = attrs:match('%f[%w][dD]ata%-[sS][rR][cC]%s*=%s*"([^"]+)"')
+            or attrs:match("%f[%w][dD]ata%-[sS][rR][cC]%s*=%s*'([^']+)'")
+        add(lazy or src, "img")
     end
-    for url in html:gmatch('url%(%s*"([^"]+)"%s*%)') do
-        add(url)
-    end
-    for url in html:gmatch("url%(%s*'([^']+)'%s*%)") do
-        add(url)
-    end
-    for url in html:gmatch("url%(%s*(https?://[^%s%)]+)%s*%)") do
-        add(url)
+    -- Cache every background-image declared by WeRead.  CSS rules can be
+    -- activated indirectly (pseudo elements, inherited classes, or markup
+    -- added by CRE), so filtering by classes here leaves remote resources in
+    -- the final document and makes the renderer try the network again.
+    -- Do not require a balanced CSS rule here.  WeRead occasionally emits
+    -- compressed/partial style text, and the resource must still be found
+    -- and replaced when it is already present in the document.
+    for background in styles:gmatch("[bB][aA][cC][kK][gG][rR][oO][uU][nN][dD]%s*%-%s*[iI][mM][aA][gG][eE]%s*:%s*[uU][rR][lL]%s*%(%s*([^)]-)%s*%)") do
+        background = background:gsub("^%s*['\"]", ""):gsub("['\"]%s*$", "")
+        add(background, "css")
     end
     return urls
 end
 
-local function replace_all(html, from, to)
+local function save_image_body(stem, body)
+    local ext = sniff_ext(body)
+    if not ext then
+        return nil, "not an image"
+    end
+    local path = stem .. "." .. ext
+    local tmp = path .. ".tmp"
+    local file = io.open(tmp, "wb")
+    if not file then
+        return nil, "write failed"
+    end
+    file:write(body)
+    file:close()
+    os.remove(path)
+    if not os.rename(tmp, path) then
+        os.remove(tmp)
+        return nil, "rename failed"
+    end
+    return path
+end
+
+function Images.localize_async(html, book_dir, on_progress, on_done, opts)
+    html = tostring(html or "")
+    opts = opts or {}
+    local Http = require("wereadlite.async_http")
+    local collect_started = Log.now_ms and Log.now_ms() or 0
+    local urls = collect_urls(html)
+    Log.info("images", "async_collect", {
+        bytes = #html,
+        candidates = #urls,
+        elapsed_ms = collect_started > 0 and math.floor((Log.now_ms() - collect_started) + 0.5) or nil,
+    })
+    local state = {
+        cancelled = false,
+        finished = false,
+        active = {},
+        next_index = 1,
+        done = 0,
+        total = #urls,
+    }
+
+    local function report()
+        if type(on_progress) == "function" then
+            pcall(on_progress, state.done, state.total)
+        end
+    end
+
+    local function finish()
+        if state.finished or state.cancelled then
+            return
+        end
+        state.finished = true
+        if type(on_done) == "function" then
+            on_done(html)
+        end
+    end
+
+    function state:cancel()
+        if self.cancelled or self.finished then
+            return
+        end
+        self.cancelled = true
+        for job in pairs(self.active) do
+            Http.cancel(job)
+        end
+        self.active = {}
+    end
+
+    if #urls == 0 then
+        UIManager:nextTick(finish)
+        return state
+    end
+
+    local cache_dir = Images.dir(book_dir)
+    local pending = {}
+    for _, item in ipairs(urls) do
+        item.stem = stem_for(cache_dir, item.url)
+        local path = cached_path(item.stem)
+        if path then
+            html = apply_local(html, item, path)
+            state.done = state.done + 1
+        else
+            pending[#pending + 1] = item
+        end
+    end
+    urls = pending
+    state.total = state.done + #pending
+    report()
+    if #pending == 0 then
+        UIManager:nextTick(finish)
+        return state
+    end
+
+    local concurrency = math.min(2, math.max(1, tonumber(Settings.image_concurrency()) or 1))
+    local pump
+    local function complete_item(item, res)
+        if state.cancelled or state.finished then
+            return
+        end
+        local path
+        if res and res.ok and type(res.body) == "string" then
+            path = save_image_body(item.stem, res.body)
+        end
+        if path then
+            html = apply_local(html, item, path)
+        else
+            -- A failed download must not destroy the CSS declaration.  The
+            -- old behavior replaced the URL with an empty string, producing
+            -- background-image:url() even though no local file existed.
+            -- Keep the original URL so a transient image failure cannot
+            -- corrupt the chapter stylesheet.
+            Log.warn("images", "async_download_fail", {
+                url = item.url,
+                kind = item.kind,
+            })
+        end
+        state.done = state.done + 1
+        report()
+        pump()
+    end
+
+    pump = function()
+        if state.cancelled or state.finished then
+            return
+        end
+        local active_count = 0
+        for _ in pairs(state.active) do
+            active_count = active_count + 1
+        end
+        while active_count < concurrency and state.next_index <= #urls do
+            local item = urls[state.next_index]
+            state.next_index = state.next_index + 1
+            local job
+            Log.dbg("images", "async_start", { index = state.next_index - 1, total = #urls, url = item.url })
+            job = Http.request({
+                url = item.url,
+                timeout = tonumber(opts.timeout) or 6,
+                accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                referer = Config.READER_URL or Config.ORIGIN,
+                send_cookie = false,
+                absorb_cookies = false,
+            }, function(res)
+                if job then
+                    state.active[job] = nil
+                end
+                complete_item(item, res)
+            end)
+            if job then
+                state.active[job] = true
+                active_count = active_count + 1
+            end
+        end
+        if state.done >= state.total then
+            finish()
+        end
+    end
+    UIManager:nextTick(pump)
+    return state
+end
+
+replace_all = function(html, from, to)
     if from == "" or from == to then
         return html
     end
@@ -138,13 +328,20 @@ function Images.dir(book_dir)
     return path
 end
 
-local function apply_local(html, item, path)
+apply_local = function(html, item, path)
     local name = path:match("([^/]+)$") or ""
     local local_src = name ~= "" and ("img/" .. name) or path
     html = replace_all(html, item.url, local_src)
     if item.raw ~= item.url then
         html = replace_all(html, item.raw, local_src)
     end
+    -- Also replace the complete CSS url() token.  This covers CSS escaping
+    -- and whitespace around the URL where a plain string replacement can
+    -- leave the declaration pointing at the remote resource.
+    local escaped = item.url:gsub("([%%%]%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+    html = html:gsub("([uU][rR][lL]%s*%(%s*['\"]?)" .. escaped .. "(['\"]?%s*%))", function(prefix, suffix)
+        return prefix .. local_src .. suffix
+    end)
     return html, local_src
 end
 
@@ -165,7 +362,7 @@ local function sh_quote(text)
     return "'" .. tostring(text or ""):gsub("'", "'\\''") .. "'"
 end
 
-local function sniff_ext(body)
+sniff_ext = function(body)
     if type(body) ~= "string" or #body < 12 then
         return nil
     end
@@ -409,7 +606,6 @@ function Images.localize(html, book_dir, on_progress, opts)
         end
     end
     if #urls == 0 then
-        report(0, 0)
         return html
     end
     report(0, #urls)

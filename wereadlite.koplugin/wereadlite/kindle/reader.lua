@@ -124,6 +124,12 @@ local function sidecar_dirs(html_path)
     return dirs
 end
 
+function Reader.clear_sidecars(html_path)
+    for _, dir in ipairs(sidecar_dirs(html_path)) do
+        remove_tree(dir)
+    end
+end
+
 function Reader.reading_root()
     return require("wereadlite.paths").reading_dir()
 end
@@ -176,9 +182,7 @@ function Reader.remove_chapter(html_path)
     local enc, dec = html_pair(html_path)
     for _, path in ipairs({ enc, dec }) do
         os.remove(path)
-        for _, dir in ipairs(sidecar_dirs(path)) do
-            remove_tree(dir)
-        end
+        Reader.clear_sidecars(path)
     end
 end
 
@@ -649,7 +653,7 @@ function Reader.fetch(url)
     return body
 end
 
-function Reader.load(url, book, on_progress)
+function Reader.load(url, book, on_progress, on_ready)
     book = book or {}
     local function report(stage, done, total)
         if type(on_progress) == "function" then
@@ -775,7 +779,11 @@ function Reader.load(url, book, on_progress)
     end
     report("load", 0, #pages)
     local encrypted, decrypted = {}, {}
+    local source_css = ""
     for i, page in ipairs(pages) do
+        if source_css == "" then
+            source_css = Codec.reader_styles(page)
+        end
         local dec_part = collect_content(page, true)
         if not dec_part then
             if i == 1 then
@@ -809,6 +817,7 @@ function Reader.load(url, book, on_progress)
     end
 
     local body = table.concat(decrypted, "\n")
+    local postprocess_started = Log.now_ms()
     local plain = body:gsub("<[^>]+>", ""):gsub("%s+", "")
     local chars = 0
     for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
@@ -821,42 +830,74 @@ function Reader.load(url, book, on_progress)
     elseif cur_sect > 0 and section_count > 0 then
         resume_percent = math.max(0, math.min(100, (cur_sect / section_count) * 100))
     end
-    state.resume_anchor = (cur_sect > 0) and RESUME_ID or nil
+    -- chapterOffset is more precise than a section boundary. Keep the coarse
+    -- anchor only as a fallback when the response has no character offset.
+    state.resume_anchor = (offset <= 0 and cur_sect > 0) and RESUME_ID or nil
     state.resume_percent = resume_percent
+    Log.dbg("reader", "postprocess", {
+        body_bytes = #body,
+        chars = chars,
+        elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
+    })
 
-    local decrypted_html = Images.localize(Codec.wrap_html({
+    local wrap_started = Log.now_ms()
+    local decrypted_source = Codec.wrap_html({
         title = chapter_title,
         body = body,
         font_path = font_path,
-    }), dir, function(done, total)
-        report("images", done, total)
-    end)
-    -- Encrypted backup only remaps already-cached images; never download again.
-    local encrypted_html = Images.localize(Codec.wrap_html({
+        source_css = source_css,
+    })
+    local encrypted_source = Codec.wrap_html({
         title = chapter_title,
         body = table.concat(encrypted, "\n"),
         font_path = font_path,
+        source_css = source_css,
         encrypted = true,
-    }), dir, nil, { fetch = false })
-    if not write_html(path, decrypted_html) then
-        return nil, "http_error", "write chapter html failed"
-    end
-    write_html(enc_path, encrypted_html)
-    state.url = url
-    state.html_path = path
-    state.html_enc_path = enc_path
-    state.chapter_title = chapter_title
-    Log.info("reader", "chapter_ready", {
-        book_id = state.book_id,
-        uid = uid,
-        title = chapter_title,
-        html = path,
-        sections = #pages,
-        resume_percent = resume_percent,
-        resume_anchor = state.resume_anchor,
-        chapter_offset = offset,
     })
-    return state
+    Log.dbg("reader", "wrap", {
+        css_bytes = #source_css,
+        decrypted_bytes = #decrypted_source,
+        elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
+    })
+
+    local function finish(decrypted_html)
+        -- Encrypted backup only remaps resources already cached above.
+        local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
+        if not write_html(path, decrypted_html) then
+            return nil, "http_error", "write chapter html failed"
+        end
+        write_html(enc_path, encrypted_html)
+        state.url = url
+        state.html_path = path
+        state.html_enc_path = enc_path
+        state.chapter_title = chapter_title
+        Log.info("reader", "chapter_ready", {
+            book_id = state.book_id,
+            uid = uid,
+            title = chapter_title,
+            html = path,
+            sections = #pages,
+            resume_percent = resume_percent,
+            resume_anchor = state.resume_anchor,
+            chapter_offset = offset,
+        })
+        return state
+    end
+
+    if type(on_ready) == "function" then
+        local task = Images.localize_async(decrypted_source, dir, function(done, total)
+            report("images", done, total)
+        end, function(decrypted_html)
+            local ready, ready_status, ready_err = finish(decrypted_html)
+            on_ready(ready, ready_status, ready_err)
+        end)
+        return nil, "pending", task
+    end
+
+    local decrypted_html = Images.localize(decrypted_source, dir, function(done, total)
+        report("images", done, total)
+    end)
+    return finish(decrypted_html)
 end
 
 return Reader

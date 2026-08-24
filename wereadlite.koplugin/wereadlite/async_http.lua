@@ -10,6 +10,7 @@ local Http = {
 
 local job_seq = 0
 local CURL
+local active_jobs = {}
 
 local function lfs_mod()
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
@@ -208,6 +209,7 @@ local function finish(job)
         return
     end
     job.done = true
+    active_jobs[job] = nil
     local body = read_file(job.body_path) or ""
     local headers = read_file(job.header_path) or ""
     local err_text = read_file(job.err_path) or ""
@@ -275,6 +277,7 @@ local function arm(job)
     UIManager:scheduleIn(Http.POLL, function()
         if job.cancelled then
             kill_job(job)
+            active_jobs[job] = nil
             Paths.remove_tree(job.dir)
             return
         end
@@ -286,6 +289,7 @@ local function arm(job)
             Log.warn("http", "curl_timeout", { url = job.url })
             kill_job(job)
             job.done = true
+            active_jobs[job] = nil
             if job.callback then
                 job.callback({
                     ok = false,
@@ -360,8 +364,29 @@ function Http.cancel(job)
     end
     job.cancelled = true
     job.done = true
+    active_jobs[job] = nil
     kill_job(job)
     Paths.remove_tree(job.dir)
+end
+
+function Http.cancel_all()
+    local jobs = {}
+    for job in pairs(active_jobs) do
+        jobs[#jobs + 1] = job
+    end
+    for _, job in ipairs(jobs) do
+        Http.cancel(job)
+    end
+    Log.info("http", "cancel_all", { count = #jobs })
+    return #jobs
+end
+
+function Http.active_count()
+    local count = 0
+    for _ in pairs(active_jobs) do
+        count = count + 1
+    end
+    return count
 end
 
 local function fail_res(err, status)
@@ -427,6 +452,7 @@ local function launch(opts, callback)
         cancelled = false,
         done = false,
     }
+    active_jobs[job] = true
     remove_file(job.body_path)
     remove_file(job.header_path)
     remove_file(job.code_path)
@@ -435,6 +461,7 @@ local function launch(opts, callback)
     remove_file(job.err_path)
     local ok, err = write_config(job, opts)
     if not ok then
+        active_jobs[job] = nil
         Log.warn("http", "cfg_fail", { err = err })
         return nil, fail_res(err)
     end
@@ -497,6 +524,7 @@ function Http.request_sync(opts)
             Log.warn("http", "curl_timeout", { url = job.url })
             kill_job(job)
             job.done = true
+            active_jobs[job] = nil
             result = fail_res("timeout", "offline")
             Paths.remove_tree(job.dir)
             break

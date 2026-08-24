@@ -1,6 +1,6 @@
 local UIManager = require("ui/uimanager")
 local Config = require("wereadlite.config")
-local Client = require("wereadlite.kindle.client")
+local Http = require("wereadlite.async_http")
 local Json = require("wereadlite.json")
 local Log = require("wereadlite.log")
 
@@ -10,7 +10,9 @@ local Heartbeat = {
 
 local generation = 0
 local task
+local request_job
 local last_report
+local paused = false
 local enc_cache_path
 local enc_cache_text
 pcall(math.randomseed, os.time())
@@ -184,7 +186,13 @@ function Heartbeat.payload(state, reading_seconds)
 end
 
 function Heartbeat.report(reading_seconds)
-    local payload, err = Heartbeat.payload(Heartbeat.state, reading_seconds)
+    if paused or request_job then
+        Log.dbg("heartbeat", "skip", { err = paused and "paused" or "in_flight" })
+        return nil, paused and "paused" or "in_flight"
+    end
+    local my_gen = generation
+    local state = Heartbeat.state
+    local payload, err = Heartbeat.payload(state, reading_seconds)
     if not payload then
         Log.dbg("heartbeat", "skip", { err = err })
         return nil, err
@@ -194,8 +202,9 @@ function Heartbeat.report(reading_seconds)
         Log.warn("heartbeat", "json", { err = encode_err })
         return nil, encode_err
     end
-    local referer = Heartbeat.state and Heartbeat.state.url or Config.READER_URL
-    local _, status, detail = Client.request({
+    local referer = state and state.url or Config.READER_URL
+    local job
+    job = Http.request({
         url = Config.BOOKREAD_URL,
         method = "POST",
         body = body,
@@ -203,18 +212,32 @@ function Heartbeat.report(reading_seconds)
         referer = referer,
         accept = "*/*",
         timeout = 10,
-    })
-    if status ~= "ok" then
-        Log.warn("heartbeat", "request", { status = status, err = detail })
-        return nil, status, detail
+    }, function(res)
+        if request_job == job then
+            request_job = nil
+        end
+        if my_gen ~= generation then
+            return
+        end
+        if not res or not res.ok then
+            Log.warn("heartbeat", "request", {
+                status = res and res.status or "offline",
+                err = res and res.err or "request_not_started",
+            })
+            return
+        end
+        Log.dbg("heartbeat", "ok", {
+            book_id = payload.b,
+            uid = payload.c,
+            rt = payload.rt,
+            pr = payload.pr,
+            co = payload.co,
+        })
+    end)
+    if not job then
+        return nil, "request_not_started"
     end
-    Log.dbg("heartbeat", "ok", {
-        book_id = payload.b,
-        uid = payload.c,
-        rt = payload.rt,
-        pr = payload.pr,
-        co = payload.co,
-    })
+    request_job = job
     return true
 end
 
@@ -223,7 +246,9 @@ local function schedule(my_gen)
         if my_gen ~= generation then
             return
         end
-        pcall(Heartbeat.report, Heartbeat.INTERVAL)
+        if not paused then
+            pcall(Heartbeat.report, Heartbeat.INTERVAL)
+        end
         last_report = now_seconds()
         if my_gen ~= generation then
             return
@@ -244,14 +269,50 @@ function Heartbeat.stop(flush)
         UIManager:unschedule(task)
         task = nil
     end
+    if request_job then
+        Http.cancel(request_job)
+        request_job = nil
+    end
     if flush and state and elapsed >= 5 then
         Heartbeat.state = state
+        paused = false
         pcall(Heartbeat.report, elapsed)
     end
     Heartbeat.state = nil
     last_report = nil
     enc_cache_path = nil
     enc_cache_text = nil
+    paused = false
+end
+
+function Heartbeat.pause(reason)
+    if not Heartbeat.state then
+        return false
+    end
+    generation = generation + 1
+    paused = true
+    if task then
+        UIManager:unschedule(task)
+        task = nil
+    end
+    if request_job then
+        Http.cancel(request_job)
+        request_job = nil
+    end
+    last_report = nil
+    Log.info("heartbeat", "pause", { reason = reason })
+    return true
+end
+
+function Heartbeat.resume()
+    if not Heartbeat.state or not paused then
+        return false
+    end
+    paused = false
+    last_report = now_seconds()
+    schedule(generation)
+    Log.info("heartbeat", "resume", { generation = generation })
+    return true
 end
 
 function Heartbeat.start(state)
@@ -260,6 +321,7 @@ function Heartbeat.start(state)
         return
     end
     Heartbeat.state = state
+    paused = false
     last_report = now_seconds()
     schedule(generation)
     Log.dbg("heartbeat", "start", {
