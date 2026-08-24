@@ -100,6 +100,14 @@ local function key_from(data)
     end
 end
 
+local function reader_url_from_deep_link(deep_link)
+    deep_link = tostring(deep_link or "")
+    local bc = deep_link:match("[?&]v=([%w_%-]+)")
+    if bc and bc ~= "" then
+        return Config.READER_URL .. "?bc=" .. bc
+    end
+end
+
 function Skill.ensure_key(force)
     if not force then
         local cached = Settings.skill_apikey()
@@ -252,6 +260,7 @@ local function add_book(books, seen, item)
         return
     end
     seen[key] = true
+    local deep_link = tostring(info.deepLink or info.deeplink or "")
     books[#books + 1] = {
         bookId = book_id,
         title = title,
@@ -260,7 +269,8 @@ local function add_book(books, seen, item)
         cover = tostring(info.cover or ""),
         category = tostring(info.category or ""),
         publisher = tostring(info.publisher or ""),
-        deepLink = tostring(info.deepLink or info.deeplink or ""),
+        deepLink = deep_link,
+        reader_url = reader_url_from_deep_link(deep_link),
         soldout = tonumber(info.soldout or item.soldout) or 0,
         rating = tonumber(item.newRating or info.newRating) or 0,
         rating_count = tonumber(item.newRatingCount or info.newRatingCount) or 0,

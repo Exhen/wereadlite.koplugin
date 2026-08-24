@@ -96,7 +96,47 @@ local function show_text(title, text)
     })
 end
 
-local function book_detail_text(book)
+local book_detail_text
+
+local function show_book_detail(book)
+    local dialog
+    local buttons = {
+        {
+            {
+                text = "关闭",
+                callback = function()
+                    UIManager:close(dialog)
+                end,
+            },
+        },
+    }
+    if book.reader_url and book.reader_url ~= "" then
+        buttons[#buttons + 1] = {
+            {
+                text = "开始阅读",
+                callback = function()
+                    UIManager:close(dialog)
+                    local Reading = require("wereadlite.reading")
+                    Reading.open_url(book.reader_url, {
+                        bookId = book.bookId,
+                        title = book.title,
+                        author = book.author,
+                        cover = book.cover,
+                        reader_param = book.reader_url,
+                    }, { resume = true })
+                end,
+            },
+        }
+    end
+    dialog = ButtonDialog:new{
+        title = book_detail_text(book),
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+book_detail_text = function(book)
     local lines = { book.title or "" }
     if book.author and book.author ~= "" then
         lines[#lines + 1] = "作者  " .. book.author
@@ -157,7 +197,7 @@ local function show_search_results(result)
                 align = "left",
                 callback = function()
                     UIManager:close(dialog)
-                    show_text(book.title or "书籍", book_detail_text(book))
+                    show_book_detail(book)
                 end,
             },
         }
@@ -186,7 +226,7 @@ function SkillView.show_book_detail(book)
     if type(book) ~= "table" then
         return
     end
-    show_text(book.title or "书籍", book_detail_text(book))
+    show_book_detail(book)
 end
 
 function SkillView.run_search(keyword, on_result)
