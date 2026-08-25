@@ -431,7 +431,10 @@ local function launch(opts, callback)
     end)
     local dir = string.format("%s/%d-%d-%d-%d", root, os.time(), job_seq, pid, math.random(100000, 999999))
     mkdir(dir)
-    local timeout = math.max(3, tonumber(opts.timeout) or 15)
+    -- Keep short-lived requests (notably review avatars) at the timeout
+    -- requested by the caller.  Clamping to 3 seconds made the configured
+    -- 1-second avatar timeout ineffective on e-ink devices.
+    local timeout = math.max(1, tonumber(opts.timeout) or 15)
     local method = opts.method or (opts.body and "POST" or "GET")
     local job = {
         url = opts.url,

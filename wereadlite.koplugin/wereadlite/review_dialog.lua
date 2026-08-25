@@ -27,6 +27,12 @@ function FixedBox:getSize()
 end
 function FixedBox:paintTo(bb, x, y)
     self.dimen = Geom:new{ x = x, y = y, w = self.width, h = self.height }
+    -- FixedBox is also used as the avatar fallback.  It is deliberately a
+    -- leaf widget, unlike FrameContainer, so it must not be asked to paint a
+    -- missing child (FrameContainer:getSize() assumes one exists).
+    if self.background then
+        bb:paintRect(x, y, self.width, self.height, self.background)
+    end
     if not self[1] then return end
     local size = self[1]:getSize() or {}
     local w = math.min(tonumber(size.w) or self.width, self.width)
@@ -80,7 +86,14 @@ function ReviewDialog:_rebuild()
     for _, item in ipairs(pages[self.page]) do
         local r = item.r
         local name = TextBoxWidget:new{ text = tostring(r.username or "微信读书用户"), width = max_w - PAD * 2 - AVATAR - GAP, face = Font:getFace("cfont", 19), fgcolor = Blitbuffer.COLOR_DARK_GRAY, bold = true, alignment = "left" }
-        local photo = avatar(r.avatar_path) or FrameContainer:new{ width = AVATAR, height = AVATAR, background = Blitbuffer.COLOR_GRAY_4 }
+        -- Never use an empty FrameContainer here: its getSize() dereferences
+        -- a nil child during the next e-ink repaint when an avatar request
+        -- timed out or returned an invalid image.
+        local photo = avatar(r.avatar_path) or FixedBox:new{
+            width = AVATAR,
+            height = AVATAR,
+            background = Blitbuffer.COLOR_GRAY_4,
+        }
         local row = HorizontalGroup:new{ align = "top" }
         row[#row + 1] = photo
         row[#row + 1] = HorizontalSpan:new{ width = Screen:scaleBySize(20) }
@@ -96,7 +109,7 @@ function ReviewDialog:_rebuild()
     end
     local nav = HorizontalGroup:new{ align = "center", Button:new{ text = "上一页", enabled = self.page > 1, width = Screen:scaleBySize(100), callback = function() turn(self.page - 1) end }, HorizontalSpan:new{ width = Screen:scaleBySize(18) }, Button:new{ text = string.format("第 %d / %d 页", self.page, #pages), enabled = false, width = Screen:scaleBySize(130) }, HorizontalSpan:new{ width = Screen:scaleBySize(18) }, Button:new{ text = "下一页", enabled = self.page < #pages, width = Screen:scaleBySize(100), callback = function() turn(self.page + 1) end } }
     local list_height = self.height - title_h - Screen:scaleBySize(92)
-    local list_frame = FixedBox:new{ width = self.width, height = list_height, FrameContainer:new{ width = self.width, height = list_height, padding = 0, background = Blitbuffer.COLOR_WHITE, list } }
+    local list_frame = FixedBox:new{ width = self.width, height = list_height, list }
     self[1] = FrameContainer:new{ background = Blitbuffer.COLOR_WHITE, width = self.width, height = self.height, VerticalGroup:new{ align = "center", TitleBar:new{ width = self.width, fullscreen = true, title = "划线评论", with_bottom_line = true, close_callback = function() UIManager:close(self) end }, list_frame, VerticalSpan:new{ height = Screen:scaleBySize(8) }, nav, VerticalSpan:new{ height = Screen:scaleBySize(12) } } }
 end
 return ReviewDialog

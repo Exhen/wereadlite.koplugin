@@ -1,4 +1,5 @@
 local ButtonDialog = require("ui/widget/buttondialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local DoubleSpinWidget = require("ui/widget/doublespinwidget")
 local LuaSettings = require("luasettings")
@@ -118,7 +119,7 @@ end
 function Settings.load_review_comments()
     local data = Settings.load()
     local value = data:readSetting("load_review_comments")
-    return value == nil and true or value == true or value == 1
+    return value ~= nil and (value == true or value == 1) or false
 end
 
 function Settings.set_load_review_comments(enabled)
@@ -132,7 +133,7 @@ function Settings.show_review_comments_dialog(on_changed)
     local dialog
     local current = Settings.load_review_comments()
     dialog = ButtonDialog:new{
-        title = "打开书时加载划线与评论",
+        title = "打开书时加载划线与想法",
         title_align = "center",
         use_info_style = false,
         buttons = {{
@@ -146,6 +147,61 @@ function Settings.show_review_comments_dialog(on_changed)
             end },
         }},
     }
+    UIManager:show(dialog)
+end
+
+function Settings.prefetch_next_chapter()
+    local data = Settings.load()
+    local value = data:readSetting("prefetch_next_chapter")
+    return value ~= nil and (value == true or value == 1) or false
+end
+
+function Settings.set_prefetch_next_chapter(enabled)
+    enabled = enabled and true or false
+    local data = Settings.load()
+    data:saveSetting("prefetch_next_chapter", enabled)
+    data:flush()
+    if not enabled then
+        -- Stop pending work immediately when the user disables prefetching.
+        local ok, Reader = pcall(require, "wereadlite.kindle.reader")
+        if ok and Reader and type(Reader.cancel_prefetch) == "function" then
+            pcall(Reader.cancel_prefetch)
+        end
+        local ok_reading, Reading = pcall(require, "wereadlite.reading")
+        if ok_reading and Reading and type(Reading.cancel_prefetch) == "function" then
+            pcall(Reading.cancel_prefetch)
+        end
+    end
+    Log.info("settings", "prefetch_next_chapter", { enabled = enabled })
+    return enabled
+end
+
+function Settings.show_prefetch_next_chapter_dialog(on_changed)
+    local current = Settings.prefetch_next_chapter()
+    local dialog
+    if current then
+        dialog = ConfirmBox:new{
+            name = "wereadlite_prefetch_next_chapter",
+            text = "关闭后，翻到下一章时将按需加载内容。",
+            ok_text = "关闭预加载",
+            cancel_text = "保持开启",
+            ok_callback = function()
+                Settings.set_prefetch_next_chapter(false)
+                if on_changed then on_changed() end
+            end,
+        }
+    else
+        dialog = ConfirmBox:new{
+            name = "wereadlite_prefetch_next_chapter",
+            text = "开启预加载可能会导致翻页时偶尔卡顿，是否开启？",
+            ok_text = "开启预加载",
+            cancel_text = "保持关闭",
+            ok_callback = function()
+                Settings.set_prefetch_next_chapter(true)
+                if on_changed then on_changed() end
+            end,
+        }
+    end
     UIManager:show(dialog)
 end
 
@@ -959,10 +1015,19 @@ function Settings.show_menu(on_changed, on_search, on_logout)
             },
             {
                 {
-                    text = string.format("打开书时加载划线与评论  %s", Settings.load_review_comments() and "是" or "否"),
+                    text = string.format("打开书时加载划线与想法  %s", Settings.load_review_comments() and "是" or "否"),
                     callback = function()
                         UIManager:close(menu)
                         Settings.show_review_comments_dialog(on_changed)
+                    end,
+                },
+            },
+            {
+                {
+                    text = string.format("预先加载下一章  %s", Settings.prefetch_next_chapter() and "是" or "否"),
+                    callback = function()
+                        UIManager:close(menu)
+                        Settings.show_prefetch_next_chapter_dialog(on_changed)
                     end,
                 },
             },

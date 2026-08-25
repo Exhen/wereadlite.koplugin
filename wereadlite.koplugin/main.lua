@@ -88,6 +88,14 @@ function Plugin:onReaderReady()
     Reading.patch_reader_ui(self.ui)
 end
 
+function Plugin:onPageUpdate()
+    Reading.refresh_review_hit_regions(self.ui)
+end
+
+function Plugin:onPosUpdate()
+    Reading.refresh_review_hit_regions(self.ui)
+end
+
 function Plugin:onNetworkConnected()
     Gate.on_network_changed()
     self:_scheduleHeartbeatResume("network_connected")

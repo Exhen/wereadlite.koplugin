@@ -838,8 +838,13 @@ function Reader.prefetch_next(state, book)
     end
 end
 
-local function html_escape(text)
-    return tostring(text or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+function Reader.cancel_prefetch()
+    local job = Reader._prefetch_job
+    Reader._prefetch_job = nil
+    if job and type(job.cancel) == "function" then
+        pcall(job.cancel, job)
+        Log.dbg("reader", "prefetch_cancelled")
+    end
 end
 
 local function html_entity(text)
@@ -882,7 +887,7 @@ local function find_text_in_html(html, wanted)
     return starts[at], ends[at + #wanted - 1]
 end
 
-local function underline_html_range(html, start_at, finish_at, id)
+local function underline_html_range(html, start_at, finish_at)
     local out, cursor = {}, 1
     while cursor <= #html do
         local tag_start, tag_end = html:find("<[^>]*>", cursor)
@@ -892,8 +897,7 @@ local function underline_html_range(html, start_at, finish_at, id)
             local right = math.min(text_end, finish_at)
             if left <= right then
                 out[#out + 1] = html:sub(cursor, left - 1)
-                out[#out + 1] = '<span class="wereadlite-highlight" data-wereadlite-review="'
-                    .. id .. '" style="text-decoration: underline;">'
+                out[#out + 1] = '<span class="wereadlite-highlight" style="text-decoration: underline; text-decoration-style: dashed;">'
                 out[#out + 1] = html:sub(left, right)
                 out[#out + 1] = "</span>"
                 out[#out + 1] = html:sub(right + 1, text_end)
@@ -909,15 +913,14 @@ local function underline_html_range(html, start_at, finish_at, id)
 end
 
 local function add_highlight_reviews(body, book_id, chapter_uid)
-    Reader.review_data = {}
-    Reader.review_marks = {}
+    local review_data, review_marks = {}, {}
     Log.info("reader", "highlight_reviews_start", { book_id = book_id, chapter_uid = chapter_uid, body_bytes = #tostring(body or "") })
     local ok, marks = pcall(Skill.chapter_highlights, book_id, chapter_uid)
     if not ok or type(marks) ~= "table" or #marks == 0 then
         Log.warn("reader", "highlight_reviews_none", { ok = ok, type = type(marks), count = type(marks) == "table" and #marks or 0 })
-        return body, 0
+        return body, 0, review_data, review_marks
     end
-    local notes, count = {}, 0
+    local count = 0
     for _, mark in ipairs(marks) do
         local text = tostring(mark.text or "")
         if text ~= "" and type(mark.reviews) == "table" and #mark.reviews > 0 then
@@ -925,27 +928,23 @@ local function add_highlight_reviews(body, book_id, chapter_uid)
             if at then
                 count = count + 1
                 local id = "wereadlite_review_" .. tostring(count)
-                Reader.review_data[id] = mark.reviews
-                Reader.review_marks[#Reader.review_marks + 1] = { id = id, text = text, reviews = mark.reviews }
-                local review_lines = {}
-                for _, review in ipairs(mark.reviews) do
-                    review_lines[#review_lines + 1] = "<p>" .. html_escape(type(review) == "table" and review.content or review) .. "</p>"
-                end
-                body = underline_html_range(body, at, finish_at, id)
+                review_data[id] = mark.reviews
+                review_marks[#review_marks + 1] = {
+                    id = id,
+                    text = text,
+                    reviews = mark.reviews,
+                    range = mark.range,
+                }
+                body = underline_html_range(body, at, finish_at)
                 Log.dbg("reader", "highlight_range", { start = at, finish = finish_at, bytes = finish_at - at + 1 })
-                notes[#notes + 1] = '<aside epub:type="footnote" id="' .. id .. '" class="wereadlite-review">'
-                    .. table.concat(review_lines) .. "</aside>"
                 Log.dbg("reader", "highlight_match", { index = count, text_bytes = #text, reviews = #mark.reviews, range = mark.range })
             else
                 Log.warn("reader", "highlight_no_match", { text_bytes = #text, range = mark.range })
             end
         end
     end
-    if count > 0 then
-        body = body .. '<section class="wereadlite-reviews">' .. table.concat(notes) .. "</section>"
-    end
     Log.info("reader", "highlight_reviews_done", { injected = count, available = #marks })
-    return body, count
+    return body, count, review_data, review_marks
 end
 
 function Reader.load(url, book, on_progress, on_ready)
@@ -1160,21 +1159,23 @@ function Reader.load(url, book, on_progress, on_ready)
         -- this out of decode/wrap ensures image localization always finishes
         -- first and a Skill failure cannot interfere with image caching.
         if not Settings.load_review_comments() then
-            Reader.review_data = {}
-            Reader.review_marks = {}
+            state.review_data = {}
+            state.review_marks = {}
             Log.info("reader", "reviews_stage_skip", { reason = "disabled" })
         else
-        report("reviews", 0, 1)
-        Log.info("reader", "reviews_stage_start", {
-            book_id = state.book_id,
-            chapter_uid = state.cur and state.cur.uid,
-        })
-        local marked_html, review_count = add_highlight_reviews(
-            decrypted_html, state.book_id, state.cur and state.cur.uid
-        )
-        decrypted_html = marked_html
-        report("reviews", 1, 1)
-        Log.info("reader", "reviews_stage_done", { count = review_count })
+            report("reviews", 0, 1)
+            Log.info("reader", "reviews_stage_start", {
+                book_id = state.book_id,
+                chapter_uid = state.cur and state.cur.uid,
+            })
+            local marked_html, review_count, review_data, review_marks = add_highlight_reviews(
+                decrypted_html, state.book_id, state.cur and state.cur.uid
+            )
+            decrypted_html = marked_html
+            state.review_data = review_data
+            state.review_marks = review_marks
+            report("reviews", 1, 1)
+            Log.info("reader", "reviews_stage_done", { count = review_count })
         end
         -- Encrypted backup only remaps resources already cached above.
         local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
