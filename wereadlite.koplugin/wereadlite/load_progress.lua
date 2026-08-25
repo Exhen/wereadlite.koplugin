@@ -14,9 +14,10 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 
 local STAGES = {
-    download = { from = 0, to = 0.34, text = "下载章节" },
-    load = { from = 0.34, to = 0.67, text = "加载章节" },
-    images = { from = 0.67, to = 1, text = "下载书内图片" },
+    download = { from = 0, to = 0.30, text = "下载章节" },
+    load = { from = 0.30, to = 0.60, text = "加载章节" },
+    images = { from = 0.60, to = 0.85, text = "下载书内图片" },
+    reviews = { from = 0.85, to = 1, text = "加载划线与评论" },
 }
 
 local LoadProgress = InputContainer:extend{

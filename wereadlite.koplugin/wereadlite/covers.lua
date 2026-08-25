@@ -125,7 +125,7 @@ function Covers.download(url, dest_stem, referer, timeout)
     return dest
 end
 
-function Covers.download_async(url, dest_stem, referer, callback)
+function Covers.download_async(url, dest_stem, referer, callback, timeout)
     callback = callback or function() end
     url = tostring(url or "")
     if url == "" then
@@ -136,7 +136,7 @@ function Covers.download_async(url, dest_stem, referer, callback)
     end
     if not Http.available() then
         UIManager:nextTick(function()
-            local path, err = Covers.download(url, dest_stem, referer)
+            local path, err = Covers.download(url, dest_stem, referer, timeout)
             callback(path, err)
         end)
         return
@@ -145,7 +145,7 @@ function Covers.download_async(url, dest_stem, referer, callback)
         url = url,
         accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         referer = referer or Config.SHELF_URL,
-        timeout = 30,
+        timeout = tonumber(timeout) or 30,
         absorb_cookies = false,
     }, function(res)
         if not res or not res.ok or not res.body then

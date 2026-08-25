@@ -115,6 +115,40 @@ function Settings.set_skill_apikey(key)
     Log.dbg("settings", "skill_apikey", { set = key ~= "", len = #key })
 end
 
+function Settings.load_review_comments()
+    local data = Settings.load()
+    local value = data:readSetting("load_review_comments")
+    return value == nil and true or value == true or value == 1
+end
+
+function Settings.set_load_review_comments(enabled)
+    local data = Settings.load()
+    data:saveSetting("load_review_comments", enabled and true or false)
+    data:flush()
+    Log.info("settings", "load_review_comments", { enabled = enabled and true or false })
+end
+
+function Settings.show_review_comments_dialog(on_changed)
+    local dialog
+    local current = Settings.load_review_comments()
+    dialog = ButtonDialog:new{
+        title = "打开书时加载划线与评论",
+        title_align = "center",
+        use_info_style = false,
+        buttons = {{
+            { text = (current and "是  · 当前" or "是"), callback = function()
+                UIManager:close(dialog); Settings.set_load_review_comments(true)
+                if on_changed then on_changed() end
+            end },
+            { text = (not current and "否  · 当前" or "否"), callback = function()
+                UIManager:close(dialog); Settings.set_load_review_comments(false)
+                if on_changed then on_changed() end
+            end },
+        }},
+    }
+    UIManager:show(dialog)
+end
+
 function Settings.image_concurrency()
     local data = Settings.load()
     return clamp(
@@ -920,6 +954,15 @@ function Settings.show_menu(on_changed, on_search, on_logout)
                     callback = function()
                         UIManager:close(menu)
                         Settings.show_image_concurrency_dialog()
+                    end,
+                },
+            },
+            {
+                {
+                    text = string.format("打开书时加载划线与评论  %s", Settings.load_review_comments() and "是" or "否"),
+                    callback = function()
+                        UIManager:close(menu)
+                        Settings.show_review_comments_dialog(on_changed)
                     end,
                 },
             },

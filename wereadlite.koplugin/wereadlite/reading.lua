@@ -7,6 +7,9 @@ local Reader = require("wereadlite.kindle.reader")
 local BookDb = require("wereadlite.book_db")
 local Heartbeat = require("wereadlite.kindle.heartbeat")
 local Bookmark = require("wereadlite.kindle.bookmark")
+local TextViewer = require("ui/widget/textviewer")
+local Covers = require("wereadlite.covers")
+local ReviewDialog = require("wereadlite.review_dialog")
 
 local Reading = {
     book = nil,
@@ -17,6 +20,26 @@ local Reading = {
     _load_task = nil,
     _load_bar = nil,
 }
+
+local function show_review_comments(reviews)
+    UIManager:show(ReviewDialog:new{ reviews = reviews })
+end
+
+local function prepare_review_comments(reviews)
+    local pending = 0
+    for _, review in ipairs(reviews or {}) do
+        if type(review) == "table" and review.avatar and review.avatar ~= "" then
+            pending = pending + 1
+            local stem = Covers.dir() .. "/review_avatar_" .. tostring(review.id or pending):gsub("[^%w%-_]", "_")
+            Covers.download_async(review.avatar, stem, nil, function(path)
+                review.avatar_path = path
+                pending = pending - 1
+                if pending == 0 then show_review_comments(reviews) end
+            end, 1)
+        end
+    end
+    if pending == 0 then show_review_comments(reviews) end
+end
 
 local function show_error(text)
     UIManager:show(InfoMessage:new{
@@ -242,6 +265,44 @@ local function open_document(path, resume, state)
     local function after_open()
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
+        -- ReaderUI sets its singleton instance immediately after invoking
+        -- after_open_callback.  Defer one tick so both a fresh reader and a
+        -- switched document register on the actual active instance (desktop
+        -- mouse clicks are translated to this same `tap` gesture).
+        UIManager:nextTick(function()
+        local ui = require("apps/reader/readerui").instance
+        if ui and ui.registerTouchZones and ui.view and ui.document then
+            ui:registerTouchZones({{
+                id = "wereadlite_review_tap",
+                ges = "tap",
+                screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
+                overrides = {
+                    "readerhighlight_tap", "readerfooter_tap", "readerconfigmenu_ext_tap",
+                    "readerconfigmenu_tap", "readermenu_ext_tap", "readermenu_tap",
+                    "tap_forward", "tap_backward",
+                },
+                handler = function(ges)
+                    Log.dbg("reading", "review_tap_event", { has_pos = ges and ges.pos ~= nil })
+                    if not Reading.is_active() or not ges or not ges.pos then return end
+                    local pos = ui.view:screenToPageTransform(ges.pos)
+                    local word = ui.document:getWordFromPosition(pos, true)
+                    local tapped = word and tostring(word.word or ""):gsub("%s+", "") or ""
+                    if tapped == "" then return end
+                    for _, mark in ipairs(Reader.review_marks or {}) do
+                        local marked = tostring(mark.text or ""):gsub("%s+", "")
+                        if marked:find(tapped, 1, true) then
+                            Log.info("reading", "review_tap", { id = mark.id, word = tapped, reviews = #mark.reviews })
+                            prepare_review_comments(mark.reviews)
+                            return true
+                        end
+                    end
+                end,
+            }})
+            Log.dbg("reading", "review_touch_registered", { marks = #(Reader.review_marks or {}) })
+        else
+            Log.warn("reading", "review_touch_register_fail", { has_ui = ui ~= nil })
+        end
+        end)
         if type(resume) == "table" then
             UIManager:scheduleIn(0.35, function()
                 Reading.goto_resume(resume, path, state)

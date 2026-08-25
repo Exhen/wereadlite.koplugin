@@ -6,8 +6,12 @@ local Images = require("wereadlite.kindle.images")
 local Json = require("wereadlite.json")
 local Nuxt = require("wereadlite.kindle.nuxt")
 local BookDb = require("wereadlite.book_db")
+local Skill = require("wereadlite.skill")
+local Settings = require("wereadlite.settings")
 
 local Reader = {}
+Reader.review_data = {}
+Reader.review_marks = {}
 
 local function mkdir(path)
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
@@ -653,6 +657,116 @@ function Reader.fetch(url)
     return body
 end
 
+local function html_escape(text)
+    return tostring(text or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+end
+
+local function html_entity(text)
+    return tostring(text or ""):gsub("&nbsp;", " "):gsub("&quot;", '"')
+        :gsub("&#39;", "'"):gsub("&apos;", "'"):gsub("&amp;", "&")
+        :gsub("&#(%d+);", function(n) return string.char(tonumber(n) or 32) end)
+        :gsub("&#x([%da-fA-F]+);", function(n) return string.char(tonumber(n, 16) or 32) end)
+end
+
+local function find_text_in_html(html, wanted)
+    wanted = html_entity(wanted):gsub("%s+", " ")
+    local plain, starts, ends = {}, {}, {}
+    local p, n = 1, 0
+    while p <= #html do
+        local a, b = html:find("<[^>]*>", p)
+        local stop = a or (#html + 1)
+        if stop > p then
+            local chunk = html_entity(html:sub(p, stop - 1))
+            for i = 1, #chunk do
+                local c = chunk:sub(i, i)
+                if not c:match("%s") then
+                    local width = #c
+                    n = n + width
+                    plain[n] = c
+                    for j = n - width + 1, n do
+                        starts[j], ends[j] = p + i - 1, p + i - 1
+                    end
+                elseif plain[n] ~= " " then
+                    n = n + 1
+                    plain[n], starts[n], ends[n] = " ", p + i - 1, p + i - 1
+                end
+            end
+        end
+        if not a then break end
+        p = b + 1
+    end
+    local text = table.concat(plain)
+    local at = text:find(wanted, 1, true)
+    if not at then return nil end
+    return starts[at], ends[at + #wanted - 1]
+end
+
+local function underline_html_range(html, start_at, finish_at, id)
+    local out, cursor = {}, 1
+    while cursor <= #html do
+        local tag_start, tag_end = html:find("<[^>]*>", cursor)
+        local text_end = tag_start and (tag_start - 1) or #html
+        if text_end >= cursor then
+            local left = math.max(cursor, start_at)
+            local right = math.min(text_end, finish_at)
+            if left <= right then
+                out[#out + 1] = html:sub(cursor, left - 1)
+                out[#out + 1] = '<span class="wereadlite-highlight" data-wereadlite-review="'
+                    .. id .. '" style="text-decoration: underline;">'
+                out[#out + 1] = html:sub(left, right)
+                out[#out + 1] = "</span>"
+                out[#out + 1] = html:sub(right + 1, text_end)
+            else
+                out[#out + 1] = html:sub(cursor, text_end)
+            end
+        end
+        if not tag_start then break end
+        out[#out + 1] = html:sub(tag_start, tag_end)
+        cursor = tag_end + 1
+    end
+    return table.concat(out)
+end
+
+local function add_highlight_reviews(body, book_id, chapter_uid)
+    Reader.review_data = {}
+    Reader.review_marks = {}
+    Log.info("reader", "highlight_reviews_start", { book_id = book_id, chapter_uid = chapter_uid, body_bytes = #tostring(body or "") })
+    local ok, marks = pcall(Skill.chapter_highlights, book_id, chapter_uid)
+    if not ok or type(marks) ~= "table" or #marks == 0 then
+        Log.warn("reader", "highlight_reviews_none", { ok = ok, type = type(marks), count = type(marks) == "table" and #marks or 0 })
+        return body, 0
+    end
+    local notes, count = {}, 0
+    for _, mark in ipairs(marks) do
+        local text = tostring(mark.text or "")
+        if text ~= "" and type(mark.reviews) == "table" and #mark.reviews > 0 then
+            local at, finish_at = find_text_in_html(body, text)
+            if at then
+                count = count + 1
+                local id = "wereadlite_review_" .. tostring(count)
+                Reader.review_data[id] = mark.reviews
+                Reader.review_marks[#Reader.review_marks + 1] = { id = id, text = text, reviews = mark.reviews }
+                local review_lines = {}
+                for _, review in ipairs(mark.reviews) do
+                    review_lines[#review_lines + 1] = "<p>" .. html_escape(type(review) == "table" and review.content or review) .. "</p>"
+                end
+                body = underline_html_range(body, at, finish_at, id)
+                Log.dbg("reader", "highlight_range", { start = at, finish = finish_at, bytes = finish_at - at + 1 })
+                notes[#notes + 1] = '<aside epub:type="footnote" id="' .. id .. '" class="wereadlite-review">'
+                    .. table.concat(review_lines) .. "</aside>"
+                Log.dbg("reader", "highlight_match", { index = count, text_bytes = #text, reviews = #mark.reviews, range = mark.range })
+            else
+                Log.warn("reader", "highlight_no_match", { text_bytes = #text, range = mark.range })
+            end
+        end
+    end
+    if count > 0 then
+        body = body .. '<section class="wereadlite-reviews">' .. table.concat(notes) .. "</section>"
+    end
+    Log.info("reader", "highlight_reviews_done", { injected = count, available = #marks })
+    return body, count
+end
+
 function Reader.load(url, book, on_progress, on_ready)
     book = book or {}
     local function report(stage, done, total)
@@ -861,6 +975,26 @@ function Reader.load(url, book, on_progress, on_ready)
     })
 
     local function finish(decrypted_html)
+        -- Highlights and reviews are a separate post-image stage.  Keeping
+        -- this out of decode/wrap ensures image localization always finishes
+        -- first and a Skill failure cannot interfere with image caching.
+        if not Settings.load_review_comments() then
+            Reader.review_data = {}
+            Reader.review_marks = {}
+            Log.info("reader", "reviews_stage_skip", { reason = "disabled" })
+        else
+        report("reviews", 0, 1)
+        Log.info("reader", "reviews_stage_start", {
+            book_id = state.book_id,
+            chapter_uid = state.cur and state.cur.uid,
+        })
+        local marked_html, review_count = add_highlight_reviews(
+            decrypted_html, state.book_id, state.cur and state.cur.uid
+        )
+        decrypted_html = marked_html
+        report("reviews", 1, 1)
+        Log.info("reader", "reviews_stage_done", { count = review_count })
+        end
         -- Encrypted backup only remaps resources already cached above.
         local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
         if not write_html(path, decrypted_html) then

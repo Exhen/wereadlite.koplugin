@@ -324,6 +324,83 @@ function Skill.search(keyword, opts)
     }
 end
 
+function Skill.chapter_highlights(book_id, chapter_uid)
+    book_id = tostring(book_id or "")
+    chapter_uid = tonumber(chapter_uid) or 0
+    if book_id == "" then
+        return {}
+    end
+    Log.info("skill", "chapter_highlights_start", { book_id = book_id, chapter_uid = chapter_uid })
+    local best = Skill.call("/book/bestbookmarks", {
+        bookId = book_id,
+        chapterUid = chapter_uid,
+        synckey = 0,
+    })
+    if type(best) ~= "table" or type(best.items) ~= "table" then
+        Log.warn("skill", "bestbookmarks_empty", { book_id = book_id, chapter_uid = chapter_uid, type = type(best) })
+        return {}
+    end
+    Log.info("skill", "bestbookmarks_ok", { book_id = book_id, chapter_uid = chapter_uid, items = #best.items })
+    local requests = {}
+    for _, item in ipairs(best.items) do
+        local range = tostring(item.range or "")
+        if range ~= "" then
+            requests[#requests + 1] = { range = range, maxIdx = 0, count = 20, synckey = 0 }
+        end
+    end
+    if #requests == 0 then
+        Log.info("skill", "readreviews_skip", { reason = "no_ranges" })
+        return {}
+    end
+    Log.info("skill", "readreviews_start", { book_id = book_id, chapter_uid = chapter_uid, ranges = #requests })
+    local reviews = Skill.call("/book/readreviews", {
+        bookId = book_id,
+        chapterUid = chapter_uid,
+        reviews = requests,
+    })
+    local by_range = {}
+    if type(reviews) == "table" and type(reviews.reviews) == "table" then
+        Log.info("skill", "readreviews_ok", { groups = #reviews.reviews })
+        for _, group in ipairs(reviews.reviews) do
+            local range = tostring(group.range or "")
+            local list = {}
+            for _, row in ipairs(group.pageReviews or {}) do
+                local review = type(row.review) == "table" and row.review or row
+                local content = tostring(review.content or "")
+                if content ~= "" then
+                    local author = type(review.author) == "table" and review.author or {}
+                    list[#list + 1] = {
+                        content = content,
+                        username = tostring(author.name or author.nickName or author.nickname or "微信读书用户"),
+                        avatar = tostring(author.avatar or author.avatarUrl or author.headImgUrl or ""),
+                        id = tostring(row.reviewId or review.reviewId or (#list + 1)),
+                    }
+                end
+            end
+            if range ~= "" and #list > 0 then
+                by_range[range] = list
+            end
+        end
+    end
+    if type(reviews) ~= "table" or type(reviews.reviews) ~= "table" then
+        Log.warn("skill", "readreviews_empty", { type = type(reviews) })
+    end
+    local out = {}
+    for _, item in ipairs(best.items) do
+        local range = tostring(item.range or "")
+        if range ~= "" and by_range[range] then
+            out[#out + 1] = {
+                range = range,
+                text = tostring(item.markText or ""),
+                reviews = by_range[range],
+                total = tonumber(item.totalCount) or 0,
+            }
+        end
+    end
+    Log.info("skill", "chapter_highlights_done", { matched = #out, ranges = #requests })
+    return out
+end
+
 local function start_of_day(ts)
     ts = tonumber(ts) or 0
     if ts <= 0 then
