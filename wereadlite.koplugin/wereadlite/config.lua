@@ -1,6 +1,6 @@
 local C = {
     NAME = "微信读书",
-    VERSION = "0.1.1",
+    VERSION = "0.2.0",
     PLUGIN_DIR = "wereadlite.koplugin",
     SETTINGS_FILE = "wereadlite.lua",
     ENTRY_FILENAME = "微信读书.epub",
