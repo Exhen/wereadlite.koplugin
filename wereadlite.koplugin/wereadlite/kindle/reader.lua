@@ -8,8 +8,58 @@ local Nuxt = require("wereadlite.kindle.nuxt")
 local BookDb = require("wereadlite.book_db")
 local Skill = require("wereadlite.skill")
 local Settings = require("wereadlite.settings")
+local AsyncHttp = require("wereadlite.async_http")
+local Paths = require("wereadlite.paths")
 
 local Reader = {}
+Reader._prefetch_job = nil
+Reader._prefetched = {}
+
+function Reader.take_prefetched(url)
+    url = tostring(url or "")
+    local state = Reader._prefetched[url]
+    if state then
+        Reader._prefetched[url] = nil
+        Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
+    end
+    return state
+end
+
+local function prefetch_key(url)
+    local h = 2166136261
+    for i = 1, #tostring(url or "") do
+        h = (h * 16777619 + tostring(url):byte(i)) % 4294967296
+    end
+    return string.format("%08x", h)
+end
+
+local function prefetch_path(url)
+    local dir = Paths.cache_dir() .. "/chapter_prefetch"
+    Paths.ensure(dir)
+    return dir .. "/" .. prefetch_key(url) .. ".html"
+end
+
+local function read_prefetch(url)
+    local path = prefetch_path(url)
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    local body = file:read("*a")
+    file:close()
+    if body and #body > 0 then
+        os.remove(path)
+        Log.info("reader", "prefetch_hit", { url = url, bytes = #body })
+        return body
+    end
+    os.remove(path)
+end
+
+local function has_prefetch(url)
+    local file = io.open(prefetch_path(url), "rb")
+    if not file then return false end
+    local size = file:seek("end") or 0
+    file:close()
+    return size > 0
+end
 Reader.review_data = {}
 Reader.review_marks = {}
 
@@ -634,6 +684,8 @@ function Reader.expand_catalog(state)
 end
 
 function Reader.fetch(url)
+    local cached = read_prefetch(url)
+    if cached then return cached end
     Log.dbg("reader", "fetch", { url = url })
     local body, status, err = Client.request({
         url = url,
@@ -655,6 +707,135 @@ function Reader.fetch(url)
     end
     Log.dbg("reader", "fetch_ok", { url = url, bytes = #body })
     return body
+end
+
+function Reader.prefetch_next(state)
+    local url = Reader.next_url(state)
+    if not url then return end
+    if has_prefetch(url) then
+        return
+    end
+    if Reader._prefetch_job then
+        AsyncHttp.cancel(Reader._prefetch_job)
+        Reader._prefetch_job = nil
+    end
+    Log.info("reader", "prefetch_start", { url = url })
+    Reader._prefetch_job = AsyncHttp.request({
+        url = url,
+        timeout = 30,
+        accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        referer = Config.READER_URL,
+        send_cookie = true,
+        absorb_cookies = true,
+    }, function(res)
+        Reader._prefetch_job = nil
+        if not res or not res.ok or not res.body or #res.body == 0 then
+            Log.warn("reader", "prefetch_fail", { url = url, status = res and res.status, err = res and res.err })
+            return
+        end
+        local path = prefetch_path(url)
+        local file = io.open(path .. ".tmp", "wb")
+        if file then
+            file:write(res.body)
+            file:close()
+            os.rename(path .. ".tmp", path)
+            Log.info("reader", "prefetch_done", { url = url, bytes = #res.body })
+
+            -- The first response is only a probe.  The chapter loader also
+            -- fetches each `sect` URL, so prefetch those bodies too.
+            local ok_parse, probe = pcall(Reader.parse, res.body)
+            local bc = url:match("[?&]bc=([^&]+)")
+            if ok_parse and type(probe) == "table" then
+                bc = (probe.cur and probe.cur.param) or bc
+            end
+            local total = ok_parse and tonumber(probe.section_count) or 1
+            total = math.max(1, total or 1)
+            if is_bc(bc) and total > 0 then
+                local pending, active, done = {}, 0, 0
+                for sect = 0, total - 1 do
+                    local sect_url = Reader.url_for(bc, { sect = sect })
+                    if not has_prefetch(sect_url) then pending[#pending + 1] = sect_url end
+                end
+                local pump
+                pump = function()
+                    while active < 2 and #pending > 0 do
+                        local sect_url = table.remove(pending, 1)
+                        active = active + 1
+                        AsyncHttp.request({
+                            url = sect_url,
+                            timeout = 30,
+                            accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            referer = Config.READER_URL,
+                            send_cookie = true,
+                            absorb_cookies = true,
+                        }, function(section_res)
+                            active = active - 1
+                            done = done + 1
+                            if section_res and section_res.ok and section_res.body and #section_res.body > 0 then
+                                local section_path = prefetch_path(sect_url)
+                                local section_file = io.open(section_path .. ".tmp", "wb")
+                                if section_file then
+                                    section_file:write(section_res.body)
+                                    section_file:close()
+                                    os.rename(section_path .. ".tmp", section_path)
+                                    Log.dbg("reader", "prefetch_section_done", { sect = sect, bytes = #section_res.body })
+                                end
+                            else
+                                Log.warn("reader", "prefetch_section_fail", { url = sect_url })
+                            end
+                            if #pending > 0 then pump() end
+                            if active == 0 and #pending == 0 then
+                                Log.info("reader", "prefetch_sections_done", { total = done })
+                            end
+                        end)
+                    end
+                end
+                pump()
+            end
+        end
+    end)
+end
+
+-- Full prefetch implementation: reuse the exact Reader.load pipeline so the
+-- next chapter is decoded, localized, annotated, and written as a ready HTML
+-- document before the user opens it.  This later declaration intentionally
+-- replaces the legacy raw-response prefetch above.
+function Reader.prefetch_next(state, book)
+    local url = Reader.next_url(state)
+    if not url then return end
+    local next_uid = state.next_param and tostring(state.next_param.uid or "") or ""
+    if next_uid ~= "" then
+        local existing = io.open(Reader.html_path(state.book_id, next_uid), "rb")
+        if existing then
+            existing:close()
+            Log.info("reader", "prefetch_already_ready", { uid = next_uid })
+            return
+        end
+    end
+    if Reader._prefetch_job and type(Reader._prefetch_job.cancel) == "function" then
+        pcall(Reader._prefetch_job.cancel, Reader._prefetch_job)
+        Reader._prefetch_job = nil
+    end
+    Log.info("reader", "prefetch_start", { url = url, mode = "full" })
+    local prefetch_book = book or state.book_info or { bookId = state.book_id, title = state.book_title }
+    local called, result, status, err = pcall(Reader.load, url, prefetch_book, nil, function(prefetched, ready_status, ready_err)
+        Reader._prefetch_job = nil
+        if prefetched then
+            Reader._prefetched[url] = prefetched
+            Log.info("reader", "prefetch_done", { url = url, html = prefetched.html_path, mode = "full" })
+        else
+            Log.warn("reader", "prefetch_fail", { url = url, status = ready_status, err = ready_err })
+        end
+    end)
+    if not called then
+        Reader._prefetch_job = nil
+        Log.warn("reader", "prefetch_throw", { url = url, err = result })
+    elseif status == "pending" then
+        Reader._prefetch_job = err
+    elseif result then
+        Reader._prefetch_job = nil
+        Log.info("reader", "prefetch_done", { url = url, html = result.html_path, mode = "full" })
+    end
 end
 
 local function html_escape(text)

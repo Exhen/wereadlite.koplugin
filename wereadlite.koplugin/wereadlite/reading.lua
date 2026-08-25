@@ -431,6 +431,17 @@ function Reading.open_url(url, book, opts)
             chapter_title = state.chapter_title or (state.cur and state.cur.title),
         })
         Heartbeat.start(state)
+        -- Delay the expensive full next-chapter pipeline until the reader has
+        -- been active for five seconds.  The state/document checks prevent a
+        -- stale callback from running after a chapter switch or shelf return.
+        UIManager:scheduleIn(5, function()
+            if Reading.state ~= state or not Reading.is_active() then
+                Log.dbg("reading", "prefetch_skip", { reason = "stale_after_delay" })
+                return
+            end
+            Log.dbg("reading", "prefetch_delay_done", { seconds = 5 })
+            Reader.prefetch_next(state, Reading.book)
+        end)
         Log.dbg("reading", "open_ok", {
             book_id = state.book_id,
             uid = state.cur and state.cur.uid,
@@ -440,6 +451,11 @@ function Reading.open_url(url, book, opts)
         })
     end
 
+    local prefetched = Reader.take_prefetched(url)
+    if prefetched then
+        complete(prefetched)
+        return true, "prefetched"
+    end
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete)
     if not called then
         close_bar()
