@@ -1,6 +1,5 @@
 local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
-local Geom = require("ui/geometry")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local LoadProgress = require("wereadlite.load_progress")
@@ -9,7 +8,6 @@ local Reader = require("wereadlite.kindle.reader")
 local BookDb = require("wereadlite.book_db")
 local Heartbeat = require("wereadlite.kindle.heartbeat")
 local Bookmark = require("wereadlite.kindle.bookmark")
-local TextViewer = require("ui/widget/textviewer")
 local Covers = require("wereadlite.covers")
 local ReviewDialog = require("wereadlite.review_dialog")
 local Settings = require("wereadlite.settings")
@@ -326,128 +324,6 @@ function Reading.is_last()
     return Reader.is_last(Reading.state)
 end
 
-local REVIEW_TOUCH_ZONE_ID = "wereadlite_review_tap"
-local REVIEW_TOUCH_OVERRIDES = {
-    -- Keep links and KOReader's native highlight handling above this zone,
-    -- but let review taps win over menus, footer controls and page turns.
-    "tap_top_left_corner",
-    "tap_top_right_corner",
-    "tap_left_bottom_corner",
-    "tap_right_bottom_corner",
-    "readerfooter_tap",
-    "readerconfigmenu_ext_tap",
-    "readerconfigmenu_tap",
-    "readermenu_ext_tap",
-    "readermenu_tap",
-    "tap_forward",
-    "tap_backward",
-}
-local REVIEW_TOUCH_UNREGISTER_OVERRIDES = {
-    -- Include the old native-highlight dependency so hot reloading removes
-    -- it if the zone was installed by a previous plugin version.
-    "readerhighlight_tap",
-    table.unpack(REVIEW_TOUCH_OVERRIDES),
-}
-
-local MAX_VISIBLE_REVIEW_CHARS = 10000
-
-local function utf8_from_codepoint(cp)
-    cp = tonumber(cp)
-    if not cp or cp < 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
-        return ""
-    elseif cp <= 0x7F then
-        return string.char(cp)
-    elseif cp <= 0x7FF then
-        return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
-    elseif cp <= 0xFFFF then
-        return string.char(
-            0xE0 + math.floor(cp / 0x1000),
-            0x80 + math.floor(cp / 0x40) % 0x40,
-            0x80 + cp % 0x40)
-    end
-    return string.char(
-        0xF0 + math.floor(cp / 0x40000),
-        0x80 + math.floor(cp / 0x1000) % 0x40,
-        0x80 + math.floor(cp / 0x40) % 0x40,
-        0x80 + cp % 0x40)
-end
-
-local function decode_review_entities(text)
-    return tostring(text or "")
-        :gsub("&#x([%da-fA-F]+);", function(value)
-            return utf8_from_codepoint(tonumber(value, 16))
-        end)
-        :gsub("&#(%d+);", function(value)
-            return utf8_from_codepoint(tonumber(value, 10))
-        end)
-        :gsub("&nbsp;", "\194\160")
-        :gsub("&quot;", '"')
-        :gsub("&apos;", "'")
-        :gsub("&#39;", "'")
-        :gsub("&lt;", "<")
-        :gsub("&gt;", ">")
-        :gsub("&amp;", "&")
-end
-
-local REVIEW_UNICODE_WHITESPACE = {
-    ["\194\160"] = true, -- no-break space
-    ["\225\154\128"] = true,
-    ["\226\128\128"] = true,
-    ["\226\128\129"] = true,
-    ["\226\128\130"] = true,
-    ["\226\128\131"] = true,
-    ["\226\128\132"] = true,
-    ["\226\128\133"] = true,
-    ["\226\128\134"] = true,
-    ["\226\128\135"] = true,
-    ["\226\128\136"] = true,
-    ["\226\128\137"] = true,
-    ["\226\128\138"] = true,
-    ["\226\128\168"] = true,
-    ["\226\128\169"] = true,
-    ["\226\128\175"] = true,
-    ["\226\129\159"] = true,
-    ["\227\128\128"] = true,
-}
-
-local function normalized_review_chars(text)
-    text = decode_review_entities(text)
-    local chars = {}
-    local i = 1
-    while i <= #text do
-        local first = text:byte(i)
-        local width = 1
-        if first and first >= 0xF0 and first <= 0xF7 then
-            width = 4
-        elseif first and first >= 0xE0 and first <= 0xEF then
-            width = 3
-        elseif first and first >= 0xC2 and first <= 0xDF then
-            width = 2
-        end
-        if i + width - 1 > #text then
-            width = 1
-        end
-        local char = text:sub(i, i + width - 1)
-        if not char:match("^%s$") and not REVIEW_UNICODE_WHITESPACE[char] then
-            chars[#chars + 1] = char
-        end
-        i = i + width
-    end
-    return chars
-end
-
-local function normalized_review_text(text)
-    return table.concat(normalized_review_chars(text))
-end
-
-local function active_reader_ui()
-    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
-    if not ok or not ReaderUI then
-        return nil
-    end
-    return ReaderUI.instance
-end
-
 function Reading.cancel_prefetch_schedule()
     if Reading._prefetch_task then
         UIManager:unschedule(Reading._prefetch_task)
@@ -462,601 +338,66 @@ function Reading.cancel_prefetch()
     end
 end
 
-local function clear_legacy_review_overlay(ui)
-    if not ui then return end
-    -- Remove state left by an older plugin version.  The current
-    -- implementation does not create or paint a review overlay.
-    if ui._wereadlite_review_hit_overlay then
-        pcall(UIManager.close, UIManager, ui._wereadlite_review_hit_overlay)
-        ui._wereadlite_review_hit_overlay = nil
+local function review_id_from_href(href)
+    href = tostring(href or "")
+    local id = href:match("^wereadlite://review/(wereadlite_review_%d+)$")
+    if id then
+        return id
     end
-    if ui.view then
-        ui.view._wereadlite_review_hit_boxes = nil
+    local num = href:match("^wereadlite://review/(%d+)$")
+    if num then
+        return "wereadlite_review_" .. num
     end
 end
 
-local function unregister_review_touch_zone(ui, reason)
-    if not ui then
-        return false
+local function review_id_from_link(link)
+    if type(link) ~= "table" then
+        return nil
     end
-    ui._wereadlite_review_hit_regions = nil
-    ui._wereadlite_review_hit_regions_state = nil
-    ui._wereadlite_review_hit_regions_viewport = nil
-    if ui._wereadlite_review_refresh_task then
-        UIManager:unschedule(ui._wereadlite_review_refresh_task)
-        ui._wereadlite_review_refresh_task = nil
-    end
-    clear_legacy_review_overlay(ui)
-    if type(ui.unRegisterTouchZones) ~= "function" then
-        return false
-    end
-    local registered = ui._wereadlite_review_touch_registered
-    if not registered and type(ui.checkRegisterTouchZone) == "function" then
-        local ok, result = pcall(ui.checkRegisterTouchZone, ui, REVIEW_TOUCH_ZONE_ID)
-        registered = ok and result
-    end
-    if not registered then
-        return false
-    end
-    local ok, err = pcall(ui.unRegisterTouchZones, ui, {{
-        id = REVIEW_TOUCH_ZONE_ID,
-        overrides = REVIEW_TOUCH_UNREGISTER_OVERRIDES,
-    }})
-    if not ok then
-        Log.warn("reading", "review_touch_unregister_fail", { reason = reason, err = err })
-        return false
-    end
-    ui._wereadlite_review_touch_registered = nil
-    Log.dbg("reading", "review_touch_unregistered", { reason = reason })
-    return true
+    local href = link.xpointer
+        or link.uri
+        or (type(link.link) == "table" and (link.link.uri or link.link.url))
+        or ""
+    return review_id_from_href(href)
 end
 
-local function ensure_review_touch_priority(ui)
-    if not ui or type(ui.touch_zone_dg) ~= "table"
-            or type(ui.touch_zone_dg.addNodeDep) ~= "function"
-            or type(ui.touch_zone_dg.serialize) ~= "function"
-            or type(ui._zones) ~= "table" then
+local function open_review_by_id(review_id)
+    review_id = tostring(review_id or "")
+    if review_id == "" or not Reading.is_active() then
         return false
     end
-
-    -- registerTouchZones normally creates these dependencies. Re-apply them
-    -- explicitly because KOReader can re-register menu/footer zones after a
-    -- document switch, and an already-existing review zone otherwise keeps an
-    -- old ordering graph.
-    for _, overridden_id in ipairs(REVIEW_TOUCH_OVERRIDES) do
-        pcall(ui.touch_zone_dg.addNodeDep, ui.touch_zone_dg,
-            overridden_id, REVIEW_TOUCH_ZONE_ID)
-    end
-
-    local ordered = {}
-    for _, zone_id in ipairs(ui.touch_zone_dg:serialize()) do
-        local zone = ui._zones[zone_id]
-        if zone then
-            ordered[#ordered + 1] = zone
-        end
-    end
-    local review_zone
-    local filtered = {}
-    for _, zone in ipairs(ordered) do
-        local id = zone.def and zone.def.id
-        if id == REVIEW_TOUCH_ZONE_ID then
-            review_zone = zone
-        else
-            filtered[#filtered + 1] = zone
-        end
-    end
-
-    -- Make the intended order explicit in addition to the dependency graph.
-    -- This protects against a native module rebuilding its ordered list while
-    -- the plugin zone is already present.
-    local insert_at = 1
-    for index, zone in ipairs(filtered) do
-        local id = zone.def and zone.def.id
-        local is_overridden = false
-        for _, overridden_id in ipairs(REVIEW_TOUCH_OVERRIDES) do
-            if id == overridden_id then
-                is_overridden = true
+    local reviews = Reader.review_data and Reader.review_data[review_id]
+    if type(reviews) ~= "table" or #reviews == 0 then
+        for _, mark in ipairs(Reader.review_marks or {}) do
+            if mark.id == review_id then
+                reviews = mark.reviews
                 break
             end
         end
-        if is_overridden then
-            insert_at = index
-            break
-        end
     end
-    if review_zone then
-        table.insert(filtered, insert_at, review_zone)
-    end
-    ui._ordered_touch_zones = filtered
-
-    local review_index
-    local first_overridden_index
-    for index, zone in ipairs(filtered) do
-        local id = zone.def and zone.def.id
-        if id == REVIEW_TOUCH_ZONE_ID then
-            review_index = index
-        elseif not first_overridden_index then
-            for _, overridden_id in ipairs(REVIEW_TOUCH_OVERRIDES) do
-                if id == overridden_id then
-                    first_overridden_index = index
-                    break
-                end
-            end
-        end
-    end
-    Log.dbg("reading", "review_touch_priority", {
-        review_index = review_index,
-        first_overridden_index = first_overridden_index,
-        zones = #ordered,
-    })
-    return review_index ~= nil
-end
-
-local function inside_screen_box(pos, box, padding)
-    if type(pos) ~= "table" or type(box) ~= "table" then
+    if type(reviews) ~= "table" or #reviews == 0 then
+        Log.warn("reading", "review_link_miss", { id = review_id })
         return false
     end
-    local x, y = tonumber(pos.x), tonumber(pos.y)
-    local bx, by = tonumber(box.x), tonumber(box.y)
-    local bw, bh = tonumber(box.w), tonumber(box.h)
-    if not x or not y or not bx or not by or not bw or not bh then
-        return false
-    end
-    padding = tonumber(padding) or 0
-    return x >= bx - padding and x <= bx + bw + padding
-        and y >= by - padding and y <= by + bh + padding
-end
-
-local function review_viewport_key(ui)
-    local document = ui and ui.document
-    local page, top, width, height = "", "", "", ""
-    if document and type(document.getCurrentPage) == "function" then
-        local ok, value = pcall(document.getCurrentPage, document)
-        if ok then page = value end
-    end
-    if document and type(document.getCurrentPos) == "function" then
-        local ok, value = pcall(document.getCurrentPos, document)
-        if ok then top = value end
-    end
-    if ui and ui.dimen then
-        width, height = ui.dimen.w or "", ui.dimen.h or ""
-    end
-    return table.concat({ tostring(page), tostring(top), tostring(width), tostring(height) }, ":")
-end
-
-local function append_normalized_tokens(tokens, text, fields)
-    for _, char in ipairs(normalized_review_chars(text)) do
-        local token = { char = char }
-        for key, value in pairs(fields or {}) do
-            token[key] = value
-        end
-        tokens[#tokens + 1] = token
-    end
-end
-
-local function collect_paging_review_tokens(ui)
-    local document, view = ui.document, ui.view
-    if not document or not view or type(document.getTextBoxes) ~= "function"
-            or type(view.pageToScreenTransform) ~= "function" then
-        return nil
-    end
-    local pages = {}
-    if type(view.getCurrentPageList) == "function" then
-        local ok, current = pcall(view.getCurrentPageList, view)
-        if ok and type(current) == "table" then
-            pages = current
-        end
-    end
-    if #pages == 0 then
-        local page
-        if type(ui.getCurrentPage) == "function" then
-            local ok, current = pcall(ui.getCurrentPage, ui)
-            if ok then page = current end
-        end
-        if page then pages[1] = page end
-    end
-
-    local tokens = {}
-    for _, page in ipairs(pages) do
-        local ok, lines = pcall(document.getTextBoxes, document, page)
-        if ok and type(lines) == "table" then
-            for line_index, line in ipairs(lines) do
-                for _, box in ipairs(line or {}) do
-                    if type(box) == "table" and type(box.word) == "string"
-                            and box.x0 and box.y0 and box.x1 and box.y1 then
-                        append_normalized_tokens(tokens, box.word, {
-                            mode = "paging",
-                            page = page,
-                            line = line_index,
-                            box = box,
-                        })
-                    end
-                end
-            end
-        end
-    end
-    return #tokens > 0 and tokens or nil
-end
-
-local function compare_xp(document, first, second)
-    local ok, result = pcall(document.compareXPointers, document, first, second)
-    return ok and result or nil
-end
-
-local function collect_rolling_review_tokens(ui)
-    local document = ui.document
-    if not document or type(document.getTextFromPositions) ~= "function"
-            or type(document.getTextFromXPointers) ~= "function"
-            or type(document.getNextVisibleChar) ~= "function"
-            or type(document.compareXPointers) ~= "function" then
-        return nil
-    end
-    local width = ui.dimen and tonumber(ui.dimen.w) or Device.screen:getWidth()
-    local height = ui.dimen and tonumber(ui.dimen.h) or Device.screen:getHeight()
-    local ok, visible = pcall(document.getTextFromPositions, document,
-        { x = 0, y = 0 }, { x = width - 1, y = height - 1 }, true)
-    if not ok or type(visible) ~= "table" or not visible.pos0 or not visible.pos1 then
-        return nil
-    end
-
-    local tokens = {}
-    local cursor = visible.pos0
-    local truncated = false
-    for _ = 1, MAX_VISIBLE_REVIEW_CHARS do
-        if compare_xp(document, cursor, visible.pos1) ~= 1 then
-            break
-        end
-        local next_ok, next_pos = pcall(document.getNextVisibleChar, document, cursor)
-        if not next_ok or not next_pos or next_pos == cursor then
-            break
-        end
-        if compare_xp(document, next_pos, visible.pos1) == -1 then
-            next_pos = visible.pos1
-        end
-        local text_ok, chunk = pcall(document.getTextFromXPointers,
-            document, cursor, next_pos, false)
-        if text_ok and type(chunk) == "string" then
-            append_normalized_tokens(tokens, chunk, {
-                mode = "rolling",
-                pos0 = cursor,
-                pos1 = next_pos,
-            })
-        end
-        cursor = next_pos
-        if cursor == visible.pos1 then
-            break
-        end
-        if #tokens >= MAX_VISIBLE_REVIEW_CHARS then
-            truncated = true
-            break
-        end
-    end
-    if truncated then
-        Log.warn("reading", "review_visible_text_truncated", { chars = #tokens })
-    end
-    return #tokens > 0 and tokens or nil
-end
-
-local function visible_review_tokens(ui)
-    if ui.paging then
-        local tokens = collect_paging_review_tokens(ui)
-        if tokens then return tokens, "paging" end
-    end
-    local tokens = collect_rolling_review_tokens(ui)
-    if tokens then return tokens, "rolling" end
-    return nil
-end
-
-local function clip_screen_box(ui, box)
-    if type(box) ~= "table" then return nil end
-    local x, y = tonumber(box.x), tonumber(box.y)
-    local w, h = tonumber(box.w), tonumber(box.h)
-    if not x or not y or not w or not h or w <= 0 or h <= 0 then return nil end
-    local screen_w = ui.dimen and tonumber(ui.dimen.w) or Device.screen:getWidth()
-    local screen_h = ui.dimen and tonumber(ui.dimen.h) or Device.screen:getHeight()
-    local x0, y0 = math.max(0, x), math.max(0, y)
-    local x1, y1 = math.min(screen_w, x + w), math.min(screen_h, y + h)
-    if x1 <= x0 or y1 <= y0 then return nil end
-    return Geom:new{ x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
-end
-
-local function rolling_boxes_for_match(ui, first, last)
-    local document = ui.document
-    local ok, boxes = pcall(document.getScreenBoxesFromPositions,
-        document, first.pos0, last.pos1, true)
-    if not ok or type(boxes) ~= "table" then return {} end
-    local visible = {}
-    for _, box in ipairs(boxes) do
-        local clipped = clip_screen_box(ui, box)
-        if clipped then visible[#visible + 1] = clipped end
-    end
-    return visible
-end
-
-local function paging_boxes_for_match(ui, tokens, first_index, last_index)
-    local grouped = {}
-    local current
-    local previous_box
-    for index = first_index, last_index do
-        local token = tokens[index]
-        local box = token.box
-        if box ~= previous_box then
-            if not current or current.page ~= token.page or current.line ~= token.line then
-                current = {
-                    page = token.page,
-                    line = token.line,
-                    x0 = box.x0,
-                    y0 = box.y0,
-                    x1 = box.x1,
-                    y1 = box.y1,
-                }
-                grouped[#grouped + 1] = current
-            else
-                current.x0 = math.min(current.x0, box.x0)
-                current.y0 = math.min(current.y0, box.y0)
-                current.x1 = math.max(current.x1, box.x1)
-                current.y1 = math.max(current.y1, box.y1)
-            end
-            previous_box = box
-        end
-    end
-    local visible = {}
-    for _, box in ipairs(grouped) do
-        local page_box = Geom:new{
-            x = box.x0,
-            y = box.y0,
-            w = box.x1 - box.x0,
-            h = box.y1 - box.y0,
-        }
-        local ok, screen_box = pcall(ui.view.pageToScreenTransform,
-            ui.view, box.page, page_box)
-        if ok then
-            local clipped = clip_screen_box(ui, screen_box)
-            if clipped then visible[#visible + 1] = clipped end
-        end
-    end
-    return visible
-end
-
-local function index_review_tokens(tokens)
-    local text, starts, finishes = {}, {}, {}
-    local byte = 1
-    for index, token in ipairs(tokens) do
-        text[#text + 1] = token.char
-        starts[byte] = index
-        byte = byte + #token.char
-        finishes[byte - 1] = index
-    end
-    return table.concat(text), starts, finishes
-end
-
-local function build_review_hit_regions(ui, expected_state)
-    local viewport = review_viewport_key(ui)
-    if ui._wereadlite_review_hit_regions_state == expected_state
-            and ui._wereadlite_review_hit_regions_viewport == viewport
-            and type(ui._wereadlite_review_hit_regions) == "table" then
-        return ui._wereadlite_review_hit_regions, true
-    end
-    if not ui.document or not ui.view then
-        return {}, false
-    end
-
-    local tokens, mode = visible_review_tokens(ui)
-    if not tokens then
-        Log.warn("reading", "review_hit_regions_unavailable", { viewport = viewport })
-        return {}, false
-    end
-    local visible_text, starts, finishes = index_review_tokens(tokens)
-    local regions, matched = {}, 0
-    for _, mark in ipairs(Reader.review_marks or {}) do
-        local wanted = normalized_review_text(mark.text)
-        local boxes, search_at = {}, 1
-        while wanted ~= "" do
-            local first_byte, last_byte = visible_text:find(wanted, search_at, true)
-            if not first_byte then break end
-            local first_index, last_index = starts[first_byte], finishes[last_byte]
-            if first_index and last_index then
-                local found
-                if mode == "rolling" then
-                    found = rolling_boxes_for_match(ui, tokens[first_index], tokens[last_index])
-                else
-                    found = paging_boxes_for_match(ui, tokens, first_index, last_index)
-                end
-                for _, box in ipairs(found) do boxes[#boxes + 1] = box end
-            end
-            search_at = last_byte + 1
-        end
-        if #boxes > 0 then
-            matched = matched + 1
-            regions[mark.id] = boxes
-        end
-    end
-    ui._wereadlite_review_hit_regions = regions
-    ui._wereadlite_review_hit_regions_state = expected_state
-    ui._wereadlite_review_hit_regions_viewport = viewport
-    Log.dbg("reading", "review_hit_regions_built", {
-        mode = mode,
-        marks = #(Reader.review_marks or {}),
-        matched = matched,
-        tokens = #tokens,
-    })
-    return regions, true
-end
-
-local function install_review_touch_zone(expected_path, expected_state)
-    local ui = active_reader_ui()
-    if not ui or type(ui.registerTouchZones) ~= "function" or not ui.view or not ui.document then
-        Log.warn("reading", "review_touch_register_fail", { has_ui = ui ~= nil })
-        return false
-    end
-    if expected_state and Reading.state ~= expected_state then
-        Log.dbg("reading", "review_touch_stale", { reason = "state" })
-        return false
-    end
-    if expected_path and tostring(ui.document.file or "") ~= tostring(expected_path) then
-        Log.dbg("reading", "review_touch_stale", {
-            reason = "document",
-            expected = expected_path,
-            current = ui.document.file,
-        })
-        return false
-    end
-    clear_legacy_review_overlay(ui)
-    if #(Reader.review_marks or {}) == 0 then
-        Log.dbg("reading", "review_touch_skip", { reason = "no_marks" })
-        return false
-    end
-    local already_registered = ui._wereadlite_review_touch_registered
-    if not already_registered and type(ui.checkRegisterTouchZone) == "function" then
-        local check_ok, check_result = pcall(ui.checkRegisterTouchZone, ui, REVIEW_TOUCH_ZONE_ID)
-        already_registered = check_ok and check_result
-        if already_registered then
-            ui._wereadlite_review_touch_registered = true
-        end
-    end
-    if already_registered then
-        -- Do not keep a zone installed with stale overrides. This is needed
-        -- both after a hot reload and when a reader module re-registers its
-        -- native zones during a chapter switch.
-        Log.dbg("reading", "review_touch_reregister", { marks = #(Reader.review_marks or {}) })
-        if not unregister_review_touch_zone(ui, "refresh_priority") then
-            return false
-        end
-    end
-
-    local function handler(ges)
-        -- The handler is owned by one ReaderUI instance, but the singleton can
-        -- change after a chapter switch.  Never use a captured/stale document
-        -- for coordinate conversion or review lookup.
-        local current_ui = active_reader_ui()
-        Log.dbg("reading", "review_tap_event", {
-            has_pos = ges and ges.pos ~= nil,
-            same_ui = current_ui == ui,
-        })
-        if current_ui ~= ui or not Reading.is_active()
-                or not current_ui.view or not current_ui.document
-                or (expected_state and Reading.state ~= expected_state)
-                or (expected_path and tostring(current_ui.document.file or "") ~= tostring(expected_path)) then
-            Log.dbg("reading", "review_touch_stale", { reason = "handler" })
-            return nil
-        end
-        if not ges or not ges.pos then
-            return nil
-        end
-
-        local regions = build_review_hit_regions(current_ui, expected_state)
-        local tapped_mark
-        for _, mark in ipairs(Reader.review_marks or {}) do
-            local hit = false
-            for _, box in ipairs(regions[mark.id] or {}) do
-                if inside_screen_box(ges.pos, box, 0) then
-                    hit = true
-                    break
-                end
-            end
-            if hit then
-                if tapped_mark and tapped_mark.id ~= mark.id then
-                    Log.warn("reading", "review_tap_ambiguous", {
-                        first = tapped_mark.id,
-                        second = mark.id,
-                        x = ges.pos.x,
-                        y = ges.pos.y,
-                    })
-                    return nil
-                end
-                tapped_mark = mark
-            end
-        end
-        if tapped_mark then
-            Log.info("reading", "review_tap", {
-                id = tapped_mark.id,
-                x = ges.pos.x,
-                y = ges.pos.y,
-                reviews = #(tapped_mark.reviews or {}),
-            })
-            prepare_review_comments(tapped_mark.reviews)
-            return true
-        end
-        -- Returning nil is essential: the normal reader paging touch zones
-        -- must still receive an ordinary tap after this zone declines it.
-        return nil
-    end
-
-    local ok, err = pcall(ui.registerTouchZones, ui, {{
-        id = REVIEW_TOUCH_ZONE_ID,
-        ges = "tap",
-        screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
-        overrides = REVIEW_TOUCH_OVERRIDES,
-        handler = handler,
-    }})
-    if not ok then
-        Log.warn("reading", "review_touch_register_fail", { err = err })
-        return false
-    end
-    ui._wereadlite_review_touch_registered = true
-    ensure_review_touch_priority(ui)
-    -- The HTML span is only a rendering marker. Build native text geometry
-    -- after ReaderReady so touch hit testing follows the actual layout,
-    -- including phrases split across multiple HTML spans.
-    UIManager:nextTick(function()
-        local current_ui = active_reader_ui()
-        if current_ui == ui and Reading.state == expected_state
-                and current_ui.document
-                and tostring(current_ui.document.file or "") == tostring(expected_path or "") then
-            build_review_hit_regions(current_ui, expected_state)
-        end
-    end)
-    Log.dbg("reading", "review_touch_registered", { marks = #(Reader.review_marks or {}) })
+    Log.info("reading", "review_link", { id = review_id, reviews = #reviews })
+    prepare_review_comments(reviews)
     return true
-end
-
-function Reading.refresh_review_hit_regions(ui)
-    ui = ui or active_reader_ui()
-    if not ui or ui ~= active_reader_ui() or not Reading.is_active() then
-        return
-    end
-    ensure_review_touch_priority(ui)
-    ui._wereadlite_review_hit_regions_viewport = nil
-    if ui._wereadlite_review_refresh_task then
-        UIManager:unschedule(ui._wereadlite_review_refresh_task)
-    end
-    local expected_state = Reading.state
-    local function refresh_task()
-        ui._wereadlite_review_refresh_task = nil
-        if ui == active_reader_ui() and Reading.state == expected_state
-                and Reading.is_active() then
-            build_review_hit_regions(ui, expected_state)
-        end
-    end
-    ui._wereadlite_review_refresh_task = refresh_task
-    UIManager:scheduleIn(0.08, refresh_task)
 end
 
 local function open_document(path, resume, state)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
     Reader.clear_sidecars(path)
-    local ReaderUI = require("apps/reader/readerui")
-    -- switchDocument creates a new ReaderUI.  Remove the old zone before the
-    -- old instance starts tearing down, and install exactly one zone on the
-    -- new instance after ReaderReady has completed.
-    unregister_review_touch_zone(ReaderUI.instance, "document_switch")
     local function after_open()
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
-        -- ReaderUI sets its singleton instance immediately after invoking
-        -- after_open_callback.  Defer one tick so both a fresh reader and a
-        -- switched document register on the actual active instance (desktop
-        -- mouse clicks are translated to this same `tap` gesture).
-        UIManager:nextTick(function()
-            install_review_touch_zone(path, state)
-        end)
         if type(resume) == "table" then
             UIManager:scheduleIn(0.35, function()
                 Reading.goto_resume(resume, path, state)
             end)
         end
     end
+    local ReaderUI = require("apps/reader/readerui")
     if ReaderUI.instance and ReaderUI.instance.switchDocument then
         ReaderUI.instance:switchDocument(path, nil, after_open)
     else
@@ -1484,12 +825,6 @@ local function install_close_hook()
         local file = self.document and self.document.file
         local ours = Reading.is_ours(file)
         if ours then
-            -- A touch zone belongs to this ReaderUI instance.  Unregister it
-            -- before KOReader tears down the instance; it must not survive a
-            -- chapter switch or return to the shelf.
-            unregister_review_touch_zone(self, "reader_close")
-        end
-        if ours then
             Heartbeat.stop(true)
         end
         local result
@@ -1689,6 +1024,63 @@ local function install_toc_hook()
     Log.dbg("reading", "hook", { name = "toc" })
 end
 
+
+local function install_review_link_hook()
+    local ok, ReaderLink = pcall(require, "apps/reader/modules/readerlink")
+    if not ok or not ReaderLink or ReaderLink._wereadlite_review_hooked then
+        return
+    end
+    ReaderLink._wereadlite_review_hooked = true
+
+    local original_tap = ReaderLink.onTap
+    function ReaderLink:onTap(_, ges)
+        -- Prefer native link hit-testing. Empty page areas return nil and
+        -- fall through to KOReader page-turn zones without a plugin overlay.
+        local has_reviews = Reading.is_active()
+            and type(Reader.review_data) == "table"
+            and next(Reader.review_data) ~= nil
+        if has_reviews and ges and type(self.getLinkFromGes) == "function" then
+            local link
+            local ok_link, result = pcall(self.getLinkFromGes, self, ges)
+            if ok_link then
+                link = result
+            end
+            local review_id = review_id_from_link(link)
+            if review_id and open_review_by_id(review_id) then
+                return true
+            end
+        end
+        if original_tap then
+            return original_tap(self, _, ges)
+        end
+    end
+
+    local original_goto = ReaderLink.onGotoLink
+    function ReaderLink:onGotoLink(link, neglect_current_location, allow_footnote_popup)
+        if Reading.is_active() then
+            local review_id = review_id_from_link(link)
+            if review_id and open_review_by_id(review_id) then
+                return true
+            end
+        end
+        if original_goto then
+            return original_goto(self, link, neglect_current_location, allow_footnote_popup)
+        end
+    end
+
+    local original_init = ReaderLink.init
+    if type(original_init) == "function" then
+        function ReaderLink:init()
+            local result = original_init(self)
+            if type(self.registerScheme) == "function" then
+                pcall(self.registerScheme, self, "wereadlite")
+            end
+            return result
+        end
+    end
+    Log.dbg("reading", "hook", { name = "review_link" })
+end
+
 local function install_highlight_hook()
     local ok, ReaderHighlight = pcall(require, "apps/reader/modules/readerhighlight")
     if not ok or not ReaderHighlight or ReaderHighlight._wereadlite_hl_hooked then
@@ -1759,6 +1151,7 @@ function Reading.install_hook()
     install_close_hook()
     install_exit_hook()
     install_toc_hook()
+    install_review_link_hook()
     install_highlight_hook()
 end
 

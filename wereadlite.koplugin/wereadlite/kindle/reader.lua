@@ -887,7 +887,12 @@ local function find_text_in_html(html, wanted)
     return starts[at], ends[at + #wanted - 1]
 end
 
-local function underline_html_range(html, start_at, finish_at)
+local function underline_html_range(html, start_at, finish_at, review_id)
+    -- Use native <a> so KOReader's ReaderLink handles taps. Blank page areas
+    -- keep going through tap_forward/tap_backward with no plugin overlay.
+    local open = '<a class="wereadlite-highlight" style="color:inherit;-cr-hint:presentational-hint;text-decoration:underline;text-decoration-style:dashed" href="wereadlite://review/'
+        .. tostring(review_id or "") .. '">'
+    local close = "</a>"
     local out, cursor = {}, 1
     while cursor <= #html do
         local tag_start, tag_end = html:find("<[^>]*>", cursor)
@@ -897,9 +902,9 @@ local function underline_html_range(html, start_at, finish_at)
             local right = math.min(text_end, finish_at)
             if left <= right then
                 out[#out + 1] = html:sub(cursor, left - 1)
-                out[#out + 1] = '<span class="wereadlite-highlight" style="text-decoration: underline; text-decoration-style: dashed;">'
+                out[#out + 1] = open
                 out[#out + 1] = html:sub(left, right)
-                out[#out + 1] = "</span>"
+                out[#out + 1] = close
                 out[#out + 1] = html:sub(right + 1, text_end)
             else
                 out[#out + 1] = html:sub(cursor, text_end)
@@ -935,7 +940,7 @@ local function add_highlight_reviews(body, book_id, chapter_uid)
                     reviews = mark.reviews,
                     range = mark.range,
                 }
-                body = underline_html_range(body, at, finish_at)
+                body = underline_html_range(body, at, finish_at, id)
                 Log.dbg("reader", "highlight_range", { start = at, finish = finish_at, bytes = finish_at - at + 1 })
                 Log.dbg("reader", "highlight_match", { index = count, text_bytes = #text, reviews = #mark.reviews, range = mark.range })
             else
