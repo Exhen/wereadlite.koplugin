@@ -89,7 +89,16 @@ function LoginView:_qr_size()
     return math.max(120, math.min(Screen:scaleBySize(220), math.floor(side * 0.52)))
 end
 
+function LoginView:_free_root()
+    if self[1] and type(self[1].free) == "function" then
+        pcall(self[1].free, self[1])
+    end
+    self[1] = nil
+end
+
 function LoginView:_paint()
+    -- Replacing the QR ImageWidget without free() leaks its BlitBuffer.
+    self:_free_root()
     local width = Screen:getWidth()
     local height = Screen:getHeight()
     self.dimen = Geom:new{ x = 0, y = 0, w = width, h = height }
@@ -327,6 +336,7 @@ function LoginView:onCloseWidget()
     pcall(function()
         login_api().cancel()
     end)
+    self:_free_root()
 end
 
 return LoginView

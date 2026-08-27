@@ -36,8 +36,7 @@ end
 local function with_busy(text, work)
     local info = InfoMessage:new{ text = text }
     UIManager:show(info)
-    UIManager:nextTick(function()
-        local ok, result, status, err = pcall(work)
+    local function done(ok, result, status, err)
         UIManager:close(info)
         if not ok then
             Log.warn("skill_view", "work", { err = tostring(result) })
@@ -50,7 +49,13 @@ local function with_busy(text, work)
         if result == false then
             show_error(status, err)
         end
+    end
+    local ok, err = pcall(work, function(result, status, err)
+        done(true, result, status, err)
     end)
+    if not ok then
+        done(false, err)
+    end
 end
 
 local function fmt_rating(value)
@@ -96,83 +101,12 @@ local function show_text(title, text)
     })
 end
 
-local book_detail_text
-
-local function show_book_detail(book)
-    local dialog
-    local buttons = {
-        {
-            {
-                text = "关闭",
-                callback = function()
-                    UIManager:close(dialog)
-                end,
-            },
-        },
-    }
-    if book.reader_url and book.reader_url ~= "" then
-        buttons[#buttons + 1] = {
-            {
-                text = "开始阅读",
-                callback = function()
-                    UIManager:close(dialog)
-                    local Reading = require("wereadlite.reading")
-                    Reading.open_url(book.reader_url, {
-                        bookId = book.bookId,
-                        title = book.title,
-                        author = book.author,
-                        cover = book.cover,
-                        reader_param = book.reader_url,
-                    }, { resume = true })
-                end,
-            },
-        }
-    end
-    dialog = ButtonDialog:new{
-        title = book_detail_text(book),
-        title_align = "center",
-        buttons = buttons,
-    }
-    UIManager:show(dialog)
-end
-
-book_detail_text = function(book)
-    local lines = { book.title or "" }
-    if book.author and book.author ~= "" then
-        lines[#lines + 1] = "作者  " .. book.author
-    end
-    if book.category and book.category ~= "" then
-        lines[#lines + 1] = "分类  " .. book.category
-    end
-    if book.publisher and book.publisher ~= "" then
-        lines[#lines + 1] = "出版社  " .. book.publisher
-    end
-    local rating = fmt_rating(book.rating)
-    if rating ~= "" then
-        local extra = ""
-        if (book.rating_count or 0) > 0 then
-            extra = string.format("（%d 人评）", book.rating_count)
-        end
-        lines[#lines + 1] = "评分  " .. rating .. extra
-    end
-    if (book.reading_count or 0) > 0 then
-        lines[#lines + 1] = "在读  " .. tostring(book.reading_count) .. " 人"
-    end
-    if (book.soldout or 0) == 1 then
-        lines[#lines + 1] = "状态  已下架"
-    end
-    if book.intro and book.intro ~= "" then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = book.intro
-    end
-    return table.concat(lines, "\n")
-end
-
-local function show_search_results(result)
+local function show_book_list(result, opts)
+    opts = type(opts) == "table" and opts or {}
     local books = result.books or {}
     if #books == 0 then
         UIManager:show(InfoMessage:new{
-            text = string.format("没有找到与“%s”相关的结果", result.keyword or ""),
+            text = opts.empty_message or "暂无相关图书",
             timeout = 2,
         })
         return
@@ -197,7 +131,8 @@ local function show_search_results(result)
                 align = "left",
                 callback = function()
                     UIManager:close(dialog)
-                    show_book_detail(book)
+                    local BookDetail = require("wereadlite.book_detail")
+                    BookDetail.show(book)
                 end,
             },
         }
@@ -207,7 +142,7 @@ local function show_search_results(result)
         buttons[#buttons + 1] = row_for(book)
     end
     dialog = ButtonDialog:new{
-        title = string.format("为您找到 %d 本", #books),
+        title = opts.title or string.format("为您找到 %d 本", #books),
         title_align = "center",
         use_info_style = false,
         rows_per_page = 6,
@@ -222,11 +157,19 @@ local function show_search_results(result)
     end
 end
 
+local function show_search_results(result)
+    show_book_list(result, {
+        title = string.format("为您找到 %d 本", #(result.books or {})),
+        empty_message = string.format("没有找到与“%s”相关的结果", result.keyword or ""),
+    })
+end
+
 function SkillView.show_book_detail(book)
     if type(book) ~= "table" then
         return
     end
-    show_book_detail(book)
+    local BookDetail = require("wereadlite.book_detail")
+    BookDetail.show(book)
 end
 
 function SkillView.run_search(keyword, on_result)
@@ -238,16 +181,19 @@ function SkillView.run_search(keyword, on_result)
         })
         return
     end
-    with_busy("正在搜索…", function()
-        local result, status, err = Skill.search(keyword, { scope = 10, count = 10 })
-        if not result then
-            return false, status, err
-        end
-        if type(on_result) == "function" then
-            on_result(result)
-            return true
-        end
-        show_search_results(result)
+    with_busy("正在搜索…", function(finish)
+        Skill.search_async(keyword, { scope = 10, count = 10 }, function(result, status, err)
+            if not result then
+                finish(false, status, err)
+                return
+            end
+            if type(on_result) == "function" then
+                on_result(result)
+            else
+                show_search_results(result)
+            end
+            finish(true)
+        end)
     end)
 end
 
@@ -407,18 +353,21 @@ end
 
 function SkillView.run_stats(mode)
     mode = mode or "monthly"
-    with_busy("正在获取阅读统计…", function()
-        local data, status, err = Skill.readdata(mode)
-        if not data then
-            return false, status, err
-        end
-        show_text((MODE_LABEL[mode] or "阅读") .. "阅读", format_stats(mode, data))
-        if data.upgrade_info then
-            UIManager:show(InfoMessage:new{
-                text = "Skill 接口有更新，部分功能可能异常",
-                timeout = 2,
-            })
-        end
+    with_busy("正在获取阅读统计…", function(finish)
+        Skill.readdata_async(mode, function(data, status, err)
+            if not data then
+                finish(false, status, err)
+                return
+            end
+            show_text((MODE_LABEL[mode] or "阅读") .. "阅读", format_stats(mode, data))
+            if data.upgrade_info then
+                UIManager:show(InfoMessage:new{
+                    text = "Skill 接口有更新，部分功能可能异常",
+                    timeout = 2,
+                })
+            end
+            finish(true)
+        end)
     end)
 end
 

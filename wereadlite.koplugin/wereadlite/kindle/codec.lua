@@ -715,7 +715,7 @@ function Codec.wrap_html(opts)
         'div.footnotes { margin-top: 1.5em; padding-top: 0.5em; border-top: 1px solid #ccc; }\n',
         '.fn-num { font-weight: bold; margin-right: 0.3em; text-decoration: none; color: inherit; }\n',
         'a.wereadlite-highlight, a.wereadlite-highlight:link, a.wereadlite-highlight:visited {',
-        ' text-decoration: underline; text-decoration-style: dashed;',
+        ' text-decoration: none !important; border-bottom: 1px dashed currentColor;',
         ' color: inherit !important; -cr-hint: presentational-hint; }\n',
         font_css,
         '\n</style>\n</head>\n<body>\n<!-- wereadlite -->\n',

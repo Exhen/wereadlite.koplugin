@@ -129,25 +129,92 @@ function Settings.set_load_review_comments(enabled)
     Log.info("settings", "load_review_comments", { enabled = enabled and true or false })
 end
 
-function Settings.show_review_comments_dialog(on_changed)
+local function show_toggle_dialog(title, current, apply, on_changed)
     local dialog
-    local current = Settings.load_review_comments()
+    local function pick(value, label)
+        local text = label
+        if current == value then
+            text = text .. "  · 当前"
+        end
+        return {
+            text = text,
+            callback = function()
+                UIManager:close(dialog)
+                apply(value)
+                if on_changed then
+                    on_changed()
+                end
+            end,
+        }
+    end
     dialog = ButtonDialog:new{
-        title = "打开书时加载划线与想法",
+        title = title,
         title_align = "center",
         use_info_style = false,
-        buttons = {{
-            { text = (current and "是  · 当前" or "是"), callback = function()
-                UIManager:close(dialog); Settings.set_load_review_comments(true)
-                if on_changed then on_changed() end
-            end },
-            { text = (not current and "否  · 当前" or "否"), callback = function()
-                UIManager:close(dialog); Settings.set_load_review_comments(false)
-                if on_changed then on_changed() end
-            end },
-        }},
+        buttons = {
+            { pick(true, "开"), pick(false, "关") },
+        },
     }
     UIManager:show(dialog)
+end
+
+function Settings.show_review_comments_dialog(on_changed)
+    show_toggle_dialog(
+        "划线与想法",
+        Settings.load_review_comments(),
+        Settings.set_load_review_comments,
+        on_changed
+    )
+end
+
+function Settings.load_review_avatars()
+    local data = Settings.load()
+    local value = data:readSetting("load_review_avatars")
+    if value == nil then
+        return true
+    end
+    return value == true or value == 1
+end
+
+function Settings.set_load_review_avatars(enabled)
+    local data = Settings.load()
+    data:saveSetting("load_review_avatars", enabled and true or false)
+    data:flush()
+    Log.info("settings", "load_review_avatars", { enabled = enabled and true or false })
+end
+
+function Settings.show_review_avatars_dialog(on_changed)
+    show_toggle_dialog(
+        "评论头像",
+        Settings.load_review_avatars(),
+        Settings.set_load_review_avatars,
+        on_changed
+    )
+end
+
+function Settings.show_chapter_load_progress()
+    local data = Settings.load()
+    local value = data:readSetting("show_chapter_load_progress")
+    if value == nil then
+        return true
+    end
+    return value == true or value == 1
+end
+
+function Settings.set_show_chapter_load_progress(enabled)
+    local data = Settings.load()
+    data:saveSetting("show_chapter_load_progress", enabled and true or false)
+    data:flush()
+    Log.info("settings", "show_chapter_load_progress", { enabled = enabled and true or false })
+end
+
+function Settings.show_chapter_load_progress_dialog(on_changed)
+    show_toggle_dialog(
+        "加载进度条",
+        Settings.show_chapter_load_progress(),
+        Settings.set_show_chapter_load_progress,
+        on_changed
+    )
 end
 
 function Settings.prefetch_next_chapter()
@@ -301,7 +368,7 @@ function Settings.show_card_radius_dialog(on_changed)
     })
 end
 
-Settings.TILE_IDS = { "clock", "recent", "user", "text_stats", "chart_stats" }
+Settings.TILE_IDS = { "clock", "recent", "user", "text_stats", "chart_stats", "recommend" }
 
 Settings.TILE_LABEL = {
     recent = "上次阅读",
@@ -309,6 +376,7 @@ Settings.TILE_LABEL = {
     clock = "时钟",
     text_stats = "文字统计",
     chart_stats = "图表统计",
+    recommend = "为你推荐",
 }
 
 local TILE_SPAN_KEY = {
@@ -317,6 +385,7 @@ local TILE_SPAN_KEY = {
     clock = "clock_span",
     text_stats = "text_stats_span",
     chart_stats = "chart_stats_span",
+    recommend = "recommend_span",
 }
 
 local TILE_ID_SET = {
@@ -325,21 +394,31 @@ local TILE_ID_SET = {
     clock = true,
     text_stats = true,
     chart_stats = true,
+    recommend = true,
 }
 
--- Default for 4×5: 时钟1 + 上次阅读3 + 账号1 | 文字统计2 + 图表统计3
+-- Default for 4×5: 时钟1 + 上次阅读3 + 账号1 | 文字统计2 + 图表统计3 | 为你推荐4
 local TILE_SPAN_DEFAULT = {
     clock = 1,
     recent = 3,
     user = 1,
     text_stats = 2,
     chart_stats = 3,
+    recommend = 5,
 }
+
+local TILE_SPAN_MIN = {
+    recommend = 2,
+}
+
+local function tile_span_min(id)
+    return TILE_SPAN_MIN[id] or 1
+end
 
 function Settings.default_tile_span(id)
     local cols = Settings.grid_cols()
     local preferred = TILE_SPAN_DEFAULT[id] or 1
-    return math.max(1, math.min(preferred, cols))
+    return math.max(tile_span_min(id), math.min(preferred, cols))
 end
 
 function Settings.tile_span(id)
@@ -349,7 +428,7 @@ function Settings.tile_span(id)
         return 1
     end
     local data = Settings.load()
-    return clamp(data:readSetting(key), 1, cols, Settings.default_tile_span(id))
+    return clamp(data:readSetting(key), tile_span_min(id), cols, Settings.default_tile_span(id))
 end
 
 function Settings.set_tile_span(id, span)
@@ -358,7 +437,7 @@ function Settings.set_tile_span(id, span)
         return Settings.tile_span(id)
     end
     local cols = Settings.grid_cols()
-    span = clamp(span, 1, cols, Settings.default_tile_span(id))
+    span = clamp(span, tile_span_min(id), cols, Settings.default_tile_span(id))
     local data = Settings.load()
     data:saveSetting(key, span)
     data:flush()
@@ -392,6 +471,10 @@ end
 
 function Settings.chart_stats_span()
     return Settings.tile_span("chart_stats")
+end
+
+function Settings.recommend_span()
+    return Settings.tile_span("recommend")
 end
 
 function Settings.tile_order()
@@ -695,7 +778,7 @@ function Settings.show_tile_menu(id, on_changed)
             end,
         }
     end
-    for n = 1, cols do
+    for n = tile_span_min(id), cols do
         buttons[#buttons + 1] = { pick_span(n) }
     end
     buttons[#buttons + 1] = {
@@ -886,34 +969,12 @@ function Settings.show_grid_font_dialog(on_changed)
 end
 
 function Settings.show_book_title_dialog(on_changed)
-    local dialog
-    local current = Settings.show_book_title()
-    local function pick(value, label)
-        local text = label
-        if current == value then
-            text = text .. "  · 当前"
-        end
-        return {
-            text = text,
-            callback = function()
-                UIManager:close(dialog)
-                local old = Settings.show_book_title()
-                Settings.set_show_book_title(value)
-                if old ~= value and on_changed then
-                    on_changed()
-                end
-            end,
-        }
-    end
-    dialog = ButtonDialog:new{
-        title = "宫格布局显示书名",
-        title_align = "center",
-        use_info_style = false,
-        buttons = {
-            { pick(true, "是"), pick(false, "否") },
-        },
-    }
-    UIManager:show(dialog)
+    show_toggle_dialog(
+        "显示书名",
+        Settings.show_book_title(),
+        Settings.set_show_book_title,
+        on_changed
+    )
 end
 
 function Settings.show_logout_dialog(on_logout)
@@ -950,121 +1011,179 @@ function Settings.show_logout_dialog(on_logout)
     UIManager:show(dialog)
 end
 
-function Settings.show_menu(on_changed, on_search, on_logout)
-    local SkillView = require("wereadlite.skill_view")
+local function yn(on)
+    return on and "开" or "关"
+end
+
+local function show_button_dialog(title, rows, name)
     local menu
+    local buttons = {}
+    for _, row in ipairs(rows or {}) do
+        buttons[#buttons + 1] = {
+            {
+                text = row.text,
+                callback = function()
+                    UIManager:close(menu)
+                    if row.callback then
+                        row.callback()
+                    end
+                end,
+            },
+        }
+    end
     menu = ButtonDialog:new{
-        name = "wereadlite_settings",
-        title = "设置",
+        name = name or "wereadlite_settings",
+        title = title,
         title_align = "center",
         use_info_style = false,
-        buttons = {
-            {
-                {
-                    text = string.format("宫格布局  %d × %d", Settings.grid_rows(), Settings.grid_cols()),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_grid_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = "功能卡片",
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_tile_enabled_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("宫格显示书名  %s", Settings.show_book_title() and "是" or "否"),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_book_title_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("宫格字号  %d", Settings.grid_font_size()),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_grid_font_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("框线圆角  %d", Settings.card_radius()),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_card_radius_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("图片并发  %d", Settings.image_concurrency()),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_image_concurrency_dialog()
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("打开书时加载划线与想法  %s", Settings.load_review_comments() and "是" or "否"),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_review_comments_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = string.format("预先加载下一章  %s", Settings.prefetch_next_chapter() and "是" or "否"),
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_prefetch_next_chapter_dialog(on_changed)
-                    end,
-                },
-            },
-            {
-                {
-                    text = "书籍搜索",
-                    callback = function()
-                        UIManager:close(menu)
-                        if type(on_search) == "function" then
-                            on_search()
-                        else
-                            SkillView.show_search()
-                        end
-                    end,
-                },
-            },
-            {
-                {
-                    text = "阅读统计",
-                    callback = function()
-                        UIManager:close(menu)
-                        SkillView.show_stats()
-                    end,
-                },
-            },
-            {
-                {
-                    text = "退出登录",
-                    callback = function()
-                        UIManager:close(menu)
-                        Settings.show_logout_dialog(on_logout)
-                    end,
-                },
-            },
-        },
+        buttons = buttons,
     }
     UIManager:show(menu)
+end
+
+local function back_row(label, reopen)
+    return {
+        text = "‹  " .. tostring(label or "返回"),
+        callback = reopen,
+    }
+end
+
+function Settings.show_shelf_menu(on_changed, ctx)
+    ctx = ctx or {}
+    show_button_dialog("首页布局", {
+        back_row("设置", function()
+            Settings.show_menu(ctx.on_changed, ctx.on_search, ctx.on_logout)
+        end),
+        {
+            text = string.format("宫格行列   %d × %d", Settings.grid_rows(), Settings.grid_cols()),
+            callback = function()
+                Settings.show_grid_dialog(on_changed)
+            end,
+        },
+        {
+            text = "功能卡片",
+            callback = function()
+                Settings.show_tile_enabled_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("显示书名   %s", yn(Settings.show_book_title())),
+            callback = function()
+                Settings.show_book_title_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("宫格字号   %d", Settings.grid_font_size()),
+            callback = function()
+                Settings.show_grid_font_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("框线圆角   %d", Settings.card_radius()),
+            callback = function()
+                Settings.show_card_radius_dialog(on_changed)
+            end,
+        },
+    }, "wereadlite_settings_shelf")
+end
+
+function Settings.show_reading_menu(on_changed, ctx)
+    ctx = ctx or {}
+    show_button_dialog("阅读体验", {
+        back_row("设置", function()
+            Settings.show_menu(ctx.on_changed, ctx.on_search, ctx.on_logout)
+        end),
+        {
+            text = string.format("划线与想法   %s", yn(Settings.load_review_comments())),
+            callback = function()
+                Settings.show_review_comments_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("评论头像   %s", yn(Settings.load_review_avatars())),
+            callback = function()
+                Settings.show_review_avatars_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("加载进度条   %s", yn(Settings.show_chapter_load_progress())),
+            callback = function()
+                Settings.show_chapter_load_progress_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("预加载下一章   %s", yn(Settings.prefetch_next_chapter())),
+            callback = function()
+                Settings.show_prefetch_next_chapter_dialog(on_changed)
+            end,
+        },
+        {
+            text = string.format("图片并发   %d", Settings.image_concurrency()),
+            callback = function()
+                Settings.show_image_concurrency_dialog()
+            end,
+        },
+    }, "wereadlite_settings_reading")
+end
+
+function Settings.show_discover_menu(ctx)
+    ctx = ctx or {}
+    local SkillView = require("wereadlite.skill_view")
+    show_button_dialog("发现", {
+        back_row("设置", function()
+            Settings.show_menu(ctx.on_changed, ctx.on_search, ctx.on_logout)
+        end),
+        {
+            text = "书籍搜索",
+            callback = function()
+                if type(ctx.on_search) == "function" then
+                    ctx.on_search()
+                else
+                    SkillView.show_search()
+                end
+            end,
+        },
+        {
+            text = "阅读统计",
+            callback = function()
+                SkillView.show_stats()
+            end,
+        },
+    }, "wereadlite_settings_discover")
+end
+
+function Settings.show_menu(on_changed, on_search, on_logout)
+    local ctx = {
+        on_changed = on_changed,
+        on_search = on_search,
+        on_logout = on_logout,
+    }
+    show_button_dialog("设置", {
+        {
+            text = "首页布局 ›",
+            callback = function()
+                Settings.show_shelf_menu(on_changed, ctx)
+            end,
+        },
+        {
+            text = "阅读体验 ›",
+            callback = function()
+                Settings.show_reading_menu(on_changed, ctx)
+            end,
+        },
+        {
+            text = "发现 ›",
+            callback = function()
+                Settings.show_discover_menu(ctx)
+            end,
+        },
+        {
+            text = "退出登录",
+            callback = function()
+                Settings.show_logout_dialog(on_logout)
+            end,
+        },
+    }, "wereadlite_settings_root")
 end
 
 return Settings

@@ -3,6 +3,7 @@ local Client = require("wereadlite.kindle.client")
 local Json = require("wereadlite.json")
 local Log = require("wereadlite.log")
 local Settings = require("wereadlite.settings")
+local UIManager = require("ui/uimanager")
 
 local Skill = {}
 
@@ -87,6 +88,51 @@ local function fetch_apikey(only_show)
     return data
 end
 
+local function fetch_apikey_async(only_show, callback)
+    callback = type(callback) == "function" and callback or function() end
+    local url = Config.SKILL_APIKEY_URL
+    if only_show then
+        url = url .. "?only_show=1"
+    end
+    Log.info("skill", "apikey_get_async", { only_show = only_show and true or false })
+    local Http = require("wereadlite.async_http")
+    Http.request({
+        url = url,
+        method = "GET",
+        send_cookie = true,
+        absorb_cookies = true,
+        accept = "application/json, */*",
+        user_agent = Config.WEB_UA,
+        referer = Config.SKILL_PAGE,
+        origin = Config.ORIGIN,
+        headers = {
+            ["x-ssr-request-id"] = request_id(),
+        },
+        timeout = 15,
+    }, function(res)
+        res = type(res) == "table" and res or {}
+        if not res.ok then
+            local status = res.status or "http_error"
+            if status == "auth_expired" or tonumber(res.code) == 401 then
+                callback(nil, "auth_expired", res.err)
+                return
+            end
+            callback(nil, status, res.err)
+            return
+        end
+        local data, decode_err = decode_json(res.body)
+        if not data then
+            if decode_err == "auth_expired" then
+                callback(nil, "auth_expired", "login required")
+                return
+            end
+            callback(nil, "http_error", decode_err)
+            return
+        end
+        callback(data, "ok")
+    end)
+end
+
 local function key_from(data)
     if type(data) ~= "table" then
         return nil
@@ -135,6 +181,48 @@ function Skill.ensure_key(force)
     Settings.set_skill_apikey(key)
     Log.info("skill", "apikey_ready", { len = #key })
     return key
+end
+
+function Skill.ensure_key_async(callback, force)
+    callback = type(callback) == "function" and callback or function() end
+    if not force then
+        local cached = Settings.skill_apikey()
+        if cached then
+            UIManager:nextTick(function()
+                callback(cached, "ok")
+            end)
+            return
+        end
+    end
+    fetch_apikey_async(true, function(data, status, err)
+        if not data then
+            Log.warn("skill", "apikey_show", { status = status })
+            callback(nil, status, err)
+            return
+        end
+        local key = key_from(data)
+        if key then
+            Settings.set_skill_apikey(key)
+            Log.info("skill", "apikey_ready", { len = #key })
+            callback(key, "ok")
+            return
+        end
+        fetch_apikey_async(false, function(created, cstatus, cerr)
+            if not created then
+                Log.warn("skill", "apikey_create", { status = cstatus })
+                callback(nil, cstatus, cerr)
+                return
+            end
+            key = key_from(created)
+            if not key then
+                callback(nil, "http_error", "未能获取 Skill API Key")
+                return
+            end
+            Settings.set_skill_apikey(key)
+            Log.info("skill", "apikey_ready", { len = #key })
+            callback(key, "ok")
+        end)
+    end)
 end
 
 local function gateway_status(data)
@@ -244,6 +332,88 @@ function Skill.call(api_name, params, retried)
     return payload
 end
 
+function Skill.call_async(api_name, params, callback, retried)
+    callback = type(callback) == "function" and callback or function() end
+    retried = retried and true or false
+    Skill.ensure_key_async(function(key, status, err)
+        if not key then
+            callback(nil, status, err)
+            return
+        end
+        local body = {
+            api_name = api_name,
+            skill_version = Config.SKILL_VERSION,
+        }
+        for name, value in pairs(as_table(params)) do
+            if value ~= nil then
+                body[name] = value
+            end
+        end
+        local encoded, encode_err = Json.encode(body)
+        if not encoded then
+            callback(nil, "http_error", encode_err or "json encode failed")
+            return
+        end
+        Log.info("skill", "call_async", { api_name = api_name })
+        local Http = require("wereadlite.async_http")
+        Http.request({
+            url = Config.SKILL_GATEWAY_URL,
+            method = "POST",
+            body = encoded,
+            send_cookie = false,
+            accept = "application/json, */*",
+            referer = Config.SKILL_PAGE,
+            origin = Config.ORIGIN,
+            user_agent = Config.WEB_UA,
+            headers = {
+                Authorization = "Bearer " .. key,
+                ["Content-Type"] = "application/json",
+                ["x-ssr-request-id"] = request_id(),
+            },
+            timeout = 15,
+        }, function(res)
+            res = type(res) == "table" and res or {}
+            if not res.ok then
+                if (res.status == "auth_expired" or tonumber(res.code) == 401) and not retried then
+                    Settings.set_skill_apikey("")
+                    Skill.call_async(api_name, params, callback, true)
+                    return
+                end
+                callback(nil, res.status or "http_error", res.err)
+                return
+            end
+            local data, decode_err = decode_json(res.body)
+            if not data then
+                if decode_err == "auth_expired" and not retried then
+                    Settings.set_skill_apikey("")
+                    Skill.call_async(api_name, params, callback, true)
+                    return
+                end
+                callback(nil, "http_error", decode_err)
+                return
+            end
+            local gw_status, gw_err = gateway_status(data)
+            if gw_status == "auth_expired" and not retried then
+                Settings.set_skill_apikey("")
+                Skill.call_async(api_name, params, callback, true)
+                return
+            end
+            if gw_status then
+                callback(nil, gw_status, gw_err)
+                return
+            end
+            local payload = unwrap_payload(data)
+            if type(data.upgrade_info) == "table" then
+                payload.upgrade_info = data.upgrade_info
+                Log.warn("skill", "upgrade", {
+                    message = tostring(data.upgrade_info.message or ""),
+                })
+            end
+            callback(payload, "ok")
+        end)
+    end, retried)
+end
+
 local function add_book(books, seen, item)
     item = as_table(item)
     local info = as_table(item.bookInfo or item.book_info)
@@ -275,26 +445,44 @@ local function add_book(books, seen, item)
         rating = tonumber(item.newRating or info.newRating) or 0,
         rating_count = tonumber(item.newRatingCount or info.newRatingCount) or 0,
         reading_count = tonumber(item.readingCount or info.readingCount) or 0,
+        total_words = tonumber(info.totalWords or info.total_words) or 0,
+        isbn = tostring(info.isbn or ""),
         search_idx = tonumber(item.searchIdx or item.search_idx),
         group = item._group,
     }
 end
 
-function Skill.search(keyword, opts)
-    opts = opts or {}
-    keyword = tostring(keyword or ""):match("^%s*(.-)%s*$") or ""
-    if keyword == "" then
-        return nil, "http_error", "请输入关键词"
+local function parse_book_from_payload(payload)
+    local books, seen = {}, {}
+    add_book(books, seen, payload)
+    if #books == 0 then
+        add_book(books, seen, { bookInfo = payload.bookInfo or payload })
     end
-    local payload, status, err = Skill.call("/store/search", {
-        keyword = keyword,
-        scope = tonumber(opts.scope) or 10,
-        count = tonumber(opts.count) or 10,
-        maxIdx = tonumber(opts.max_idx) or 0,
-    })
-    if not payload then
-        return nil, status, err
+    if #books == 0 then
+        return nil
     end
+    local book = books[1]
+    if (not book.reader_param or book.reader_param == "") and book.reader_url and book.reader_url ~= "" then
+        local bc = book.reader_url:match("[?&]v=([%w_%-]+)")
+        if bc and bc ~= "" then
+            book.reader_param = bc
+        end
+    end
+    return book
+end
+
+local function enrich_reader_params(books)
+    for _, book in ipairs(books or {}) do
+        if (not book.reader_param or book.reader_param == "") and book.reader_url and book.reader_url ~= "" then
+            local bc = book.reader_url:match("[?&]v=([%w_%-]+)")
+            if bc and bc ~= "" then
+                book.reader_param = bc
+            end
+        end
+    end
+end
+
+local function parse_search_payload(payload, keyword)
     local books, seen = {}, {}
     for _, group in ipairs(as_table(payload.results)) do
         group = as_table(group)
@@ -324,81 +512,382 @@ function Skill.search(keyword, opts)
     }
 end
 
-function Skill.chapter_highlights(book_id, chapter_uid)
-    book_id = tostring(book_id or "")
-    chapter_uid = tonumber(chapter_uid) or 0
-    if book_id == "" then
+function Skill.search(keyword, opts)
+    opts = opts or {}
+    keyword = tostring(keyword or ""):match("^%s*(.-)%s*$") or ""
+    if keyword == "" then
+        return nil, "http_error", "请输入关键词"
+    end
+    local payload, status, err = Skill.call("/store/search", {
+        keyword = keyword,
+        scope = tonumber(opts.scope) or 10,
+        count = tonumber(opts.count) or 10,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    })
+    if not payload then
+        return nil, status, err
+    end
+    return parse_search_payload(payload, keyword)
+end
+
+function Skill.search_async(keyword, opts, callback)
+    opts = opts or {}
+    callback = type(callback) == "function" and callback or function() end
+    keyword = tostring(keyword or ""):match("^%s*(.-)%s*$") or ""
+    if keyword == "" then
+        UIManager:nextTick(function()
+            callback(nil, "http_error", "请输入关键词")
+        end)
+        return
+    end
+    Skill.call_async("/store/search", {
+        keyword = keyword,
+        scope = tonumber(opts.scope) or 10,
+        count = tonumber(opts.count) or 10,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    }, function(payload, status, err)
+        if not payload then
+            callback(nil, status, err)
+            return
+        end
+        callback(parse_search_payload(payload, keyword), status, err)
+    end)
+end
+
+local function parse_review_group(group)
+    local list = {}
+    group = as_table(group)
+    for _, row in ipairs(group.pageReviews or {}) do
+        local review = type(row.review) == "table" and row.review or row
+        local content = tostring(review.content or "")
+        if content ~= "" then
+            local author = type(review.author) == "table" and review.author or {}
+            list[#list + 1] = {
+                content = content,
+                username = tostring(author.name or author.nickName or author.nickname or "微信读书用户"),
+                avatar = tostring(author.avatar or author.avatarUrl or author.headImgUrl or ""),
+                id = tostring(row.reviewId or review.reviewId or (#list + 1)),
+            }
+        end
+    end
+    return list
+end
+
+local function parse_underlines_payload(payload, book_id, chapter_uid)
+    if type(payload) ~= "table" or type(payload.underlines) ~= "table" then
+        Log.warn("skill", "underlines_empty", { book_id = book_id, chapter_uid = chapter_uid, type = type(payload) })
         return {}
     end
-    Log.info("skill", "chapter_highlights_start", { book_id = book_id, chapter_uid = chapter_uid })
-    local best = Skill.call("/book/bestbookmarks", {
+    local out = {}
+    for _, item in ipairs(payload.underlines) do
+        item = as_table(item)
+        local range = tostring(item.range or "")
+        if range ~= "" then
+            out[#out + 1] = {
+                range = range,
+                count = tonumber(item.count) or 0,
+                score = tonumber(item.score) or 0,
+                type = tonumber(item.type) or 0,
+            }
+        end
+    end
+    Log.info("skill", "chapter_underlines_done", { book_id = book_id, chapter_uid = chapter_uid, count = #out })
+    return out
+end
+
+function Skill.chapter_underlines(book_id, chapter_uid)
+    book_id = tostring(book_id or "")
+    chapter_uid = tonumber(chapter_uid) or 0
+    if book_id == "" or chapter_uid == 0 then
+        return {}
+    end
+    Log.info("skill", "chapter_underlines_start", { book_id = book_id, chapter_uid = chapter_uid })
+    local payload = Skill.call("/book/underlines", {
         bookId = book_id,
         chapterUid = chapter_uid,
         synckey = 0,
     })
-    if type(best) ~= "table" or type(best.items) ~= "table" then
-        Log.warn("skill", "bestbookmarks_empty", { book_id = book_id, chapter_uid = chapter_uid, type = type(best) })
-        return {}
+    return parse_underlines_payload(payload, book_id, chapter_uid)
+end
+
+function Skill.chapter_underlines_async(book_id, chapter_uid, callback)
+    book_id = tostring(book_id or "")
+    chapter_uid = tonumber(chapter_uid) or 0
+    callback = type(callback) == "function" and callback or function() end
+    if book_id == "" or chapter_uid == 0 then
+        UIManager:nextTick(function()
+            callback({})
+        end)
+        return
     end
-    Log.info("skill", "bestbookmarks_ok", { book_id = book_id, chapter_uid = chapter_uid, items = #best.items })
-    local requests = {}
-    for _, item in ipairs(best.items) do
-        local range = tostring(item.range or "")
-        if range ~= "" then
-            requests[#requests + 1] = { range = range, maxIdx = 0, count = 20, synckey = 0 }
-        end
-    end
-    if #requests == 0 then
-        Log.info("skill", "readreviews_skip", { reason = "no_ranges" })
-        return {}
-    end
-    Log.info("skill", "readreviews_start", { book_id = book_id, chapter_uid = chapter_uid, ranges = #requests })
-    local reviews = Skill.call("/book/readreviews", {
+    Log.info("skill", "chapter_underlines_start", { book_id = book_id, chapter_uid = chapter_uid })
+    Skill.call_async("/book/underlines", {
         bookId = book_id,
         chapterUid = chapter_uid,
-        reviews = requests,
+        synckey = 0,
+    }, function(payload, status, err)
+        if not payload then
+            Log.warn("skill", "underlines_empty", { book_id = book_id, chapter_uid = chapter_uid, status = status, err = err })
+            callback({}, status, err)
+            return
+        end
+        callback(parse_underlines_payload(payload, book_id, chapter_uid), status, err)
+    end)
+end
+
+function Skill.fetch_range_reviews(book_id, chapter_uid, range)
+    book_id = tostring(book_id or "")
+    chapter_uid = tonumber(chapter_uid) or 0
+    range = tostring(range or "")
+    if book_id == "" or chapter_uid == 0 or range == "" then
+        return {}
+    end
+    Log.info("skill", "readreviews_one", { book_id = book_id, chapter_uid = chapter_uid, range = range })
+    local payload = Skill.call("/book/readreviews", {
+        bookId = book_id,
+        chapterUid = chapter_uid,
+        reviews = {
+            { range = range, maxIdx = 0, count = 20, synckey = 0 },
+        },
     })
-    local by_range = {}
-    if type(reviews) == "table" and type(reviews.reviews) == "table" then
-        Log.info("skill", "readreviews_ok", { groups = #reviews.reviews })
-        for _, group in ipairs(reviews.reviews) do
-            local range = tostring(group.range or "")
-            local list = {}
-            for _, row in ipairs(group.pageReviews or {}) do
-                local review = type(row.review) == "table" and row.review or row
-                local content = tostring(review.content or "")
-                if content ~= "" then
-                    local author = type(review.author) == "table" and review.author or {}
-                    list[#list + 1] = {
-                        content = content,
-                        username = tostring(author.name or author.nickName or author.nickname or "微信读书用户"),
-                        avatar = tostring(author.avatar or author.avatarUrl or author.headImgUrl or ""),
-                        id = tostring(row.reviewId or review.reviewId or (#list + 1)),
-                    }
-                end
-            end
-            if range ~= "" and #list > 0 then
-                by_range[range] = list
-            end
+    if type(payload) ~= "table" or type(payload.reviews) ~= "table" then
+        Log.warn("skill", "readreviews_one_empty", { range = range, type = type(payload) })
+        return {}
+    end
+    for _, group in ipairs(payload.reviews) do
+        if tostring(group.range or "") == range then
+            local list = parse_review_group(group)
+            Log.info("skill", "readreviews_one_ok", { range = range, reviews = #list })
+            return list
         end
     end
-    if type(reviews) ~= "table" or type(reviews.reviews) ~= "table" then
-        Log.warn("skill", "readreviews_empty", { type = type(reviews) })
+    Log.info("skill", "readreviews_one_miss", { range = range })
+    return {}
+end
+
+function Skill.fetch_range_reviews_async(book_id, chapter_uid, range, callback)
+    book_id = tostring(book_id or "")
+    chapter_uid = tonumber(chapter_uid) or 0
+    range = tostring(range or "")
+    callback = type(callback) == "function" and callback or function() end
+    if book_id == "" or chapter_uid == 0 or range == "" then
+        UIManager:nextTick(function()
+            callback({})
+        end)
+        return
     end
-    local out = {}
-    for _, item in ipairs(best.items) do
-        local range = tostring(item.range or "")
-        if range ~= "" and by_range[range] then
-            out[#out + 1] = {
-                range = range,
-                text = tostring(item.markText or ""),
-                reviews = by_range[range],
-                total = tonumber(item.totalCount) or 0,
-            }
+    Log.info("skill", "readreviews_one", { book_id = book_id, chapter_uid = chapter_uid, range = range })
+    Skill.call_async("/book/readreviews", {
+        bookId = book_id,
+        chapterUid = chapter_uid,
+        reviews = {
+            { range = range, maxIdx = 0, count = 20, synckey = 0 },
+        },
+    }, function(payload, status, err)
+        if type(payload) ~= "table" or type(payload.reviews) ~= "table" then
+            Log.warn("skill", "readreviews_one_empty", { range = range, type = type(payload) })
+            callback({}, status, err)
+            return
+        end
+        for _, group in ipairs(payload.reviews) do
+            if tostring(group.range or "") == range then
+                local list = parse_review_group(group)
+                Log.info("skill", "readreviews_one_ok", { range = range, reviews = #list })
+                callback(list, status, err)
+                return
+            end
+        end
+        Log.info("skill", "readreviews_one_miss", { range = range })
+        callback({}, status, err)
+    end)
+end
+
+local function parse_recommend_payload(payload, count)
+    local books, seen = {}, {}
+    for _, item in ipairs(as_table(payload.books)) do
+        add_book(books, seen, item)
+    end
+    local last_idx = 0
+    for _, book in ipairs(books) do
+        local idx = tonumber(book.search_idx) or 0
+        if idx > last_idx then
+            last_idx = idx
         end
     end
-    Log.info("skill", "chapter_highlights_done", { matched = #out, ranges = #requests })
-    return out
+    enrich_reader_params(books)
+    Log.info("skill", "recommend_ok", { count = #books, max_idx = last_idx })
+    return {
+        books = books,
+        max_idx = last_idx,
+        has_more = #books >= count,
+        upgrade_info = payload.upgrade_info,
+    }
+end
+
+function Skill.recommend(opts)
+    opts = opts or {}
+    local count = math.max(1, tonumber(opts.count) or 12)
+    local payload, status, err = Skill.call("/book/recommend", {
+        count = count,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    })
+    if not payload then
+        return nil, status, err
+    end
+    return parse_recommend_payload(payload, count), status, err
+end
+
+function Skill.recommend_async(opts, callback)
+    opts = opts or {}
+    callback = type(callback) == "function" and callback or function() end
+    local count = math.max(1, tonumber(opts.count) or 12)
+    Skill.call_async("/book/recommend", {
+        count = count,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    }, function(payload, status, err)
+        if not payload then
+            callback(nil, status, err)
+            return
+        end
+        callback(parse_recommend_payload(payload, count), status, err)
+    end)
+end
+
+local function parse_similar_payload(payload, book_id, count)
+    local similar = as_table(payload.booksimilar or payload.bookSimilar)
+    local books, seen = {}, {}
+    for _, row in ipairs(as_table(similar.books)) do
+        row = as_table(row)
+        local wrap = as_table(row.book)
+        local info = as_table(wrap.bookInfo or wrap.book_info)
+        if next(info) then
+            add_book(books, seen, {
+                bookInfo = info,
+                searchIdx = row.idx,
+                newRating = info.newRating,
+                newRatingCount = info.newRatingCount,
+                readingCount = info.readingCount,
+                soldout = info.soldout,
+            })
+        end
+    end
+    local last_idx = 0
+    for _, book in ipairs(books) do
+        local idx = tonumber(book.search_idx) or 0
+        if idx > last_idx then
+            last_idx = idx
+        end
+    end
+    enrich_reader_params(books)
+    Log.info("skill", "similar_ok", {
+        book_id = book_id,
+        count = #books,
+        max_idx = last_idx,
+        session_id = tostring(similar.sessionId or similar.session_id or ""),
+    })
+    return {
+        book_id = book_id,
+        books = books,
+        session_id = tostring(similar.sessionId or similar.session_id or ""),
+        max_idx = last_idx,
+        has_more = #books >= count,
+        upgrade_info = payload.upgrade_info,
+    }
+end
+
+function Skill.similar(book_id, opts)
+    opts = opts or {}
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil, "http_error", "missing bookId"
+    end
+    local count = math.max(1, tonumber(opts.count) or 12)
+    local params = {
+        bookId = book_id,
+        count = count,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    }
+    local session_id = tostring(opts.session_id or "")
+    if session_id ~= "" then
+        params.sessionId = session_id
+    end
+    local payload, status, err = Skill.call("/book/similar", params)
+    if not payload then
+        return nil, status, err
+    end
+    return parse_similar_payload(payload, book_id, count), status, err
+end
+
+function Skill.similar_async(book_id, opts, callback)
+    opts = opts or {}
+    callback = type(callback) == "function" and callback or function() end
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        UIManager:nextTick(function()
+            callback(nil, "http_error", "missing bookId")
+        end)
+        return
+    end
+    local count = math.max(1, tonumber(opts.count) or 12)
+    local params = {
+        bookId = book_id,
+        count = count,
+        maxIdx = tonumber(opts.max_idx) or 0,
+    }
+    local session_id = tostring(opts.session_id or "")
+    if session_id ~= "" then
+        params.sessionId = session_id
+    end
+    Skill.call_async("/book/similar", params, function(payload, status, err)
+        if not payload then
+            callback(nil, status, err)
+            return
+        end
+        callback(parse_similar_payload(payload, book_id, count), status, err)
+    end)
+end
+
+function Skill.book_info(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil, "http_error", "missing bookId"
+    end
+    local payload, status, err = Skill.call("/book/info", {
+        bookId = book_id,
+    })
+    if not payload then
+        return nil, status, err
+    end
+    local book = parse_book_from_payload(payload)
+    if not book then
+        return nil, status, err or "empty"
+    end
+    Log.info("skill", "book_info_ok", { book_id = book_id, title = book.title })
+    return book, status, err
+end
+
+function Skill.book_info_async(book_id, callback)
+    book_id = tostring(book_id or "")
+    callback = type(callback) == "function" and callback or function() end
+    if book_id == "" then
+        UIManager:nextTick(function()
+            callback(nil, "http_error", "missing bookId")
+        end)
+        return
+    end
+    Skill.call_async("/book/info", { bookId = book_id }, function(payload, status, err)
+        if not payload then
+            callback(nil, status, err)
+            return
+        end
+        local book = parse_book_from_payload(payload)
+        if not book then
+            callback(nil, status, err or "empty")
+            return
+        end
+        Log.info("skill", "book_info_ok", { book_id = book_id, title = book.title })
+        callback(book, status, err)
+    end)
 end
 
 local function start_of_day(ts)
@@ -431,6 +920,15 @@ local function absorb_day_map(map, data)
     absorb(data.dailyReadTimes)
 end
 
+local function parse_readdata_payload(payload)
+    if type(payload.readDetail) == "table" then
+        local nested = payload.readDetail
+        nested.upgrade_info = nested.upgrade_info or payload.upgrade_info
+        return nested
+    end
+    return payload
+end
+
 function Skill.readdata(mode, baseTime)
     mode = tostring(mode or "monthly")
     local params = { mode = mode }
@@ -442,12 +940,28 @@ function Skill.readdata(mode, baseTime)
     if not payload then
         return nil, status, err
     end
-    if type(payload.readDetail) == "table" then
-        local nested = payload.readDetail
-        nested.upgrade_info = nested.upgrade_info or payload.upgrade_info
-        return nested
+    return parse_readdata_payload(payload)
+end
+
+function Skill.readdata_async(mode, baseTime, callback)
+    if type(baseTime) == "function" then
+        callback = baseTime
+        baseTime = nil
     end
-    return payload
+    callback = type(callback) == "function" and callback or function() end
+    mode = tostring(mode or "monthly")
+    local params = { mode = mode }
+    local ts = tonumber(baseTime)
+    if ts and ts > 0 then
+        params.baseTime = math.floor(ts)
+    end
+    Skill.call_async("/readdata/detail", params, function(payload, status, err)
+        if not payload then
+            callback(nil, status, err)
+            return
+        end
+        callback(parse_readdata_payload(payload), status, err)
+    end)
 end
 
 function Skill.heatmap30(opts)
@@ -490,6 +1004,66 @@ function Skill.heatmap30(opts)
         ts = ts + 86400
     end
     return map
+end
+
+function Skill.heatmap30_async(opts, callback)
+    opts = opts or {}
+    callback = type(callback) == "function" and callback or function() end
+    local map = {}
+    local now = os.time()
+    local today = os.date("*t", now)
+    local first = start_of_day(now) - 29 * 86400
+    local last = start_of_day(now)
+    local months = {}
+    local seen = {
+        [string.format("%04d-%02d", today.year, today.month)] = true,
+    }
+    months[#months + 1] = { label = "current", base = nil }
+    local ts = first
+    while ts <= last do
+        local t = os.date("*t", ts)
+        local key = string.format("%04d-%02d", t.year, t.month)
+        if not seen[key] then
+            seen[key] = true
+            months[#months + 1] = {
+                label = key,
+                base = os.time({
+                    year = t.year,
+                    month = t.month,
+                    day = 15,
+                    hour = 12,
+                    min = 0,
+                    sec = 0,
+                }),
+            }
+        end
+        ts = ts + 86400
+    end
+
+    local index = 1
+    local function step(seed)
+        if type(seed) == "table" then
+            absorb_day_map(map, seed)
+        end
+        if index > #months then
+            callback(map, "ok")
+            return
+        end
+        local item = months[index]
+        index = index + 1
+        if item.label == "current" and type(opts.monthly) == "table" then
+            step(opts.monthly)
+            return
+        end
+        Skill.readdata_async("monthly", item.base, function(data, status, err)
+            if not data and item.label == "current" then
+                callback(nil, status, err)
+                return
+            end
+            step(data)
+        end)
+    end
+    step(nil)
 end
 
 return Skill

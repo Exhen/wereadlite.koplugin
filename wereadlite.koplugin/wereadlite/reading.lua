@@ -11,6 +11,7 @@ local Bookmark = require("wereadlite.kindle.bookmark")
 local Covers = require("wereadlite.covers")
 local ReviewDialog = require("wereadlite.review_dialog")
 local Settings = require("wereadlite.settings")
+local Skill = require("wereadlite.skill")
 
 local Reading = {
     book = nil,
@@ -38,6 +39,10 @@ local function show_review_comments(reviews)
 end
 
 local function prepare_review_comments(reviews)
+    if not Settings.load_review_avatars() then
+        show_review_comments(reviews)
+        return
+    end
     local loading = InfoMessage:new{ text = "正在加载评论…" }
     UIManager:show(loading)
     local jobs = {}
@@ -366,21 +371,57 @@ local function open_review_by_id(review_id)
     if review_id == "" or not Reading.is_active() then
         return false
     end
-    local reviews = Reader.review_data and Reader.review_data[review_id]
-    if type(reviews) ~= "table" or #reviews == 0 then
-        for _, mark in ipairs(Reader.review_marks or {}) do
-            if mark.id == review_id then
-                reviews = mark.reviews
-                break
-            end
+    local mark
+    for _, item in ipairs(Reader.review_marks or {}) do
+        if item.id == review_id then
+            mark = item
+            break
         end
     end
-    if type(reviews) ~= "table" or #reviews == 0 then
+    if not mark then
         Log.warn("reading", "review_link_miss", { id = review_id })
         return false
     end
-    Log.info("reading", "review_link", { id = review_id, reviews = #reviews })
-    prepare_review_comments(reviews)
+
+    local reviews = Reader.review_data and Reader.review_data[review_id]
+    if type(reviews) ~= "table" or #reviews == 0 then
+        reviews = mark.reviews
+    end
+    if type(reviews) == "table" and #reviews > 0 then
+        Log.info("reading", "review_link_cached", { id = review_id, reviews = #reviews })
+        prepare_review_comments(reviews)
+        return true
+    end
+
+    local state = Reading.state
+    local book_id = state and tostring(state.book_id or "")
+    local chapter_uid = state and state.cur and tonumber(state.cur.uid)
+    local range = tostring(mark.range or "")
+    if book_id == "" or not chapter_uid or range == "" then
+        Log.warn("reading", "review_link_context", { id = review_id, range = range })
+        return false
+    end
+
+    local loading = InfoMessage:new{ text = "正在加载评论…" }
+    UIManager:show(loading)
+    Skill.fetch_range_reviews_async(book_id, chapter_uid, range, function(fetched, status, err)
+        UIManager:close(loading)
+        if type(fetched) ~= "table" then
+            Log.warn("reading", "review_fetch_fail", { id = review_id, range = range, status = status, err = err })
+            UIManager:show(InfoMessage:new{ text = "加载评论失败", timeout = 2 })
+            return
+        end
+        if #fetched == 0 then
+            Log.info("reading", "review_fetch_empty", { id = review_id, range = range })
+            UIManager:show(InfoMessage:new{ text = "暂无评论", timeout = 2 })
+            return
+        end
+        Reader.review_data = Reader.review_data or {}
+        Reader.review_data[review_id] = fetched
+        mark.reviews = fetched
+        Log.info("reading", "review_link", { id = review_id, range = range, reviews = #fetched })
+        prepare_review_comments(fetched)
+    end)
     return true
 end
 
@@ -398,10 +439,11 @@ local function open_document(path, resume, state)
         end
     end
     local ReaderUI = require("apps/reader/readerui")
+    -- seamless=true hides KOReader's "Opening file ..." infomessage (same as legado.koplugin).
     if ReaderUI.instance and ReaderUI.instance.switchDocument then
-        ReaderUI.instance:switchDocument(path, nil, after_open)
+        ReaderUI.instance:switchDocument(path, true, after_open)
     else
-        ReaderUI:showReader(path, nil, nil, nil, after_open)
+        ReaderUI:showReader(path, nil, true, nil, after_open)
     end
 end
 
@@ -458,18 +500,21 @@ end
 
 function Reading.open_url(url, book, opts)
     opts = opts or {}
+    url = tostring(url or "")
     Reading.cancel_load()
-    -- Do not cancel a running next-chapter request here: if it is nearly
-    -- complete, the reader can still consume its ready result. Only the
-    -- delayed trigger for the previous chapter must be removed.
     Reading.cancel_prefetch_schedule()
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
-    local ok_bar, bar = pcall(LoadProgress.open)
-    if not ok_bar then
-        Log.warn("reading", "progress_ui", { err = bar })
-        bar = nil
+    local bar
+    if Settings.show_chapter_load_progress() then
+        local ok_bar, opened = pcall(LoadProgress.open)
+        if not ok_bar then
+            Log.warn("reading", "progress_ui", { err = opened })
+            bar = nil
+        else
+            bar = opened
+        end
     end
     Reading._load_bar = bar
     local function report(stage, done, total)
@@ -562,6 +607,27 @@ function Reading.open_url(url, book, opts)
         complete(prefetched)
         return true, "prefetched"
     end
+
+    -- Same chapter already loading in background: adopt that job (no second fetch).
+    if Reader.is_prefetching(url) then
+        local adopted, job = Reader.adopt_prefetch(url, report, complete)
+        if adopted then
+            Reading._load_task = job
+            Log.info("reading", "open_adopt_prefetch", { url = url })
+            return true, "adopted"
+        end
+        -- Race: finished into cache between checks.
+        prefetched = Reader.take_prefetched(url)
+        if prefetched then
+            complete(prefetched)
+            return true, "prefetched"
+        end
+    else
+        -- Opening a different chapter (or no prefetch): stop the background job
+        -- so it cannot write the same html_path as the new load.
+        Reading.cancel_prefetch()
+    end
+
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete)
     if not called then
         close_bar()
@@ -1037,8 +1103,8 @@ local function install_review_link_hook()
         -- Prefer native link hit-testing. Empty page areas return nil and
         -- fall through to KOReader page-turn zones without a plugin overlay.
         local has_reviews = Reading.is_active()
-            and type(Reader.review_data) == "table"
-            and next(Reader.review_data) ~= nil
+            and type(Reader.review_marks) == "table"
+            and #Reader.review_marks > 0
         if has_reviews and ges and type(self.getLinkFromGes) == "function" then
             local link
             local ok_link, result = pcall(self.getLinkFromGes, self, ges)

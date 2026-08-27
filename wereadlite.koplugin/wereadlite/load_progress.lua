@@ -17,7 +17,7 @@ local STAGES = {
     download = { from = 0, to = 0.30, text = "下载章节" },
     load = { from = 0.30, to = 0.60, text = "加载章节" },
     images = { from = 0.60, to = 0.85, text = "下载书内图片" },
-    reviews = { from = 0.85, to = 1, text = "加载划线与评论" },
+    reviews = { from = 0.85, to = 1, text = "加载划线" },
 }
 
 local LoadProgress = InputContainer:extend{

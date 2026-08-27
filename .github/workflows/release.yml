@@ -1,6 +1,9 @@
 # Package wereadlite.koplugin and publish a GitHub Release from the
 # version declared in _meta.lua (must match wereadlite/config.lua VERSION).
 #
+# Release notes come from CHANGELOG.md section matching that version
+# (e.g. ## [0.2.1] - ...). Keep Unreleased notes out of the shipped body.
+#
 # Triggers:
 #   - Manual: Actions → Release → Run workflow
 #   - Tag push: git tag v0.1.0 && git push origin v0.1.0
@@ -70,6 +73,46 @@ jobs:
             exit 1
           fi
 
+      - name: Build release notes from CHANGELOG
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          CHANGELOG="CHANGELOG.md"
+          BODY_FILE="$GITHUB_WORKSPACE/RELEASE_BODY.md"
+          if [[ ! -f "$CHANGELOG" ]]; then
+            echo "::error::missing $CHANGELOG"
+            exit 1
+          fi
+          # Extract "## [VERSION] ..." through the line before the next "## ".
+          SECTION="$(awk -v ver="$VERSION" '
+            BEGIN { found = 0 }
+            $0 ~ ("^## \\[" ver "\\]") {
+              found = 1
+              print
+              next
+            }
+            found && /^## / { exit }
+            found { print }
+          ' "$CHANGELOG")"
+          if [[ -z "${SECTION//[[:space:]]/}" ]]; then
+            echo "::error::CHANGELOG.md has no section for version $VERSION (expect '## [$VERSION] - YYYY-MM-DD')"
+            exit 1
+          fi
+          {
+            printf '%s\n\n' "$SECTION"
+            echo "---"
+            echo
+            echo "### 安装"
+            echo
+            echo "将 \`wereadlite.koplugin-v${VERSION}.zip\` 解压到 KOReader 的 \`plugins/\` 目录。"
+            echo
+            echo "请勿打包进 \`data/\`、\`cache/\`（会话与缓存数据）。"
+          } > "$BODY_FILE"
+          echo "----- release body -----"
+          cat "$BODY_FILE"
+          echo "body_path=$BODY_FILE" >> "$GITHUB_OUTPUT"
+
       - name: Package plugin
         run: |
           set -euo pipefail
@@ -98,13 +141,8 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: wereadlite v${{ steps.ver.outputs.version }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          body: |
-            ## wereadlite v${{ steps.ver.outputs.version }}
-
-            安装：将 `wereadlite.koplugin-v${{ steps.ver.outputs.version }}.zip` 解压到 KOReader 的 `plugins/` 目录。
-
-            请勿打包进 `data/`、`cache/`（会话与缓存数据）。
+          generate_release_notes: false
+          body_path: ${{ steps.notes.outputs.body_path }}
           files: |
             ${{ steps.ver.outputs.asset }}
             ${{ steps.ver.outputs.asset }}.sha256

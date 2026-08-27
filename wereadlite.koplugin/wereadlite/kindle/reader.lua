@@ -10,9 +10,11 @@ local Skill = require("wereadlite.skill")
 local Settings = require("wereadlite.settings")
 local AsyncHttp = require("wereadlite.async_http")
 local Paths = require("wereadlite.paths")
+local UIManager = require("ui/uimanager")
 
 local Reader = {}
 Reader._prefetch_job = nil
+Reader._prefetch_url = nil
 Reader._prefetched = {}
 
 function Reader.take_prefetched(url)
@@ -709,100 +711,48 @@ function Reader.fetch(url)
     return body
 end
 
-function Reader.prefetch_next(state)
-    local url = Reader.next_url(state)
-    if not url then return end
-    if has_prefetch(url) then
-        return
-    end
-    if Reader._prefetch_job then
-        AsyncHttp.cancel(Reader._prefetch_job)
-        Reader._prefetch_job = nil
-    end
-    Log.info("reader", "prefetch_start", { url = url })
-    Reader._prefetch_job = AsyncHttp.request({
-        url = url,
-        timeout = 30,
-        accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        referer = Config.READER_URL,
-        send_cookie = true,
-        absorb_cookies = true,
-    }, function(res)
-        Reader._prefetch_job = nil
-        if not res or not res.ok or not res.body or #res.body == 0 then
-            Log.warn("reader", "prefetch_fail", { url = url, status = res and res.status, err = res and res.err })
-            return
-        end
-        local path = prefetch_path(url)
-        local file = io.open(path .. ".tmp", "wb")
-        if file then
-            file:write(res.body)
-            file:close()
-            os.rename(path .. ".tmp", path)
-            Log.info("reader", "prefetch_done", { url = url, bytes = #res.body })
-
-            -- The first response is only a probe.  The chapter loader also
-            -- fetches each `sect` URL, so prefetch those bodies too.
-            local ok_parse, probe = pcall(Reader.parse, res.body)
-            local bc = url:match("[?&]bc=([^&]+)")
-            if ok_parse and type(probe) == "table" then
-                bc = (probe.cur and probe.cur.param) or bc
-            end
-            local total = ok_parse and tonumber(probe.section_count) or 1
-            total = math.max(1, total or 1)
-            if is_bc(bc) and total > 0 then
-                local pending, active, done = {}, 0, 0
-                for sect = 0, total - 1 do
-                    local sect_url = Reader.url_for(bc, { sect = sect })
-                    if not has_prefetch(sect_url) then pending[#pending + 1] = sect_url end
-                end
-                local pump
-                pump = function()
-                    while active < 2 and #pending > 0 do
-                        local sect_url = table.remove(pending, 1)
-                        active = active + 1
-                        AsyncHttp.request({
-                            url = sect_url,
-                            timeout = 30,
-                            accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            referer = Config.READER_URL,
-                            send_cookie = true,
-                            absorb_cookies = true,
-                        }, function(section_res)
-                            active = active - 1
-                            done = done + 1
-                            if section_res and section_res.ok and section_res.body and #section_res.body > 0 then
-                                local section_path = prefetch_path(sect_url)
-                                local section_file = io.open(section_path .. ".tmp", "wb")
-                                if section_file then
-                                    section_file:write(section_res.body)
-                                    section_file:close()
-                                    os.rename(section_path .. ".tmp", section_path)
-                                    Log.dbg("reader", "prefetch_section_done", { sect = sect, bytes = #section_res.body })
-                                end
-                            else
-                                Log.warn("reader", "prefetch_section_fail", { url = sect_url })
-                            end
-                            if #pending > 0 then pump() end
-                            if active == 0 and #pending == 0 then
-                                Log.info("reader", "prefetch_sections_done", { total = done })
-                            end
-                        end)
-                    end
-                end
-                pump()
-            end
-        end
-    end)
+-- Prefetch uses Reader.load with opts.background so downloads are async and
+-- each stage yields via UIManager:nextTick. Same URL may later be adopted by
+-- Reading.open_url instead of starting a second load.
+function Reader.is_prefetching(url)
+    url = tostring(url or "")
+    local job = Reader._prefetch_job
+    return url ~= ""
+        and Reader._prefetch_url == url
+        and type(job) == "table"
+        and not job.cancelled
 end
 
--- Full prefetch implementation: reuse the exact Reader.load pipeline so the
--- next chapter is decoded, localized, annotated, and written as a ready HTML
--- document before the user opens it.  This later declaration intentionally
--- replaces the legacy raw-response prefetch above.
+function Reader.adopt_prefetch(url, on_progress, on_ready)
+    url = tostring(url or "")
+    if not Reader.is_prefetching(url) then
+        return false
+    end
+    local job = Reader._prefetch_job
+    Reader._prefetch_job = nil
+    Reader._prefetch_url = nil
+    job.adopted = true
+    if type(on_progress) == "function" then
+        job.on_progress = on_progress
+    end
+    job.on_ready = function(state, status, err)
+        if type(on_ready) == "function" then
+            on_ready(state, status, err)
+        end
+    end
+    Log.info("reader", "prefetch_adopted", { url = url })
+    return true, job
+end
+
 function Reader.prefetch_next(state, book)
     local url = Reader.next_url(state)
-    if not url then return end
+    if not url then
+        return
+    end
+    if Reader._prefetched[url] then
+        Log.info("reader", "prefetch_already_cached", { url = url })
+        return
+    end
     local next_uid = state.next_param and tostring(state.next_param.uid or "") or ""
     if next_uid ~= "" then
         local existing = io.open(Reader.html_path(state.book_id, next_uid), "rb")
@@ -812,178 +762,262 @@ function Reader.prefetch_next(state, book)
             return
         end
     end
-    if Reader._prefetch_job and type(Reader._prefetch_job.cancel) == "function" then
-        pcall(Reader._prefetch_job.cancel, Reader._prefetch_job)
-        Reader._prefetch_job = nil
+    if Reader.is_prefetching(url) then
+        Log.dbg("reader", "prefetch_already_running", { url = url })
+        return
     end
-    Log.info("reader", "prefetch_start", { url = url, mode = "full" })
+    Reader.cancel_prefetch()
+    Log.info("reader", "prefetch_start", { url = url, mode = "background" })
     local prefetch_book = book or state.book_info or { bookId = state.book_id, title = state.book_title }
-    local called, result, status, err = pcall(Reader.load, url, prefetch_book, nil, function(prefetched, ready_status, ready_err)
-        Reader._prefetch_job = nil
+    local prefetch_opts = { background = true, prefetch = true }
+    local job_ref
+    local function on_prefetch_ready(prefetched, ready_status, ready_err)
+        -- If adopted, on_ready was replaced; this callback is no longer invoked.
+        if Reader._prefetch_url == url then
+            Reader._prefetch_url = nil
+        end
+        if job_ref and Reader._prefetch_job == job_ref then
+            Reader._prefetch_job = nil
+        end
         if prefetched then
             Reader._prefetched[url] = prefetched
-            Log.info("reader", "prefetch_done", { url = url, html = prefetched.html_path, mode = "full" })
+            Log.info("reader", "prefetch_done", { url = url, html = prefetched.html_path, mode = "background" })
         else
             Log.warn("reader", "prefetch_fail", { url = url, status = ready_status, err = ready_err })
         end
-    end)
+    end
+    local called, result, status, err = pcall(
+        Reader.load, url, prefetch_book, nil, on_prefetch_ready, prefetch_opts
+    )
     if not called then
         Reader._prefetch_job = nil
+        Reader._prefetch_url = nil
         Log.warn("reader", "prefetch_throw", { url = url, err = result })
-    elseif status == "pending" then
+        return
+    end
+    if status == "pending" then
+        job_ref = err
         Reader._prefetch_job = err
-    elseif result then
-        Reader._prefetch_job = nil
-        Log.info("reader", "prefetch_done", { url = url, html = result.html_path, mode = "full" })
+        Reader._prefetch_url = url
+        return
+    end
+    Reader._prefetch_job = nil
+    Reader._prefetch_url = nil
+    if result then
+        Reader._prefetched[url] = result
+        Log.info("reader", "prefetch_done", { url = url, html = result.html_path, mode = "background" })
     end
 end
 
 function Reader.cancel_prefetch()
     local job = Reader._prefetch_job
+    local url = Reader._prefetch_url
     Reader._prefetch_job = nil
+    Reader._prefetch_url = nil
     if job and type(job.cancel) == "function" then
         pcall(job.cancel, job)
-        Log.dbg("reader", "prefetch_cancelled")
+        Log.dbg("reader", "prefetch_cancelled", { url = url })
     end
 end
 
-local function html_entity(text)
-    return tostring(text or ""):gsub("&nbsp;", " "):gsub("&quot;", '"')
-        :gsub("&#39;", "'"):gsub("&apos;", "'"):gsub("&amp;", "&")
-        :gsub("&#(%d+);", function(n) return string.char(tonumber(n) or 32) end)
-        :gsub("&#x([%da-fA-F]+);", function(n) return string.char(tonumber(n, 16) or 32) end)
-end
+-- WeRead encodes per-character offsets on <span wco="N">; API range matches those coords.
+-- Inject underlines in O(N + M): one index scan, mark spans, single table.concat emit.
+local UNDERLINE_LINK_OPEN = '<a class="wereadlite-highlight" style="color:inherit;-cr-hint:presentational-hint;text-decoration:none;border-bottom:1px dashed currentColor" href="wereadlite://review/'
 
-local function find_text_in_html(html, wanted)
-    wanted = html_entity(wanted):gsub("%s+", " ")
-    local plain, starts, ends = {}, {}, {}
-    local p, n = 1, 0
-    while p <= #html do
-        local a, b = html:find("<[^>]*>", p)
-        local stop = a or (#html + 1)
-        if stop > p then
-            local chunk = html_entity(html:sub(p, stop - 1))
-            for i = 1, #chunk do
-                local c = chunk:sub(i, i)
-                if not c:match("%s") then
-                    local width = #c
-                    n = n + width
-                    plain[n] = c
-                    for j = n - width + 1, n do
-                        starts[j], ends[j] = p + i - 1, p + i - 1
-                    end
-                elseif plain[n] ~= " " then
-                    n = n + 1
-                    plain[n], starts[n], ends[n] = " ", p + i - 1, p + i - 1
-                end
+-- Returns doc (document order) and by_wco (sorted by wco). Entries are shared tables:
+-- { wco, open_gt, close_lt [, mark] }
+local function build_wco_index(html)
+    local doc = {}
+    local p, n = 1, #html
+    while p <= n do
+        local span_start = html:find("<span", p, true)
+        if not span_start then
+            break
+        end
+        local gt = html:find(">", span_start, true)
+        if not gt then
+            break
+        end
+        local wco = tonumber(html:sub(span_start, gt):match('wco%s*=%s*"(%d+)"'))
+        if wco then
+            local close_lt = html:find("</span>", gt + 1, true)
+            if close_lt and close_lt > gt then
+                doc[#doc + 1] = {
+                    wco = wco,
+                    open_gt = gt,
+                    close_lt = close_lt,
+                }
             end
         end
-        if not a then break end
-        p = b + 1
+        p = gt + 1
     end
-    local text = table.concat(plain)
-    local at = text:find(wanted, 1, true)
-    if not at then return nil end
-    return starts[at], ends[at + #wanted - 1]
+    local by_wco = {}
+    for i = 1, #doc do
+        by_wco[i] = doc[i]
+    end
+    table.sort(by_wco, function(a, b)
+        return a.wco < b.wco
+    end)
+    return doc, by_wco
 end
 
-local function underline_html_range(html, start_at, finish_at, review_id)
-    -- Use native <a> so KOReader's ReaderLink handles taps. Blank page areas
-    -- keep going through tap_forward/tap_backward with no plugin overlay.
-    local open = '<a class="wereadlite-highlight" style="color:inherit;-cr-hint:presentational-hint;text-decoration:underline;text-decoration-style:dashed" href="wereadlite://review/'
-        .. tostring(review_id or "") .. '">'
-    local close = "</a>"
-    local out, cursor = {}, 1
-    while cursor <= #html do
-        local tag_start, tag_end = html:find("<[^>]*>", cursor)
-        local text_end = tag_start and (tag_start - 1) or #html
-        if text_end >= cursor then
-            local left = math.max(cursor, start_at)
-            local right = math.min(text_end, finish_at)
-            if left <= right then
-                out[#out + 1] = html:sub(cursor, left - 1)
-                out[#out + 1] = open
-                out[#out + 1] = html:sub(left, right)
-                out[#out + 1] = close
-                out[#out + 1] = html:sub(right + 1, text_end)
-            else
-                out[#out + 1] = html:sub(cursor, text_end)
-            end
+local function wco_lower_bound(by_wco, start0)
+    local lo, hi, idx = 1, #by_wco, #by_wco + 1
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        if by_wco[mid].wco >= start0 then
+            idx = mid
+            hi = mid - 1
+        else
+            lo = mid + 1
         end
-        if not tag_start then break end
-        out[#out + 1] = html:sub(tag_start, tag_end)
-        cursor = tag_end + 1
     end
-    return table.concat(out)
+    return idx
 end
 
-local function add_highlight_reviews(body, book_id, chapter_uid)
+local function emit_wco_underlines(html, doc)
+    local out = {}
+    local cursor = 1
+    local marked = 0
+    for i = 1, #doc do
+        local span = doc[i]
+        if cursor <= span.open_gt then
+            out[#out + 1] = html:sub(cursor, span.open_gt)
+        end
+        local text = html:sub(span.open_gt + 1, span.close_lt - 1)
+        if span.mark then
+            marked = marked + 1
+            out[#out + 1] = UNDERLINE_LINK_OPEN
+            out[#out + 1] = span.mark
+            out[#out + 1] = '">'
+            out[#out + 1] = text
+            out[#out + 1] = "</a>"
+        else
+            out[#out + 1] = text
+        end
+        cursor = span.close_lt
+    end
+    if cursor <= #html then
+        out[#out + 1] = html:sub(cursor)
+    end
+    return table.concat(out), marked
+end
+
+local function parse_range(range)
+    range = tostring(range or "")
+    local start0, end0 = range:match("^(%d+)%-(%d+)$")
+    start0, end0 = tonumber(start0), tonumber(end0)
+    if not start0 or not end0 or end0 <= start0 then
+        return nil
+    end
+    return start0, end0
+end
+
+local function add_chapter_underlines(body, book_id, chapter_uid, underlines)
     local review_data, review_marks = {}, {}
-    Log.info("reader", "highlight_reviews_start", { book_id = book_id, chapter_uid = chapter_uid, body_bytes = #tostring(body or "") })
-    local ok, marks = pcall(Skill.chapter_highlights, book_id, chapter_uid)
-    if not ok or type(marks) ~= "table" or #marks == 0 then
-        Log.warn("reader", "highlight_reviews_none", { ok = ok, type = type(marks), count = type(marks) == "table" and #marks or 0 })
+    body = tostring(body or "")
+    underlines = type(underlines) == "table" and underlines or {}
+    local t0 = Log.now_ms and Log.now_ms() or nil
+    Log.info("reader", "underlines_start", {
+        book_id = book_id,
+        chapter_uid = chapter_uid,
+        body_bytes = #body,
+        available = #underlines,
+    })
+    if #underlines == 0 then
+        Log.warn("reader", "underlines_none", { count = 0 })
         return body, 0, review_data, review_marks
     end
-    local count = 0
-    for _, mark in ipairs(marks) do
-        local text = tostring(mark.text or "")
-        if text ~= "" and type(mark.reviews) == "table" and #mark.reviews > 0 then
-            local at, finish_at = find_text_in_html(body, text)
-            if at then
-                count = count + 1
-                local id = "wereadlite_review_" .. tostring(count)
-                review_data[id] = mark.reviews
-                review_marks[#review_marks + 1] = {
-                    id = id,
-                    text = text,
-                    reviews = mark.reviews,
-                    range = mark.range,
-                }
-                body = underline_html_range(body, at, finish_at, id)
-                Log.dbg("reader", "highlight_range", { start = at, finish = finish_at, bytes = finish_at - at + 1 })
-                Log.dbg("reader", "highlight_match", { index = count, text_bytes = #text, reviews = #mark.reviews, range = mark.range })
-            else
-                Log.warn("reader", "highlight_no_match", { text_bytes = #text, range = mark.range })
-            end
+    local pending = {}
+    for _, item in ipairs(underlines) do
+        local range = tostring(item.range or "")
+        local start0, end0 = parse_range(range)
+        if start0 then
+            pending[#pending + 1] = {
+                range = range,
+                start0 = start0,
+                end0 = end0,
+                count = tonumber(item.count) or 0,
+            }
         end
     end
-    Log.info("reader", "highlight_reviews_done", { injected = count, available = #marks })
-    return body, count, review_data, review_marks
+    local t_index = Log.now_ms and Log.now_ms() or nil
+    local doc, by_wco = build_wco_index(body)
+    local t_mark = Log.now_ms and Log.now_ms() or nil
+    Log.info("reader", "underlines_wco_index", {
+        spans = #doc,
+        index_ms = t_index and t_mark and math.floor(t_mark - t_index + 0.5) or nil,
+    })
+
+    local count = 0
+    for _, item in ipairs(pending) do
+        local idx = wco_lower_bound(by_wco, item.start0)
+        if idx <= #by_wco and by_wco[idx].wco < item.end0 then
+            count = count + 1
+            local id = "wereadlite_review_" .. tostring(count)
+            review_marks[#review_marks + 1] = {
+                id = id,
+                range = item.range,
+                count = item.count,
+            }
+            local spans = 0
+            for i = idx, #by_wco do
+                local span = by_wco[i]
+                if span.wco >= item.end0 then
+                    break
+                end
+                span.mark = id
+                spans = spans + 1
+            end
+            Log.dbg("reader", "underline_range", {
+                index = count,
+                range = item.range,
+                wco_start = item.start0,
+                wco_end = item.end0,
+                spans = spans,
+            })
+        else
+            Log.warn("reader", "underline_no_match", {
+                range = item.range,
+                start0 = item.start0,
+                end0 = item.end0,
+            })
+        end
+    end
+
+    local marked_body, marked_spans = emit_wco_underlines(body, doc)
+    local t_end = Log.now_ms and Log.now_ms() or nil
+    Log.info("reader", "underlines_done", {
+        injected = count,
+        available = #underlines,
+        marked_spans = marked_spans,
+        emit_ms = t_mark and t_end and math.floor(t_end - t_mark + 0.5) or nil,
+        total_ms = t0 and t_end and math.floor(t_end - t0 + 0.5) or nil,
+    })
+    return marked_body, count, review_data, review_marks
 end
 
-function Reader.load(url, book, on_progress, on_ready)
+local FETCH_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+local function load_background_mode(opts)
+    opts = type(opts) == "table" and opts or {}
+    return opts.background == true or opts.prefetch == true
+end
+
+local function validate_fetch_body(body)
+    body = tostring(body or "")
+    if body == "" then
+        return nil, "http_error", "empty response"
+    end
+    if body:find("扫码登录", 1, true) and not body:find("readerContent", 1, true) then
+        Log.warn("reader", "fetch_login_page", { bytes = #body })
+        return nil, "auth_expired"
+    end
+    return body
+end
+
+local function merge_book_meta(state, book)
     book = book or {}
-    local function report(stage, done, total)
-        if type(on_progress) == "function" then
-            pcall(on_progress, stage, done, total)
-        end
-    end
-    report("download", 0, 1)
-    Log.dbg("reader", "load_start", {
-        url = url,
-        book_id = book.bookId,
-        title = book.title,
-    })
-    local html, status, err = Reader.fetch(url)
-    if not html then
-        Log.warn("reader", "load_fetch", { url = url, status = status, err = err })
-        return nil, status, err
-    end
-    report("download", 1, 1)
-    local state = Reader.parse(html)
-    Log.dbg("reader", "parse", {
-        book_id = state.book_id,
-        title = state.book_title,
-        uid = state.cur and state.cur.uid,
-        idx = state.cur and state.cur.idx,
-        chapters = #(state.chapters or {}),
-        section = state.section,
-        section_count = state.section_count,
-        need_pay = state.need_pay,
-        has_token = state.token ~= nil and state.token ~= "",
-        bytes = #html,
-    })
     if state.cur then
         local uid = tostring(state.cur.uid or "")
         if uid ~= "" then
@@ -1020,16 +1054,63 @@ function Reader.load(url, book, on_progress, on_ready)
         end
         pcall(BookDb.save, state.book_info)
     end
-    local pages = {}
+end
+
+local function resolve_bc(state, url)
     local bc = query_bc(url)
     if is_bc(state.cur and state.cur.param) then
         bc = state.cur.param
     elseif is_bc(state.cur_param and state.cur_param.param) then
         bc = state.cur_param.param
     end
-    -- Always re-fetch every section 0..N-1. The probe response is only for
-    -- metadata (section count / resume offset); never reuse it as body.
-    local cur_sect = math.max(0, tonumber(state.section) or 0)
+    return bc
+end
+
+local function fetch_async(url, job, callback)
+    url = tostring(url or "")
+    if job and job.cancelled then
+        return
+    end
+    local cached = read_prefetch(url)
+    if cached then
+        UIManager:nextTick(function()
+            if not job or not job.cancelled then
+                callback(cached, "ok")
+            end
+        end)
+        return
+    end
+    Log.dbg("reader", "fetch_async", { url = url })
+    job.active_http = AsyncHttp.request({
+        url = url,
+        timeout = 30,
+        accept = FETCH_ACCEPT,
+        referer = Config.READER_URL,
+        send_cookie = true,
+        absorb_cookies = true,
+    }, function(res)
+        job.active_http = nil
+        UIManager:nextTick(function()
+            if job and job.cancelled then
+                return
+            end
+            if not res or not res.ok or not res.body or #res.body == 0 then
+                callback(nil, res and res.status or "http_error", res and res.err)
+                return
+            end
+            if res.status == "auth_expired" then
+                callback(nil, "auth_expired", res.err)
+                return
+            end
+            local body, status, err = validate_fetch_body(res.body)
+            callback(body, status, err)
+        end)
+    end)
+end
+
+local function download_sections_sync(state, url, html, report)
+    local pages = {}
+    local bc = resolve_bc(state, url)
     local section_count = tonumber(state.section_count) or 0
     if section_count < 1 then
         section_count = 1
@@ -1039,7 +1120,7 @@ function Reader.load(url, book, on_progress, on_ready)
         local total = last_sect + 1
         report("download", 0, total)
         Log.dbg("reader", "sections", {
-            cur = cur_sect,
+            cur = math.max(0, tonumber(state.section) or 0),
             last = last_sect,
             total = total,
             offset = state.chapter_offset,
@@ -1065,6 +1146,112 @@ function Reader.load(url, book, on_progress, on_ready)
         return nil, "http_error", "chapter empty"
     end
     report("download", #pages, #pages)
+    return pages
+end
+
+local function download_sections_background(state, url, html, report, job, on_pages, on_fail)
+    local pages = {}
+    local bc = resolve_bc(state, url)
+    local section_count = tonumber(state.section_count) or 0
+    if section_count < 1 then
+        section_count = 1
+    end
+    local last_sect = section_count - 1
+    if not is_bc(bc) then
+        pages[1] = html
+        UIManager:nextTick(function()
+            if job.cancelled then
+                return
+            end
+            on_pages(pages)
+        end)
+        return
+    end
+    local total = last_sect + 1
+    report("download", 0, total)
+    Log.dbg("reader", "sections_async", {
+        cur = math.max(0, tonumber(state.section) or 0),
+        last = last_sect,
+        total = total,
+        offset = state.chapter_offset,
+    })
+    local sect = 0
+    local function fetch_next()
+        if job.cancelled then
+            return
+        end
+        if sect > last_sect then
+            if #pages == 0 then
+                on_fail("http_error", "chapter empty")
+                return
+            end
+            report("download", #pages, total)
+            UIManager:nextTick(function()
+                if not job.cancelled then
+                    on_pages(pages)
+                end
+            end)
+            return
+        end
+        local sect_url = Reader.url_for(bc, { sect = sect })
+        Log.dbg("reader", "section_fetch_async", { sect = sect })
+        fetch_async(sect_url, job, function(page, status, err)
+            if job.cancelled then
+                return
+            end
+            if not page then
+                if sect == 0 then
+                    on_fail(status or "http_error", err or "chapter section 0 missing")
+                    return
+                end
+                Log.warn("reader", "section_skip", { sect = sect })
+                sect = last_sect + 1
+                UIManager:nextTick(fetch_next)
+                return
+            end
+            pages[#pages + 1] = page
+            report("download", #pages, total)
+            sect = sect + 1
+            UIManager:nextTick(fetch_next)
+        end)
+    end
+    UIManager:nextTick(fetch_next)
+end
+
+local function assemble_chapter(state, pages, url, book, on_progress, on_ready, opts, job)
+    opts = type(opts) == "table" and opts or {}
+    local background = load_background_mode(opts)
+    local function progress_cb()
+        if job and type(job.on_progress) == "function" then
+            return job.on_progress
+        end
+        return on_progress
+    end
+    local function ready_cb()
+        if job and type(job.on_ready) == "function" then
+            return job.on_ready
+        end
+        return on_ready
+    end
+    local function report(stage, done, total)
+        local cb = progress_cb()
+        if type(cb) == "function" then
+            pcall(cb, stage, done, total)
+        end
+    end
+    local function invoke_ready(...)
+        local cb = ready_cb()
+        if type(cb) == "function" then
+            return cb(...)
+        end
+    end
+    local function fail(status, err)
+        invoke_ready(nil, status, err)
+        return nil, status, err
+    end
+    if job and job.cancelled then
+        return
+    end
 
     local font_path = ""
     if not Codec.has_map() then
@@ -1076,9 +1263,223 @@ function Reader.load(url, book, on_progress, on_ready)
             return part
         end
     end
+
+    local encrypted, decrypted, source_css = {}, {}, ""
+    local cur_sect = math.max(0, tonumber(state.section) or 0)
+    local section_count = tonumber(state.section_count) or 0
+    if section_count < 1 then
+        section_count = 1
+    end
+
+    local function after_decode()
+        if job and job.cancelled then
+            return
+        end
+        if state.need_pay then
+            Log.info("reader", "need_pay_ignored", { book_id = state.book_id })
+        end
+        local chapter_title = (state.cur and state.cur.title) or state.book_title or ""
+        local uid = (state.cur and state.cur.uid) or (state.cur_param and state.cur_param.uid) or "chapter"
+        local dir = Reader.reading_dir(state.book_id)
+        local path = Reader.html_path(state.book_id, uid)
+        local enc_path = Reader.html_path(state.book_id, uid, "enc")
+        report("load", #pages, #pages)
+
+        local RESUME_ID = "wereadlite_resume"
+        local resume_index = math.min(#decrypted, math.max(1, cur_sect + 1))
+        if #decrypted > 0 and cur_sect > 0 then
+            decrypted[resume_index] = '<a id="' .. RESUME_ID .. '"></a>' .. decrypted[resume_index]
+        end
+
+        local body = table.concat(decrypted, "\n")
+        local postprocess_started = Log.now_ms()
+        local plain = body:gsub("<[^>]+>", ""):gsub("%s+", "")
+        local chars = 0
+        for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+            chars = chars + 1
+        end
+        local resume_percent = 0
+        local offset = tonumber(state.chapter_offset) or 0
+        if offset > 0 and chars > 0 then
+            resume_percent = math.max(0, math.min(100, (offset / chars) * 100))
+        elseif cur_sect > 0 and section_count > 0 then
+            resume_percent = math.max(0, math.min(100, (cur_sect / section_count) * 100))
+        end
+        state.resume_anchor = (offset <= 0 and cur_sect > 0) and RESUME_ID or nil
+        state.resume_percent = resume_percent
+        Log.dbg("reader", "postprocess", {
+            body_bytes = #body,
+            chars = chars,
+            elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
+        })
+
+        local function continue_after_underlines()
+            if job and job.cancelled then
+                return
+            end
+            local wrap_started = Log.now_ms()
+            local decrypted_source = Codec.wrap_html({
+                title = chapter_title,
+                body = body,
+                font_path = font_path,
+                source_css = source_css,
+            })
+            local encrypted_source = Codec.wrap_html({
+                title = chapter_title,
+                body = table.concat(encrypted, "\n"),
+                font_path = font_path,
+                source_css = source_css,
+                encrypted = true,
+            })
+            Log.dbg("reader", "wrap", {
+                css_bytes = #source_css,
+                decrypted_bytes = #decrypted_source,
+                elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
+            })
+
+            local function finish(decrypted_html)
+                if job and job.cancelled then
+                    return
+                end
+                local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
+                if not write_html(path, decrypted_html) then
+                    return fail("http_error", "write chapter html failed")
+                end
+                write_html(enc_path, encrypted_html)
+                state.url = url
+                state.html_path = path
+                state.html_enc_path = enc_path
+                state.chapter_title = chapter_title
+                Log.info("reader", "chapter_ready", {
+                    book_id = state.book_id,
+                    uid = uid,
+                    title = chapter_title,
+                    html = path,
+                    sections = #pages,
+                    resume_percent = resume_percent,
+                    resume_anchor = state.resume_anchor,
+                    chapter_offset = offset,
+                    background = background,
+                })
+                if type(ready_cb()) == "function" then
+                    invoke_ready(state)
+                end
+                return state
+            end
+
+            if type(ready_cb()) == "function" then
+                local task = Images.localize_async(decrypted_source, dir, function(done, total)
+                    report("images", done, total)
+                end, function(decrypted_html)
+                    finish(decrypted_html)
+                end)
+                if job then
+                    job.image_task = task
+                end
+                return nil, "pending", task
+            end
+
+            local decrypted_html = Images.localize(decrypted_source, dir, function(done, total)
+                report("images", done, total)
+            end)
+            return finish(decrypted_html)
+        end
+
+        local function run_underlines()
+            if job and job.cancelled then
+                return
+            end
+            local function finish_underlines(marked_body, underline_count, review_data, review_marks)
+                if job and job.cancelled then
+                    return
+                end
+                body = marked_body or body
+                state.review_data = review_data or {}
+                state.review_marks = review_marks or {}
+                report("reviews", 1, 1)
+                Log.info("reader", "underlines_stage_done", { count = underline_count or 0 })
+                if background then
+                    UIManager:nextTick(continue_after_underlines)
+                else
+                    continue_after_underlines()
+                end
+            end
+            if Settings.load_review_comments() then
+                report("reviews", 0, 1)
+                local chapter_uid = state.cur and state.cur.uid
+                Log.info("reader", "underlines_stage_start", {
+                    book_id = state.book_id,
+                    chapter_uid = chapter_uid,
+                })
+                Skill.chapter_underlines_async(state.book_id, chapter_uid, function(underlines, status, err)
+                    if job and job.cancelled then
+                        return
+                    end
+                    if type(underlines) ~= "table" then
+                        Log.warn("reader", "underlines_fetch_fail", { status = status, err = err })
+                        underlines = {}
+                    end
+                    local marked_body, underline_count, review_data, review_marks = add_chapter_underlines(
+                        body, state.book_id, chapter_uid, underlines
+                    )
+                    finish_underlines(marked_body, underline_count, review_data, review_marks)
+                end)
+                return
+            end
+            state.review_data = {}
+            state.review_marks = {}
+            Log.info("reader", "underlines_stage_skip", { reason = "disabled" })
+            if background then
+                UIManager:nextTick(continue_after_underlines)
+            else
+                return continue_after_underlines()
+            end
+        end
+
+        if background then
+            UIManager:nextTick(run_underlines)
+            return nil, "pending"
+        end
+        -- Underlines always go async; continue via on_ready.
+        run_underlines()
+        return nil, "pending"
+    end
+
     report("load", 0, #pages)
-    local encrypted, decrypted = {}, {}
-    local source_css = ""
+    if background then
+        local index = 1
+        local function decode_next()
+            if job and job.cancelled then
+                return
+            end
+            if index > #pages then
+                UIManager:nextTick(after_decode)
+                return
+            end
+            local page = pages[index]
+            if source_css == "" then
+                source_css = Codec.reader_styles(page)
+            end
+            local dec_part = collect_content(page, true)
+            if not dec_part then
+                if index == 1 then
+                    fail(state.need_pay and "need_pay" or "http_error", state.need_pay and "本章需要购买" or "readerContent missing")
+                    return
+                end
+                UIManager:nextTick(after_decode)
+                return
+            end
+            decrypted[#decrypted + 1] = dec_part
+            encrypted[#encrypted + 1] = collect_content(page, false) or ""
+            Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
+            report("load", index, #pages)
+            index = index + 1
+            UIManager:nextTick(decode_next)
+        end
+        UIManager:nextTick(decode_next)
+        return
+    end
+
     for i, page in ipairs(pages) do
         if source_css == "" then
             source_css = Codec.reader_styles(page)
@@ -1086,10 +1487,7 @@ function Reader.load(url, book, on_progress, on_ready)
         local dec_part = collect_content(page, true)
         if not dec_part then
             if i == 1 then
-                if state.need_pay then
-                    return nil, "need_pay", "本章需要购买"
-                end
-                return nil, "http_error", "readerContent missing"
+                return fail(state.need_pay and "need_pay" or "http_error", state.need_pay and "本章需要购买" or "readerContent missing")
             end
             break
         end
@@ -1098,127 +1496,128 @@ function Reader.load(url, book, on_progress, on_ready)
         Log.dbg("reader", "decode", { page = i, pages = #pages, bytes = #dec_part })
         report("load", i, #pages)
     end
-    if state.need_pay then
-        Log.info("reader", "need_pay_ignored", { book_id = state.book_id })
-    end
-    local chapter_title = (state.cur and state.cur.title) or state.book_title or ""
-    local uid = (state.cur and state.cur.uid) or (state.cur_param and state.cur_param.uid) or "chapter"
-    local dir = Reader.reading_dir(state.book_id)
-    local path = Reader.html_path(state.book_id, uid)
-    local enc_path = Reader.html_path(state.book_id, uid, "enc")
-    report("load", #pages, #pages)
+    return after_decode()
+end
 
-    -- Mark resume point at the start of the saved section for CRE anchor jump.
-    local RESUME_ID = "wereadlite_resume"
-    local resume_index = math.min(#decrypted, math.max(1, cur_sect + 1))
-    if #decrypted > 0 and cur_sect > 0 then
-        decrypted[resume_index] = '<a id="' .. RESUME_ID .. '"></a>' .. decrypted[resume_index]
-    end
-
-    local body = table.concat(decrypted, "\n")
-    local postprocess_started = Log.now_ms()
-    local plain = body:gsub("<[^>]+>", ""):gsub("%s+", "")
-    local chars = 0
-    for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        chars = chars + 1
-    end
-    local resume_percent = 0
-    local offset = tonumber(state.chapter_offset) or 0
-    if offset > 0 and chars > 0 then
-        resume_percent = math.max(0, math.min(100, (offset / chars) * 100))
-    elseif cur_sect > 0 and section_count > 0 then
-        resume_percent = math.max(0, math.min(100, (cur_sect / section_count) * 100))
-    end
-    -- chapterOffset is more precise than a section boundary. Keep the coarse
-    -- anchor only as a fallback when the response has no character offset.
-    state.resume_anchor = (offset <= 0 and cur_sect > 0) and RESUME_ID or nil
-    state.resume_percent = resume_percent
-    Log.dbg("reader", "postprocess", {
-        body_bytes = #body,
-        chars = chars,
-        elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
-    })
-
-    local wrap_started = Log.now_ms()
-    local decrypted_source = Codec.wrap_html({
-        title = chapter_title,
-        body = body,
-        font_path = font_path,
-        source_css = source_css,
-    })
-    local encrypted_source = Codec.wrap_html({
-        title = chapter_title,
-        body = table.concat(encrypted, "\n"),
-        font_path = font_path,
-        source_css = source_css,
-        encrypted = true,
-    })
-    Log.dbg("reader", "wrap", {
-        css_bytes = #source_css,
-        decrypted_bytes = #decrypted_source,
-        elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
-    })
-
-    local function finish(decrypted_html)
-        -- Highlights and reviews are a separate post-image stage.  Keeping
-        -- this out of decode/wrap ensures image localization always finishes
-        -- first and a Skill failure cannot interfere with image caching.
-        if not Settings.load_review_comments() then
-            state.review_data = {}
-            state.review_marks = {}
-            Log.info("reader", "reviews_stage_skip", { reason = "disabled" })
-        else
-            report("reviews", 0, 1)
-            Log.info("reader", "reviews_stage_start", {
-                book_id = state.book_id,
-                chapter_uid = state.cur and state.cur.uid,
-            })
-            local marked_html, review_count, review_data, review_marks = add_highlight_reviews(
-                decrypted_html, state.book_id, state.cur and state.cur.uid
-            )
-            decrypted_html = marked_html
-            state.review_data = review_data
-            state.review_marks = review_marks
-            report("reviews", 1, 1)
-            Log.info("reader", "reviews_stage_done", { count = review_count })
+local function load_background(url, book, on_progress, on_ready, opts)
+    local job = {
+        cancelled = false,
+        active_http = nil,
+        image_task = nil,
+        on_progress = on_progress,
+        on_ready = on_ready,
+        url = tostring(url or ""),
+    }
+    function job:cancel()
+        self.cancelled = true
+        if self.active_http then
+            AsyncHttp.cancel(self.active_http)
+            self.active_http = nil
         end
-        -- Encrypted backup only remaps resources already cached above.
-        local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
-        if not write_html(path, decrypted_html) then
-            return nil, "http_error", "write chapter html failed"
+        if self.image_task and type(self.image_task.cancel) == "function" then
+            pcall(self.image_task.cancel, self.image_task)
+            self.image_task = nil
         end
-        write_html(enc_path, encrypted_html)
-        state.url = url
-        state.html_path = path
-        state.html_enc_path = enc_path
-        state.chapter_title = chapter_title
-        Log.info("reader", "chapter_ready", {
+    end
+
+    local function report(stage, done, total)
+        if type(job.on_progress) == "function" then
+            pcall(job.on_progress, stage, done, total)
+        end
+    end
+
+    local function invoke_ready(state, status, err)
+        if type(job.on_ready) == "function" then
+            job.on_ready(state, status, err)
+        end
+    end
+
+    Log.dbg("reader", "load_start", {
+        url = url,
+        book_id = book and book.bookId,
+        title = book and book.title,
+        background = true,
+    })
+    report("download", 0, 1)
+    fetch_async(url, job, function(html, status, err)
+        if job.cancelled then
+            return
+        end
+        if not html then
+            Log.warn("reader", "load_fetch", { url = url, status = status, err = err, background = true })
+            invoke_ready(nil, status, err)
+            return
+        end
+        report("download", 1, 1)
+        local state = Reader.parse(html)
+        Log.dbg("reader", "parse", {
             book_id = state.book_id,
-            uid = uid,
-            title = chapter_title,
-            html = path,
-            sections = #pages,
-            resume_percent = resume_percent,
-            resume_anchor = state.resume_anchor,
-            chapter_offset = offset,
+            title = state.book_title,
+            uid = state.cur and state.cur.uid,
+            idx = state.cur and state.cur.idx,
+            chapters = #(state.chapters or {}),
+            section = state.section,
+            section_count = state.section_count,
+            need_pay = state.need_pay,
+            has_token = state.token ~= nil and state.token ~= "",
+            bytes = #html,
+            background = true,
         })
-        return state
-    end
-
-    if type(on_ready) == "function" then
-        local task = Images.localize_async(decrypted_source, dir, function(done, total)
-            report("images", done, total)
-        end, function(decrypted_html)
-            local ready, ready_status, ready_err = finish(decrypted_html)
-            on_ready(ready, ready_status, ready_err)
+        merge_book_meta(state, book)
+        download_sections_background(state, url, html, report, job, function(pages)
+            assemble_chapter(state, pages, url, book, nil, nil, opts, job)
+        end, function(fail_status, fail_err)
+            if not job.cancelled then
+                invoke_ready(nil, fail_status, fail_err)
+            end
         end)
-        return nil, "pending", task
+    end)
+    return nil, "pending", job
+end
+
+function Reader.load(url, book, on_progress, on_ready, opts)
+    opts = type(opts) == "table" and opts or {}
+    if load_background_mode(opts) and type(on_ready) == "function" then
+        return load_background(url, book, on_progress, on_ready, opts)
     end
 
-    local decrypted_html = Images.localize(decrypted_source, dir, function(done, total)
-        report("images", done, total)
-    end)
-    return finish(decrypted_html)
+    book = book or {}
+    local function report(stage, done, total)
+        if type(on_progress) == "function" then
+            pcall(on_progress, stage, done, total)
+        end
+    end
+    report("download", 0, 1)
+    Log.dbg("reader", "load_start", {
+        url = url,
+        book_id = book.bookId,
+        title = book.title,
+    })
+    local html, status, err = Reader.fetch(url)
+    if not html then
+        Log.warn("reader", "load_fetch", { url = url, status = status, err = err })
+        return nil, status, err
+    end
+    report("download", 1, 1)
+    local state = Reader.parse(html)
+    Log.dbg("reader", "parse", {
+        book_id = state.book_id,
+        title = state.book_title,
+        uid = state.cur and state.cur.uid,
+        idx = state.cur and state.cur.idx,
+        chapters = #(state.chapters or {}),
+        section = state.section,
+        section_count = state.section_count,
+        need_pay = state.need_pay,
+        has_token = state.token ~= nil and state.token ~= "",
+        bytes = #html,
+    })
+    merge_book_meta(state, book)
+    local pages, pages_status, pages_err = download_sections_sync(state, url, html, report)
+    if not pages then
+        return nil, pages_status, pages_err
+    end
+    return assemble_chapter(state, pages, url, book, on_progress, on_ready, opts, nil)
 end
 
 return Reader

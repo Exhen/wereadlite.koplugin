@@ -1,5 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
+local ButtonDialog = require("ui/widget/buttondialog")
 local BD = require("ui/bidi")
 local Device = require("device")
 local Font = require("ui/font")
@@ -31,6 +32,7 @@ local Settings = require("wereadlite.settings")
 local Shelf = require("wereadlite.kindle.shelf")
 local ClockCard = require("wereadlite.clock_card")
 local StatsCards = require("wereadlite.stats_cards")
+local RecommendCard = require("wereadlite.recommend_card")
 
 local Screen = Device.screen
 
@@ -90,6 +92,19 @@ local ShelfView = InputContainer:extend{
     page = 1,
     on_close = nil,
     on_auth_expired = nil,
+}
+
+-- Persists across Gate.close/open; avoids refetching stats/recommend on each home visit.
+local TILE_CACHE = {
+    stats = {},
+    recommend = nil,
+    stats_ui = {
+        text_tab = 1,
+        text_mode = "monthly",
+        chart_tab = 1,
+        chart_mode = "monthly",
+    },
+    recommend_ui = { page = 1 },
 }
 
 local function geom()
@@ -197,13 +212,11 @@ function ShelfView:init()
     self._preload_gen = 0
     self._preload_busy = false
     self._stats_busy = false
-    self._stats_cache = {}
-    self._stats_ui = {
-        text_tab = 1,
-        text_mode = "monthly",
-        chart_tab = 1,
-        chart_mode = "monthly",
-    }
+    self._stats_cache = TILE_CACHE.stats
+    self._stats_ui = TILE_CACHE.stats_ui
+    self._recommend_ui = TILE_CACHE.recommend_ui
+    self._recommend_cache = TILE_CACHE.recommend
+    self._recommend_busy = false
     self._search = nil
     self._shelf_page = nil
     self._clock_gen = 0
@@ -380,7 +393,7 @@ function ShelfView:_make_toolbar()
     }
     search_row[#search_row + 1] = HorizontalSpan:new{ width = Size.padding.small }
     search_row[#search_row + 1] = TextWidget:new{
-        text = searching and (self._search.keyword or "搜索书籍") or "搜索书籍",
+        text = searching and self:_browse_title() or "搜索书籍",
         face = Font:getFace("x_smallinfofont"),
         fgcolor = searching and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY_5,
         max_width = text_max,
@@ -720,6 +733,27 @@ function ShelfView:_stats_frame(width, height, inner)
         FixedBox:new{
             width = math.max(1, width - border * 2),
             height = math.max(1, height - border * 2),
+            align = "left",
+            inner,
+        },
+    }
+end
+
+function ShelfView:_recommend_frame(width, height, inner)
+    local pad = card_pad()
+    local inset = card_inset()
+    return RoundClipFrame:new{
+        width = width,
+        height = height,
+        bordersize = Size.border.default,
+        padding = pad,
+        margin = 0,
+        radius = card_radius(),
+        background = Blitbuffer.COLOR_WHITE,
+        allow_mirroring = false,
+        FixedBox:new{
+            width = math.max(1, width - inset * 2),
+            height = math.max(1, height - inset * 2),
             align = "left",
             inner,
         },
@@ -1154,22 +1188,530 @@ function ShelfView:_paint()
         self:_set_body(layers)
     end)
     if not ok then
-        Log.warn("shelf", "paint", { err = err })
+        Log.warn("shelf", "paint", { err = err, trace = debug.traceback(tostring(err), 2) })
         self:_set_body(self:_status_widget("书架排版失败"))
         return
     end
     if self.page == 1 then
         self:_ensure_stats()
+        self:_ensure_recommend()
     end
+end
+
+function ShelfView:_recommend_book_slots(span)
+    span = math.max(1, tonumber(span) or 1)
+    return math.max(0, span - 1)
+end
+
+function ShelfView:_recommend_books()
+    local cache = self._recommend_cache
+    if type(cache) == "table" and type(cache.books) == "table" then
+        return cache.books
+    end
+    return {}
+end
+
+function ShelfView:_recommend_page_count(span)
+    span = math.max(2, tonumber(span) or 2)
+    local book_slots = self:_recommend_book_slots(span)
+    if book_slots <= 0 then
+        return 1
+    end
+    local books = self:_recommend_books()
+    local pages = math.max(1, math.ceil(#books / book_slots))
+    local cache = self._recommend_cache
+    if type(cache) == "table" and cache.has_more and #books > 0 and (#books % book_slots) == 0 then
+        pages = pages + 1
+    end
+    return pages
+end
+
+function ShelfView:_recommend_arrow_widget(icon, size)
+    local widget
+    local ok = pcall(function()
+        widget = IconWidget:new{
+            icon = icon,
+            width = size,
+            height = size,
+        }
+    end)
+    if ok and widget then
+        return widget
+    end
+    return TextWidget:new{
+        text = icon:find("left", 1, true) and "‹" or "›",
+        face = Settings.grid_face("body"),
+        bold = true,
+    }
+end
+
+function ShelfView:_recommend_nav_button(icon, width, height, enabled)
+    width = math.max(1, tonumber(width) or 1)
+    height = math.max(1, tonumber(height) or 1)
+    local border = Size.border.default
+    local inner_w = math.max(1, width - border * 2)
+    local inner_h = math.max(1, height - border * 2)
+    local icon_size = math.min(
+        inner_w - Screen:scaleBySize(4),
+        inner_h - Screen:scaleBySize(4),
+        Screen:scaleBySize(22)
+    )
+    icon_size = math.max(Screen:scaleBySize(14), icon_size)
+    return RoundClipFrame:new{
+        width = width,
+        height = height,
+        bordersize = border,
+        padding = 0,
+        margin = 0,
+        radius = math.min(card_radius(), math.floor(height / 2)),
+        color = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+        background = enabled and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_GRAY_E,
+        allow_mirroring = false,
+        FixedBox:new{
+            width = inner_w,
+            height = inner_h,
+            align = "center",
+            self:_recommend_arrow_widget(icon, icon_size),
+        },
+    }
+end
+
+function ShelfView:_recommend_pager(width, height, page, pages, mid_gap)
+    width = math.max(1, tonumber(width) or 1)
+    height = math.max(1, tonumber(height) or 1)
+    page = math.max(1, tonumber(page) or 1)
+    pages = math.max(1, tonumber(pages) or 1)
+    -- Horizontal gap between buttons matches vertical gap under the title badge.
+    local mid = math.max(1, tonumber(mid_gap) or Screen:scaleBySize(6))
+    mid = math.min(mid, math.max(1, width - 2))
+    local can_prev = page > 1
+    local can_next = page < pages
+    -- Flush to badge left/right; remaining width is split into two wider buttons.
+    local btn_w = math.max(1, math.floor((width - mid) / 2))
+    local right_w = math.max(1, width - mid - btn_w)
+    local chevron_left = "chevron.left"
+    local chevron_right = "chevron.right"
+    if BD.mirroredUILayout() then
+        chevron_left, chevron_right = chevron_right, chevron_left
+    end
+    local hits = {}
+    if can_prev then
+        hits[#hits + 1] = {
+            kind = "recommend_prev",
+            x = 0,
+            y = 0,
+            w = btn_w,
+            h = height,
+        }
+    end
+    if can_next then
+        hits[#hits + 1] = {
+            kind = "recommend_next",
+            x = btn_w + mid,
+            y = 0,
+            w = right_w,
+            h = height,
+        }
+    end
+    local row = HorizontalGroup:new{
+        align = "center",
+        self:_recommend_nav_button(chevron_left, btn_w, height, can_prev),
+        HorizontalSpan:new{ width = mid },
+        self:_recommend_nav_button(chevron_right, right_w, height, can_next),
+    }
+    return FixedBox:new{
+        width = width,
+        height = height,
+        align = "left",
+        row,
+    }, hits
+end
+
+function ShelfView:_recommend_title_icon(size)
+    size = math.max(1, tonumber(size) or 1)
+    local Paths = require("wereadlite.paths")
+    local path = Paths.root() .. "/resources/thumb.up.svg"
+    local widget
+    local ok = pcall(function()
+        -- IconWidget with `file` skips name lookup and acts as ImageWidget.
+        widget = IconWidget:new{
+            file = path,
+            width = size,
+            height = size,
+            scale_factor = 0,
+            alpha = true,
+        }
+        widget:getSize()
+    end)
+    if ok and widget then
+        return widget
+    end
+    if widget and type(widget.free) == "function" then
+        pcall(widget.free, widget)
+    end
+    return TextWidget:new{
+        text = "赞",
+        face = Font:getFace("cfont", math.max(14, math.floor(size * 0.7))),
+        bold = true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+end
+
+function ShelfView:_recommend_title_slot(cell_w, cell_h, page, pages)
+    cell_w = math.max(1, tonumber(cell_w) or 1)
+    cell_h = math.max(1, tonumber(cell_h) or 1)
+    local border = Size.border.default
+    local pager_gap = math.max(6, Screen:scaleBySize(6))
+    local pager_h = math.max(Screen:scaleBySize(30), 26)
+    local title_h = math.max(1, cell_h - pager_h - pager_gap)
+    local pager, pager_hits = self:_recommend_pager(cell_w, pager_h, page, pages, pager_gap)
+    local pager_y = title_h + pager_gap
+    local hits = {}
+    for _, hit in ipairs(pager_hits) do
+        hits[#hits + 1] = {
+            kind = hit.kind,
+            x = hit.x or 0,
+            y = pager_y + (hit.y or 0),
+            w = hit.w,
+            h = hit.h,
+        }
+    end
+
+    local pad = math.max(4, Screen:scaleBySize(4))
+    local inner_w = math.max(1, cell_w - border * 2)
+    local inner_h = math.max(1, title_h - border * 2)
+    local face = Settings.grid_face("body")
+    if title_h >= Screen:scaleBySize(110) then
+        face = Settings.grid_face("title")
+    end
+    local sample = TextWidget:new{
+        text = "推",
+        face = face,
+        bold = true,
+        padding = 0,
+    }
+    local line_h = sample:getSize().h or Screen:scaleBySize(18)
+    if type(sample.free) == "function" then
+        pcall(sample.free, sample)
+    end
+    local text_block = line_h * 2 + math.max(2, Screen:scaleBySize(2))
+    local icon_room = math.max(0, inner_h - text_block - pad * 3)
+    local icon_size = math.min(
+        Screen:scaleBySize(32),
+        math.floor(inner_w * 0.42),
+        icon_room > 0 and icon_room or Screen:scaleBySize(18)
+    )
+    icon_size = math.max(Screen:scaleBySize(16), icon_size)
+    local icon_gap = math.max(3, Screen:scaleBySize(3))
+
+    local badge_inner = VerticalGroup:new{
+        align = "center",
+        self:_recommend_title_icon(icon_size),
+        VerticalSpan:new{ width = icon_gap },
+        TextWidget:new{
+            text = "为你",
+            face = face,
+            bold = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+            max_width = math.max(1, inner_w - pad * 2),
+            padding = 0,
+        },
+        TextWidget:new{
+            text = "推荐",
+            face = face,
+            bold = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+            max_width = math.max(1, inner_w - pad * 2),
+            padding = 0,
+        },
+    }
+    local badge = RoundClipFrame:new{
+        width = cell_w,
+        height = title_h,
+        bordersize = border,
+        padding = 0,
+        margin = 0,
+        radius = card_radius(),
+        color = Blitbuffer.COLOR_GRAY_B,
+        background = Blitbuffer.COLOR_GRAY_E,
+        allow_mirroring = false,
+        FixedBox:new{
+            width = inner_w,
+            height = inner_h,
+            align = "center",
+            badge_inner,
+        },
+    }
+
+    local widget = FixedBox:new{
+        width = cell_w,
+        height = cell_h,
+        align = "top",
+        VerticalGroup:new{
+            align = "center",
+            badge,
+            VerticalSpan:new{ width = pager_gap },
+            pager,
+        },
+    }
+    return widget, hits
+end
+
+function ShelfView:_recommend_empty_cell(cell_w, cell_h)
+    return FixedBox:new{
+        width = cell_w,
+        height = cell_h,
+    }
+end
+
+function ShelfView:_recommend_message_cell(text, cell_w, cell_h)
+    local border = Size.border.default
+    local inner_w = math.max(1, cell_w - border * 2)
+    local inner_h = math.max(1, cell_h - border * 2)
+    return RoundClipFrame:new{
+        width = cell_w,
+        height = cell_h,
+        bordersize = border,
+        padding = 0,
+        margin = 0,
+        radius = card_radius(),
+        background = Blitbuffer.COLOR_WHITE,
+        allow_mirroring = false,
+        FixedBox:new{
+            width = inner_w,
+            height = inner_h,
+            align = "center",
+            TextBoxWidget:new{
+                text = tostring(text or ""),
+                face = Settings.grid_face("meta"),
+                width = inner_w,
+                height = inner_h,
+                alignment = "center",
+                height_overflow_show_ellipsis = true,
+            },
+        },
+    }
+end
+
+function ShelfView:_recommend_cover_widget(book, cover_w, cover_h)
+    book = type(book) == "table" and book or {}
+    local border = Size.border.default
+    local mark = utf8_prefix(book.title or "书", 1)
+    local inner_w = math.max(1, cover_w - border * 2)
+    local inner_h = math.max(1, cover_h - border * 2)
+    local cover = placeholder(inner_w, inner_h, mark)
+    local path = Covers.cached(book.bookId)
+    if path and path ~= "" then
+        local ok, image = pcall(function()
+            return safe_image(path, inner_w, inner_h, true)
+        end)
+        if ok and image then
+            cover = image
+        end
+    end
+    local ok_frame, frame = pcall(function()
+        return RoundClipFrame:new{
+            width = cover_w,
+            height = cover_h,
+            bordersize = border,
+            padding = 0,
+            margin = 0,
+            radius = card_radius(),
+            background = Blitbuffer.COLOR_WHITE,
+            allow_mirroring = false,
+            FixedBox:new{
+                width = inner_w,
+                height = inner_h,
+                align = "center",
+                cover,
+            },
+        }
+    end)
+    if ok_frame and frame then
+        return frame
+    end
+    Log.warn("shelf", "recommend_cover", { err = tostring(frame) })
+    return self:_recommend_empty_cell(cover_w, cover_h)
+end
+
+function ShelfView:_recommend_card(span, ctx)
+    span = math.max(2, tonumber(span) or 2)
+    ctx = type(ctx) == "table" and ctx or {}
+    local ui = self._recommend_ui or { page = 1 }
+    local page = math.max(1, tonumber(ui.page) or 1)
+    local cache = self._recommend_cache
+    local books = self:_recommend_books()
+    local loading = cache == nil
+    local err = cache == false
+    local cell_w = math.max(1, tonumber(ctx.cell_w) or 1)
+    local gap = math.max(0, tonumber(ctx.gap) or 0)
+    local cell_h = math.max(1, tonumber(ctx.row_h) or 1)
+    local book_slots = self:_recommend_book_slots(span)
+    local start = book_slots > 0 and ((page - 1) * book_slots + 1) or 1
+    local pages = self:_recommend_page_count(span)
+    local slots = {}
+    local title_widget, title_hits = self:_recommend_title_slot(cell_w, cell_h, page, pages)
+    slots[1] = { widget = title_widget }
+
+    for i = 1, book_slots do
+        local slot_idx = 1 + i
+        local book = books[start + i - 1]
+        if loading then
+            slots[slot_idx] = {
+                widget = i == 1
+                    and self:_recommend_message_cell("加载中", cell_w, cell_h)
+                    or self:_recommend_empty_cell(cell_w, cell_h),
+            }
+        elseif err then
+            slots[slot_idx] = {
+                widget = i == 1
+                    and self:_recommend_message_cell("加载失败\n点按重试", cell_w, cell_h)
+                    or self:_recommend_empty_cell(cell_w, cell_h),
+            }
+        elseif type(book) == "table" then
+            slots[slot_idx] = {
+                widget = self:_recommend_cover_widget(book, cell_w, cell_h),
+                hit_kind = "recommend_book",
+                book = book,
+            }
+        else
+            slots[slot_idx] = {
+                widget = self:_recommend_empty_cell(cell_w, cell_h),
+            }
+        end
+    end
+
+    local grid, hits = RecommendCard.build({
+        span = span,
+        cell_w = cell_w,
+        gap = gap,
+        height = cell_h,
+        slots = slots,
+    })
+    for _, hit in ipairs(title_hits) do
+        hits[#hits + 1] = hit
+    end
+
+    return grid, hits
+end
+
+function ShelfView:_ensure_recommend()
+    if self._closed or self.page ~= 1 or self._recommend_busy or self:_is_search() then
+        return
+    end
+    if not Settings.tile_enabled("recommend") then
+        return
+    end
+    local span = Settings.recommend_span()
+    local ui = self._recommend_ui or { page = 1 }
+    local page = math.max(1, tonumber(ui.page) or 1)
+    local cache = self._recommend_cache
+    if cache == false then
+        return
+    end
+    local book_slots = self:_recommend_book_slots(span)
+    local books = type(cache) == "table" and cache.books or {}
+    local need = book_slots > 0 and (page * book_slots) or 0
+    if need <= 0 then
+        return
+    end
+    if type(cache) == "table" and not cache.has_more and #books >= need then
+        return
+    end
+    if type(cache) == "table" and #books >= need then
+        return
+    end
+    self._recommend_busy = true
+    local later = UIManager.tickAfterNext or UIManager.nextTick
+    later(UIManager, function()
+        if self._closed then
+            self._recommend_busy = false
+            return
+        end
+        local Skill = require("wereadlite.skill")
+        local max_idx = 0
+        local has_more = true
+        if type(self._recommend_cache) == "table" then
+            max_idx = tonumber(self._recommend_cache.max_idx) or 0
+            has_more = self._recommend_cache.has_more ~= false
+            books = self._recommend_cache.books or {}
+        else
+            books = {}
+        end
+        if not has_more then
+            self._recommend_busy = false
+            return
+        end
+        local fetch_count = math.max(span * 2, 12)
+        Skill.recommend_async({
+            count = fetch_count,
+            max_idx = max_idx,
+        }, function(data, status, err)
+            if self._closed then
+                self._recommend_busy = false
+                return
+            end
+            if type(data) ~= "table" or type(data.books) ~= "table" then
+                if type(self._recommend_cache) ~= "table" then
+                    self._recommend_cache = false
+                    TILE_CACHE.recommend = false
+                end
+                if status then
+                    Log.warn("shelf", "recommend", { status = status, err = err })
+                end
+            else
+                local seen = {}
+                for _, book in ipairs(books) do
+                    if type(book) == "table" then
+                        local id = tostring(book.bookId or book.title or "")
+                        if id ~= "" then
+                            seen[id] = true
+                        end
+                    end
+                end
+                for _, book in ipairs(data.books) do
+                    if type(book) == "table" then
+                        local id = tostring(book.bookId or book.title or "")
+                        if id ~= "" and not seen[id] then
+                            books[#books + 1] = book
+                            seen[id] = true
+                        end
+                    end
+                end
+                self._recommend_cache = {
+                    books = books,
+                    max_idx = tonumber(data.max_idx) or max_idx,
+                    has_more = data.has_more ~= false and #data.books > 0,
+                }
+                TILE_CACHE.recommend = self._recommend_cache
+            end
+            if type(self._recommend_cache) ~= "table" then
+                self._recommend_cache = { books = books, max_idx = 0, has_more = false }
+                TILE_CACHE.recommend = self._recommend_cache
+            end
+            self._recommend_busy = false
+            if not self._closed then
+                self:_paint()
+                local later2 = UIManager.tickAfterNext or UIManager.nextTick
+                later2(UIManager, function()
+                    if not self._closed and self.page == 1 then
+                        self:_prefetch_covers()
+                    end
+                end)
+            end
+        end)
+    end)
 end
 
 function ShelfView:_add_func_tile(layers, tile, ctx)
     local x, w = self:_col_rect(tile.col, tile.span, ctx.cell_w, ctx.gap, ctx.width, ctx.cols)
     local is_stats = tile.id == "text_stats" or tile.id == "chart_stats"
+    local is_recommend = tile.id == "recommend"
     local border = Size.border.default
-    local inset = is_stats and border or ctx.inset
-    local inner_w = math.max(1, w - inset * 2)
-    local inner_h = math.max(1, ctx.row_h - inset * 2)
+    local content_inset = is_recommend and card_inset() or nil
+    local inset = (is_stats or is_recommend) and border or ctx.inset
+    local inner_w = math.max(1, w - (content_inset or inset) * 2)
+    local inner_h = math.max(1, ctx.row_h - (content_inset or inset) * 2)
     local inner
     local align = "center"
     local extra = { kind = tile.id }
@@ -1184,13 +1726,41 @@ function ShelfView:_add_func_tile(layers, tile, ctx)
     elseif is_stats then
         inner, extra.hits = self:_stats_card(tile.id == "chart_stats" and "chart" or "text", inner_w, inner_h)
         align = "left"
+    elseif is_recommend then
+        local rec_ctx = {
+            cell_w = math.max(1, math.floor((inner_w - (tile.span - 1) * ctx.gap) / tile.span)),
+            gap = ctx.gap,
+            row_h = inner_h,
+        }
+        local ok_card, inner_or_err, hits = pcall(function()
+            return self:_recommend_card(tile.span, rec_ctx)
+        end)
+        if ok_card then
+            inner, extra.hits = inner_or_err, hits
+        else
+            Log.warn("shelf", "recommend_card", { err = tostring(inner_or_err) })
+            inner = TextWidget:new{
+                text = "推荐卡片加载失败",
+                face = Settings.grid_face("meta"),
+                max_width = inner_w,
+            }
+        end
+        align = "left"
     else
         inner = FixedBox:new{ width = inner_w, height = ctx.inner_h }
+    end
+    local wrapped
+    if is_recommend then
+        wrapped = self:_recommend_frame(w, ctx.row_h, inner)
+    elseif is_stats then
+        wrapped = self:_stats_frame(w, ctx.row_h, inner)
+    else
+        wrapped = self:_card(w, ctx.row_h, inner, align)
     end
     layers[#layers + 1] = OffsetBox:new{
         x_off = x,
         y_off = ctx.y,
-        is_stats and self:_stats_frame(w, ctx.row_h, inner) or self:_card(w, ctx.row_h, inner, align),
+        wrapped,
     }
     self._cells[#self._cells + 1] = {
         x = x,
@@ -1200,13 +1770,15 @@ function ShelfView:_add_func_tile(layers, tile, ctx)
         kind = extra.kind,
         book = extra.book,
     }
+    local hit_inset = content_inset or inset
     for _, hit in ipairs(extra.hits or {}) do
         self._cells[#self._cells + 1] = {
-            x = x + inset + (hit.x or 0),
-            y = ctx.origin_y + ctx.y + inset + (hit.y or 0),
+            x = x + hit_inset + (hit.x or 0),
+            y = ctx.origin_y + ctx.y + hit_inset + (hit.y or 0),
             w = hit.w,
             h = hit.h,
             kind = hit.kind,
+            book = hit.book,
             mode = hit.mode,
             tab = hit.tab,
         }
@@ -1270,43 +1842,72 @@ function ShelfView:_ensure_stats()
             return
         end
         local Skill = require("wereadlite.skill")
-        local ok, err = pcall(function()
-            local monthly
-            for mode in pairs(need_modes) do
-                local data, status = Skill.readdata(mode)
+        local modes = {}
+        for mode in pairs(need_modes) do
+            modes[#modes + 1] = mode
+        end
+        local index = 1
+        local monthly
+
+        local function finish_stats()
+            self._stats_busy = false
+            if not self._closed and self.page == 1 then
+                self:_paint()
+            end
+        end
+
+        local function fetch_heatmap()
+            if not need_heat then
+                finish_stats()
+                return
+            end
+            if type(cache.monthly) == "table" then
+                monthly = cache.monthly
+            end
+            Skill.heatmap30_async({ monthly = monthly }, function(map, status, err)
+                if self._closed then
+                    self._stats_busy = false
+                    return
+                end
+                cache.heatmap = type(map) == "table" and map or false
+                if status and status ~= "ok" then
+                    Log.warn("shelf", "heatmap", { status = status, err = err })
+                end
+                finish_stats()
+            end)
+        end
+
+        local function fetch_next_mode()
+            if self._closed then
+                self._stats_busy = false
+                return
+            end
+            if index > #modes then
+                fetch_heatmap()
+                return
+            end
+            local mode = modes[index]
+            index = index + 1
+            Skill.readdata_async(mode, function(data, status, err)
+                if self._closed then
+                    self._stats_busy = false
+                    return
+                end
                 cache[mode] = type(data) == "table" and data or false
                 if mode == "monthly" then
                     monthly = data
                 end
-                if status then
-                    Log.warn("shelf", "stats", { mode = mode, status = status })
+                if status and not data then
+                    Log.warn("shelf", "stats", { mode = mode, status = status, err = err })
                 end
-            end
-            if need_heat then
-                if type(cache.monthly) == "table" then
-                    monthly = cache.monthly
-                end
-                local map, status = Skill.heatmap30({ monthly = monthly })
-                cache.heatmap = type(map) == "table" and map or false
-                if status then
-                    Log.warn("shelf", "heatmap", { status = status })
-                end
-            end
-        end)
-        if not ok then
-            Log.warn("shelf", "stats", { err = tostring(err) })
-            for mode in pairs(need_modes) do
-                if cache[mode] == nil then
-                    cache[mode] = false
-                end
-            end
-            if need_heat and cache.heatmap == nil then
-                cache.heatmap = false
-            end
+                fetch_next_mode()
+            end)
         end
-        self._stats_busy = false
-        if not self._closed and self.page == 1 then
-            self:_paint()
+
+        if #modes == 0 then
+            fetch_heatmap()
+        else
+            fetch_next_mode()
         end
     end)
 end
@@ -1358,13 +1959,32 @@ function ShelfView:_prefetch_covers()
     if user and not Covers.cached_avatar() and user.avatar and user.avatar ~= "" then
         queue[#queue + 1] = { kind = "avatar", user = user }
     end
+    local seen = {}
     if not searching and self.page == 1 then
         local last = self:_last_book()
         if last and last.bookId and not Covers.cached(last.bookId) then
             queue[#queue + 1] = { kind = "book", book = last }
         end
+        if Settings.tile_enabled("recommend") then
+            local span = math.max(2, Settings.recommend_span())
+            local ui = self._recommend_ui or { page = 1 }
+            local page = math.max(1, tonumber(ui.page) or 1)
+            local book_slots = self:_recommend_book_slots(span)
+            if book_slots > 0 then
+                local start = (page - 1) * book_slots + 1
+                for i = start, start + book_slots - 1 do
+                    local book = self:_recommend_books()[i]
+                    if type(book) == "table" then
+                        local id = tostring(book.bookId or "")
+                        if id ~= "" and not seen[id] and not Covers.cached(id) then
+                            seen[id] = true
+                            queue[#queue + 1] = { kind = "book", book = book }
+                        end
+                    end
+                end
+            end
+        end
     end
-    local seen = {}
     for _, book in ipairs(books or {}) do
         local id = tostring(book.bookId or "")
         if id ~= "" and not seen[id] and not Covers.cached(id) then
@@ -1573,6 +2193,17 @@ function ShelfView:_open_search()
     end)
 end
 
+function ShelfView:_browse_title()
+    local s = self._search
+    if not s then
+        return "搜索书籍"
+    end
+    if s.mode == "similar" then
+        return "相似推荐：" .. tostring(s.source_title or "图书")
+    end
+    return s.keyword or "搜索书籍"
+end
+
 function ShelfView:_is_search()
     return type(self._search) == "table"
 end
@@ -1647,6 +2278,7 @@ function ShelfView:_start_search(keyword)
         self._shelf_page = self.page or 1
     end
     self._search = {
+        mode = "search",
         keyword = keyword,
         books = {},
         seen = {},
@@ -1660,43 +2292,118 @@ function ShelfView:_start_search(keyword)
             return
         end
         local Skill = require("wereadlite.skill")
-        local result, status = Skill.search(keyword, {
+        Skill.search_async(keyword, {
             scope = 10,
             count = math.max(10, self:_search_per()),
             max_idx = 0,
-        })
-        if self._closed or not self:_is_search() or self._search.keyword ~= keyword then
-            return
-        end
-        if not result then
-            self._search.has_more = false
-            Log.warn("shelf", "search", { status = status })
-            UIManager:show(InfoMessage:new{
-                text = status == "auth_expired" and "登录已过期，请重新扫码"
-                    or status == "offline" and "网络不可用"
-                    or "搜索失败",
-                timeout = 2,
-            })
+        }, function(result, status)
+            if self._closed or not self:_is_search() or self._search.keyword ~= keyword then
+                return
+            end
+            if not result then
+                self._search.has_more = false
+                Log.warn("shelf", "search", { status = status })
+                UIManager:show(InfoMessage:new{
+                    text = status == "auth_expired" and "登录已过期，请重新扫码"
+                        or status == "offline" and "网络不可用"
+                        or "搜索失败",
+                    timeout = 2,
+                })
+                self:_paint()
+                return
+            end
+            self:_merge_search_books(result.books)
+            self._search.has_more = result.has_more and true or false
+            self._search.max_idx = result.max_idx or 0
+            if result.upgrade_info then
+                UIManager:show(InfoMessage:new{
+                    text = "Skill 接口有更新，部分功能可能异常",
+                    timeout = 2,
+                })
+            end
+            if #self._search.books == 0 then
+                UIManager:show(InfoMessage:new{
+                    text = string.format("没有找到与“%s”相关的结果", keyword),
+                    timeout = 2,
+                })
+            end
             self:_paint()
+            self:_prefetch_covers()
+        end)
+    end)
+end
+
+function ShelfView:_start_similar(book)
+    book = type(book) == "table" and book or {}
+    local book_id = tostring(book.bookId or book.book_id or "")
+    if book_id == "" then
+        UIManager:show(InfoMessage:new{
+            text = "无法识别图书",
+            timeout = 2,
+        })
+        return
+    end
+    if not self:_is_search() then
+        self._shelf_page = self.page or 1
+    end
+    local source_title = tostring(book.title or "图书")
+    self._search = {
+        mode = "similar",
+        book_id = book_id,
+        source_title = source_title,
+        books = {},
+        seen = {},
+        has_more = true,
+        max_idx = 0,
+        session_id = "",
+    }
+    self.page = 1
+    self:_set_body(self:_status_widget("正在加载相似推荐…"))
+    UIManager:scheduleIn(0.05, function()
+        if self._closed or not self:_is_search() or self._search.mode ~= "similar"
+            or self._search.book_id ~= book_id then
             return
         end
-        self:_merge_search_books(result.books)
-        self._search.has_more = result.has_more and true or false
-        self._search.max_idx = result.max_idx or 0
-        if result.upgrade_info then
-            UIManager:show(InfoMessage:new{
-                text = "Skill 接口有更新，部分功能可能异常",
-                timeout = 2,
-            })
-        end
-        if #self._search.books == 0 then
-            UIManager:show(InfoMessage:new{
-                text = string.format("没有找到与“%s”相关的结果", keyword),
-                timeout = 2,
-            })
-        end
-        self:_paint()
-        self:_prefetch_covers()
+        local Skill = require("wereadlite.skill")
+        Skill.similar_async(book_id, {
+            count = math.max(12, self:_search_per()),
+            max_idx = 0,
+        }, function(result, status)
+            if self._closed or not self:_is_search() or self._search.mode ~= "similar"
+                or self._search.book_id ~= book_id then
+                return
+            end
+            if not result then
+                self._search.has_more = false
+                Log.warn("shelf", "similar", { status = status, book_id = book_id })
+                UIManager:show(InfoMessage:new{
+                    text = status == "auth_expired" and "登录已过期，请重新扫码"
+                        or status == "offline" and "网络不可用"
+                        or "加载失败",
+                    timeout = 2,
+                })
+                self:_paint()
+                return
+            end
+            self:_merge_search_books(result.books)
+            self._search.has_more = result.has_more and true or false
+            self._search.max_idx = result.max_idx or 0
+            self._search.session_id = tostring(result.session_id or "")
+            if result.upgrade_info then
+                UIManager:show(InfoMessage:new{
+                    text = "Skill 接口有更新，部分功能可能异常",
+                    timeout = 2,
+                })
+            end
+            if #self._search.books == 0 then
+                UIManager:show(InfoMessage:new{
+                    text = "暂无相似推荐",
+                    timeout = 2,
+                })
+            end
+            self:_paint()
+            self:_prefetch_covers()
+        end)
     end)
 end
 
@@ -1715,21 +2422,43 @@ function ShelfView:_open_search_book(book)
     if type(book) ~= "table" then
         return
     end
-    local book_id = tostring(book.bookId or "")
-    if book_id ~= "" then
-        for _, owned in ipairs(Shelf.books or {}) do
-            if tostring(owned.bookId or "") == book_id and owned.reader_param and owned.reader_param ~= "" then
-                Reading.open_book(owned)
-                return
-            end
-        end
-    end
-    if book.reader_param and book.reader_param ~= "" then
-        Reading.open_book(book)
+    local BookDetail = require("wereadlite.book_detail")
+    BookDetail.show(book)
+end
+
+function ShelfView:_show_book_hold_menu(book)
+    if type(book) ~= "table" then
         return
     end
-    local SkillView = require("wereadlite.skill_view")
-    SkillView.show_book_detail(book)
+    local BookDetail = require("wereadlite.book_detail")
+    local dialog
+    dialog = ButtonDialog:new{
+        title = tostring(book.title or "图书"),
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = "查看详情",
+                    callback = function()
+                        UIManager:close(dialog)
+                        UIManager:nextTick(function()
+                            BookDetail.show(book)
+                        end)
+                    end,
+                },
+                {
+                    text = "相似推荐",
+                    callback = function()
+                        UIManager:close(dialog)
+                        UIManager:nextTick(function()
+                            self:_start_similar(book)
+                        end)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
 end
 
 function ShelfView:_goto_search(page)
@@ -1775,29 +2504,46 @@ function ShelfView:_goto_search(page)
             return
         end
         local Skill = require("wereadlite.skill")
-        local result, status = Skill.search(s.keyword, {
-            scope = 10,
-            count = per,
-            max_idx = s.max_idx or 0,
-        })
-        if not result then
-            s.has_more = false
-            Log.warn("shelf", "search_more", { status = status })
-            finish()
-            return
+        local function on_page(result, status)
+            if self._closed or not self:_is_search() then
+                return
+            end
+            if not result then
+                s.has_more = false
+                Log.warn("shelf", s.mode == "similar" and "similar_more" or "search_more", { status = status })
+                finish()
+                return
+            end
+            local before = #s.books
+            self:_merge_search_books(result.books)
+            s.has_more = result.has_more and true or false
+            s.max_idx = math.max(s.max_idx or 0, result.max_idx or 0)
+            if s.mode == "similar" then
+                s.session_id = tostring(result.session_id or s.session_id or "")
+            end
+            if #s.books == before then
+                s.has_more = false
+            end
+            local loading_text = s.mode == "similar" and "正在加载相似推荐… %d" or "正在加载搜索结果… %d"
+            self:_set_body(self:_status_widget(string.format(
+                loading_text,
+                #s.books
+            )))
+            UIManager:scheduleIn(0.05, fetch_until)
         end
-        local before = #s.books
-        self:_merge_search_books(result.books)
-        s.has_more = result.has_more and true or false
-        s.max_idx = math.max(s.max_idx or 0, result.max_idx or 0)
-        if #s.books == before then
-            s.has_more = false
+        if s.mode == "similar" then
+            Skill.similar_async(s.book_id, {
+                count = math.max(12, per),
+                max_idx = s.max_idx or 0,
+                session_id = s.session_id,
+            }, on_page)
+        else
+            Skill.search_async(s.keyword, {
+                scope = 10,
+                count = per,
+                max_idx = s.max_idx or 0,
+            }, on_page)
         end
-        self:_set_body(self:_status_widget(string.format(
-            "正在加载搜索结果… %d",
-            #s.books
-        )))
-        UIManager:scheduleIn(0.05, fetch_until)
     end
 
     if ((not load_all) and #s.books >= page * per) or not s.has_more then
@@ -1805,7 +2551,8 @@ function ShelfView:_goto_search(page)
         return
     end
     self.page = page
-    self:_set_body(self:_status_widget("正在加载搜索结果…"))
+    local start_text = s.mode == "similar" and "正在加载相似推荐…" or "正在加载搜索结果…"
+    self:_set_body(self:_status_widget(start_text))
     UIManager:scheduleIn(0.05, fetch_until)
 end
 
@@ -1830,6 +2577,10 @@ local TILE_FROM_KIND = {
     chart_mode = "chart_stats",
     chart_prev = "chart_stats",
     chart_next = "chart_stats",
+    recommend = "recommend",
+    recommend_prev = "recommend",
+    recommend_next = "recommend",
+    recommend_book = "recommend",
 }
 
 local HIT_PRIORITY = {
@@ -1839,12 +2590,16 @@ local HIT_PRIORITY = {
     text_next = 4,
     chart_prev = 4,
     chart_next = 4,
+    recommend_prev = 4,
+    recommend_next = 4,
+    recommend_book = 4,
     user = 3,
     clock = 2,
     recent = 2,
     book = 2,
     text_stats = 1,
     chart_stats = 1,
+    recommend = 1,
 }
 
 function ShelfView:_hit_cell(x, y)
@@ -1940,6 +2695,9 @@ function ShelfView:onTap(_, ges)
             return true
         end
         if x >= bar.close_x1 and x < bar.close_x2 then
+            if self:_is_search() then
+                return self:_close_search()
+            end
             return self:onClose()
         end
         return true
@@ -2004,11 +2762,48 @@ function ShelfView:onTap(_, ges)
             self:_paint()
             return true
         end
+        if cell.kind == "recommend_prev" then
+            local span = Settings.recommend_span()
+            local pages = self:_recommend_page_count(span)
+            local page = math.max(1, tonumber(self._recommend_ui.page) or 1)
+            if page > 1 then
+                self._recommend_ui.page = page - 1
+                self:_paint()
+                self:_ensure_recommend()
+                self:_prefetch_covers()
+            end
+            return true
+        end
+        if cell.kind == "recommend_next" then
+            local span = Settings.recommend_span()
+            local pages = self:_recommend_page_count(span)
+            local page = math.max(1, tonumber(self._recommend_ui.page) or 1)
+            if page < pages then
+                self._recommend_ui.page = page + 1
+                self:_paint()
+                self:_ensure_recommend()
+                self:_prefetch_covers()
+            end
+            return true
+        end
+        if cell.kind == "recommend_book" and cell.book then
+            self:_open_search_book(cell.book)
+            return true
+        end
         if cell.kind == "text_stats" then
             local mode = self._stats_ui.text_mode or "monthly"
             if self._stats_cache[mode] == false then
                 self._stats_cache[mode] = nil
                 self:_paint()
+            end
+            return true
+        end
+        if cell.kind == "recommend" then
+            if self._recommend_cache == false then
+                self._recommend_cache = nil
+                TILE_CACHE.recommend = nil
+                self:_paint()
+                self:_ensure_recommend()
             end
             return true
         end
@@ -2055,10 +2850,14 @@ function ShelfView:onHold(_, ges)
     if bar and pos.y >= bar.y1 and pos.y < bar.y2 then
         return true
     end
+    local cell = self:_hit_cell(pos.x, pos.y)
+    if cell and (cell.kind == "book" or cell.kind == "recent") and cell.book then
+        self:_show_book_hold_menu(cell.book)
+        return true
+    end
     if self:_is_search() then
         return true
     end
-    local cell = self:_hit_cell(pos.x, pos.y)
     local tile_id = cell and TILE_FROM_KIND[cell.kind]
     if tile_id then
         self:_open_tile_menu(tile_id)
@@ -2066,14 +2865,37 @@ function ShelfView:onHold(_, ges)
     return true
 end
 
-function ShelfView:onClose()
+function ShelfView:_mark_closed()
+    if self._closed then
+        return false
+    end
     self._closed = true
     self._clock_gen = (self._clock_gen or 0) + 1
+    self._cover_gen = (self._cover_gen or 0) + 1
+    self._preload_gen = (self._preload_gen or 0) + 1
+    self._recommend_busy = false
+    self._stats_busy = false
+    return true
+end
+
+function ShelfView:onClose()
+    if self:_is_search() then
+        return self:_close_search()
+    end
+    self:_mark_closed()
     UIManager:close(self)
     if self.on_close then
         self.on_close()
     end
     return true
+end
+
+function ShelfView:onCloseWidget()
+    self:_mark_closed()
+    if self[1] and self[1].free then
+        pcall(self[1].free, self[1])
+    end
+    self[1] = nil
 end
 
 return ShelfView
