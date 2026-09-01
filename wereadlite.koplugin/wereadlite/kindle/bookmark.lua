@@ -123,6 +123,32 @@ local function toast(text, timeout)
     })
 end
 
+local function refresh_session_then(callback)
+    local Session = require("wereadlite.session")
+    Session.refresh_async(function(user, status, err)
+        if user then
+            callback(true)
+            return
+        end
+        Log.warn("bookmark", "session_refresh", { status = status, err = err })
+        callback(false, status, err)
+    end)
+end
+
+local function retry_auth_expired(err, retried, on_retry, on_fail)
+    if err ~= "auth_expired" or retried then
+        return false
+    end
+    refresh_session_then(function(ok)
+        if ok then
+            on_retry()
+        else
+            on_fail(true)
+        end
+    end)
+    return true
+end
+
 local function chapter_hint(state)
     local offset = tonumber(state and state.chapter_offset) or 0
     if offset > 0 then
@@ -403,20 +429,31 @@ function Bookmark.sync_highlight(item, state, opts)
         end
         return
     end
-    Bookmark.add(payload, state, function(data, add_err, bookmark_id)
-        if data then
-            attach_ids(item, payload, bookmark_id)
-            if opts.notify ~= false then
-                toast("已同步划线")
-            end
-            return
-        end
-        if add_err == "auth_expired" then
+    local function fail(add_err, auth_failed)
+        if auth_failed or add_err == "auth_expired" then
             toast("登录已过期，请重新登录", 2)
         elseif opts.notify ~= false then
             toast("划线同步失败")
         end
-    end)
+    end
+    local function do_add(retried)
+        Bookmark.add(payload, state, function(data, add_err, bookmark_id)
+            if data then
+                attach_ids(item, payload, bookmark_id)
+                if opts.notify ~= false then
+                    toast("已同步划线")
+                end
+                return
+            end
+            if retry_auth_expired(add_err, retried, function()
+                do_add(true)
+            end, fail) then
+                return
+            end
+            fail(add_err, false)
+        end)
+    end
+    do_add(false)
 end
 
 function Bookmark.resolve_id(item, state)
@@ -447,19 +484,30 @@ function Bookmark.sync_delete(item, state, opts)
         end
         return
     end
-    Bookmark.remove(bookmark_id, state, function(data, rem_err)
-        if data then
-            if opts.notify ~= false then
-                toast("已删除划线")
-            end
-            return
-        end
-        if rem_err == "auth_expired" then
+    local function fail(rem_err, auth_failed)
+        if auth_failed or rem_err == "auth_expired" then
             toast("登录已过期，请重新登录", 2)
         elseif opts.notify ~= false then
             toast("删除划线失败")
         end
-    end)
+    end
+    local function do_remove(retried)
+        Bookmark.remove(bookmark_id, state, function(data, rem_err)
+            if data then
+                if opts.notify ~= false then
+                    toast("已删除划线")
+                end
+                return
+            end
+            if retry_auth_expired(rem_err, retried, function()
+                do_remove(true)
+            end, fail) then
+                return
+            end
+            fail(rem_err, false)
+        end)
+    end
+    do_remove(false)
 end
 
 return Bookmark

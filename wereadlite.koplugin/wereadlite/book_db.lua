@@ -154,16 +154,56 @@ function BookDb.get(book_id)
     return result
 end
 
+local function reader_param_from_reader_url(url)
+    url = tostring(url or "")
+    return url:match("[?&]v=([%w_%-]+)") or url:match("[?&]bc=([^&]+)")
+end
+
+local function reader_param_from_state(state)
+    if type(state) ~= "table" then
+        return nil
+    end
+    local param = state.cur and state.cur.param
+    if param and param ~= "" then
+        return param
+    end
+    param = state.cur_param and state.cur_param.param
+    if param and param ~= "" then
+        return param
+    end
+    return nil
+end
+
+local function merge_last_read(row, decoded)
+    if type(decoded) ~= "table" then
+        return row
+    end
+    for key, value in pairs(decoded) do
+        if value ~= nil and value ~= "" and (row[key] == nil or row[key] == "") then
+            row[key] = value
+        end
+    end
+    return row
+end
+
 function BookDb.save_last_read(book, extra)
     book = type(book) == "table" and book or {}
     extra = extra or {}
     local info = type(extra.book_info) == "table" and extra.book_info or {}
+    local reader_param = book.reader_param
+    if (not reader_param or reader_param == "") then
+        reader_param = reader_param_from_state(extra.state)
+    end
+    if (not reader_param or reader_param == "") then
+        reader_param = reader_param_from_reader_url(book.reader_url)
+    end
     local row = {
         bookId = book.bookId or info.bookId or info.book_id,
         title = book.title or info.title,
         author = book.author or info.author,
         cover = book.cover or info.cover,
-        reader_param = book.reader_param,
+        reader_param = reader_param,
+        reader_url = book.reader_url,
         chapter_title = extra.chapter_title or (book.chapter_title or ""),
     }
     local book_id = as_text(row.bookId)
@@ -209,7 +249,7 @@ function BookDb.get_last_read()
     end
     local ok, result = pcall(function()
         local stmt = conn:prepare([[
-            SELECT book_id, title, author, cover, reader_param, chapter_title
+            SELECT book_id, title, author, cover, reader_param, chapter_title, json
             FROM last_read WHERE id = 1 LIMIT 1
         ]])
         local row = stmt:step()
@@ -217,14 +257,18 @@ function BookDb.get_last_read()
         if not row or not row[1] then
             return nil
         end
-        return {
+        local result = merge_last_read({
             bookId = as_text(row[1]),
             title = as_text(row[2]),
             author = as_text(row[3]),
             cover = as_text(row[4]),
             reader_param = as_text(row[5]),
             chapter_title = as_text(row[6]),
-        }
+        }, Json.decode(as_text(row[7])))
+        if (not result.reader_param or result.reader_param == "") then
+            result.reader_param = reader_param_from_reader_url(result.reader_url)
+        end
+        return result
     end)
     pcall(conn.close, conn)
     if not ok then

@@ -509,7 +509,7 @@ function Codec.convert_footnotes(html)
     return html .. table.concat(tail)
 end
 
-function Codec.inner_by_id(html, id)
+local function div_bounds_by_id(html, id)
     html = tostring(html or "")
     local needle = 'id="' .. id .. '"'
     local at = html:find(needle, 1, true)
@@ -532,7 +532,7 @@ function Codec.inner_by_id(html, id)
         local nxt_open = html:find("<div", p, true)
         local nxt_close = html:find("</div>", p, true)
         if not nxt_close then
-            return html:sub(gt + 1)
+            return open, #html
         end
         if nxt_open and nxt_open < nxt_close then
             depth = depth + 1
@@ -540,11 +540,32 @@ function Codec.inner_by_id(html, id)
         else
             depth = depth - 1
             if depth == 0 then
-                return html:sub(gt + 1, nxt_close - 1)
+                return open, nxt_close + 5
             end
             p = nxt_close + 6
         end
     end
+end
+
+function Codec.inner_by_id(html, id)
+    local open, close = div_bounds_by_id(html, id)
+    if not open then
+        return nil
+    end
+    local gt = html:find(">", open, true)
+    if not gt or gt >= close then
+        return nil
+    end
+    return html:sub(gt + 1, close - 6)
+end
+
+-- Plain-text chapter titles are not custom-font encoded; keep them out of decode_html.
+local function carve_element_by_id(html, id)
+    local open, close = div_bounds_by_id(html, id)
+    if not open then
+        return html, nil
+    end
+    return html:sub(1, open - 1), html:sub(open, close), html:sub(close + 1)
 end
 
 local function remove_css_property(css, name)
@@ -578,6 +599,13 @@ function Codec.reader_content(html, decode)
     if text == "" and not has_image then
         error("readerContent empty")
     end
+    local title_head, title_block, title_tail
+    if decode ~= false then
+        title_head, title_block, title_tail = carve_element_by_id(inner, "readerChapterTitle")
+        if title_block then
+            inner = title_head .. title_tail
+        end
+    end
     if Codec.looks_like_shards(inner) then
         if decode ~= false then
             local ok, decoded = pcall(Codec.decode_parts, { inner })
@@ -587,6 +615,9 @@ function Codec.reader_content(html, decode)
         end
     elseif decode ~= false then
         inner = Codec.decode_html(inner)
+        if title_block then
+            inner = title_head .. title_block .. inner:sub(#title_head + 1)
+        end
     end
     if decode == false then
         return strip_inline_typography(inner)

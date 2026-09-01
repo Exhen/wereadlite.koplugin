@@ -5,6 +5,13 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3]
+
+### Fixed
+
+- 优化评论展示
+- 其他稳定性修复
+
 ## [0.2.2]
 
 ### Added

@@ -787,6 +787,7 @@ function ShelfView:_col_rect(col, span, cell_w, gap, width, cols)
 end
 
 function ShelfView:_last_book()
+    local BookDetail = require("wereadlite.book_detail")
     local last = BookDb.get_last_read()
     if type(last) ~= "table" or tostring(last.bookId or "") == "" then
         return nil
@@ -795,6 +796,9 @@ function ShelfView:_last_book()
         if tostring(book.bookId or "") == tostring(last.bookId) then
             if not last.reader_param or last.reader_param == "" then
                 last.reader_param = book.reader_param
+            end
+            if not last.reader_url or last.reader_url == "" then
+                last.reader_url = book.reader_url
             end
             if not last.cover or last.cover == "" then
                 last.cover = book.cover
@@ -805,7 +809,27 @@ function ShelfView:_last_book()
             break
         end
     end
-    return last
+    if (not last.reader_param or last.reader_param == "") or (not last.reader_url or last.reader_url == "") then
+        local cached = BookDb.get(last.bookId)
+        if type(cached) == "table" then
+            if not last.reader_param or last.reader_param == "" then
+                last.reader_param = cached.reader_param
+            end
+            if not last.reader_url or last.reader_url == "" then
+                last.reader_url = cached.reader_url
+            end
+            if not last.cover or last.cover == "" then
+                last.cover = cached.cover
+            end
+            if not last.title or last.title == "" then
+                last.title = cached.title
+            end
+            if not last.author or last.author == "" then
+                last.author = cached.author
+            end
+        end
+    end
+    return BookDetail.enrich_reader_param(last)
 end
 
 function ShelfView:_user_row(width, height)

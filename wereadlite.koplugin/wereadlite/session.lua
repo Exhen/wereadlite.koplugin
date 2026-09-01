@@ -29,4 +29,19 @@ function Session.save_from_header(text)
     return CookieStore.replace_header(text, "login")
 end
 
+-- The web reader's skey/sfs values may be rotated while the device sleeps.
+-- Refreshing them is deliberately separate from clearing authentication: a
+-- failed refresh must not turn a transient network problem into a logout.
+function Session.refresh_async(on_done)
+    local Shelf = require("wereadlite.kindle.shelf")
+    return Shelf.refresh_session(on_done, false)
+end
+
+function Session.cancel_refresh()
+    local ok, Shelf = pcall(require, "wereadlite.kindle.shelf")
+    if ok and Shelf and type(Shelf.cancel_session_refresh) == "function" then
+        return Shelf.cancel_session_refresh()
+    end
+end
+
 return Session

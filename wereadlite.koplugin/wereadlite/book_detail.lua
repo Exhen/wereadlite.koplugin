@@ -39,6 +39,7 @@ function BookDetail.enrich_reader_param(book)
     book = type(book) == "table" and book or {}
     if (not book.reader_param or book.reader_param == "") and book.reader_url and book.reader_url ~= "" then
         local bc = book.reader_url:match("[?&]v=([%w_%-]+)")
+            or book.reader_url:match("[?&]bc=([^&]+)")
         if bc and bc ~= "" then
             book.reader_param = bc
         end

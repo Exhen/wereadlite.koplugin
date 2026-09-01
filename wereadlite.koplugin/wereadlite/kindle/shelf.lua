@@ -15,6 +15,10 @@ local Shelf = {
     eof = false,
 }
 
+local session_job
+local session_waiters = {}
+local session_seed_books = false
+
 local function looks_like_login(html)
     html = tostring(html or "")
     if html:find("userInfo:", 1, true) then
@@ -206,14 +210,21 @@ local function seed_from_html(html)
     end
 end
 
-function Shelf.ensure_user(on_done)
+-- Refresh the WeRead web session without requiring the shelf UI to be opened.
+-- The shelf HTML contains the current short-lived skey/sfs values, which must
+-- be refreshed after a long suspend before bookmark APIs are used again.
+function Shelf.refresh_session(on_done, seed_books)
     on_done = on_done or function() end
-    if Shelf.user then
-        on_done(Shelf.user)
-        return
+    if session_job and not session_job.done and not session_job.cancelled then
+        session_waiters[#session_waiters + 1] = on_done
+        session_seed_books = session_seed_books or seed_books == true
+        return session_job
     end
-    Log.dbg("shelf", "ensure_user", { url = Config.SHELF_URL })
-    Http.request({
+    session_waiters = { on_done }
+    session_seed_books = seed_books == true
+    Log.info("shelf", "session_refresh_start", { seed_books = seed_books == true })
+    local job
+    job = Http.request({
         url = Config.SHELF_URL,
         accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         referer = Config.SHELF_URL,
@@ -222,15 +233,32 @@ function Shelf.ensure_user(on_done)
         absorb_cookies = true,
         timeout = 15,
     }, function(res)
+        if job.cancelled then
+            return
+        end
+        if session_job == job then
+            session_job = nil
+        end
+        local waiters = session_waiters
+        session_waiters = {}
+        local should_seed_books = session_seed_books
+        session_seed_books = false
+        local function finish_waiters(...)
+            for _, waiter in ipairs(waiters) do
+                pcall(waiter, ...)
+            end
+        end
         local body = res and res.body or ""
         local status = res and res.status
         local err = res and res.err
         if not res or not res.ok then
             if looks_like_login(body or err) then
+                Log.warn("shelf", "session_refresh", { status = "auth_expired" })
                 Log.warn("shelf", "auth_expired", { source = "html" })
-                on_done(nil, "auth_expired")
+                finish_waiters(nil, "auth_expired")
                 return
             end
+            Log.warn("shelf", "session_refresh", { status = status or "http_error", err = err })
             Log.warn("shelf", "ensure_user", {
                 status = status,
                 err = err,
@@ -238,31 +266,65 @@ function Shelf.ensure_user(on_done)
                 bytes = #body,
                 header = tostring(res and res.headers or ""):match("[^\r\n]+"),
             })
-            on_done(nil, status or "http_error", err)
+            finish_waiters(nil, status or "http_error", err)
             return
         end
         if looks_like_login(body) then
+            Log.warn("shelf", "session_refresh", { status = "auth_expired" })
             Log.warn("shelf", "auth_expired", { source = "html" })
-            on_done(nil, "auth_expired")
+            finish_waiters(nil, "auth_expired")
             return
         end
         local user = Shelf.parse_user_info(body)
         if not user then
+            Log.warn("shelf", "session_refresh", { status = "auth_expired", err = "userInfo missing" })
             Log.warn("shelf", "auth_expired", { source = "userInfo" })
-            on_done(nil, "auth_expired", "userInfo missing")
+            finish_waiters(nil, "auth_expired", "userInfo missing")
             return
         end
         Shelf.sync_session(body)
-        seed_from_html(body)
+        if should_seed_books then
+            seed_from_html(body)
+        end
         Shelf.user = user
+        Log.info("shelf", "session_refresh_done", {
+            seed_books = should_seed_books,
+            user_vid = user.user_vid,
+        })
         Log.dbg("shelf", "user", {
             vid = user.user_vid,
             name = user.name,
             books = #Shelf.books,
             total = Shelf.total,
         })
-        on_done(user)
+        finish_waiters(user)
     end)
+    session_job = job
+    return job
+end
+
+function Shelf.cancel_session_refresh()
+    local job = session_job
+    session_job = nil
+    session_waiters = {}
+    session_seed_books = false
+    if not job or job.done or job.cancelled then
+        return false
+    end
+    Http.cancel(job)
+    Log.info("shelf", "session_refresh_cancel", { url = job.url })
+    return true
+end
+
+function Shelf.ensure_user(on_done, force)
+    on_done = on_done or function() end
+    -- Shelf.user is display cache only; skey/sfs in cookies must still be refreshed.
+    Log.dbg("shelf", "ensure_user", {
+        url = Config.SHELF_URL,
+        force = force == true,
+        has_user = Shelf.user ~= nil,
+    })
+    return Shelf.refresh_session(on_done, true)
 end
 
 local function api_error(data)

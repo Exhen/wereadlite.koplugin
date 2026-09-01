@@ -1,3 +1,5 @@
+local Device = require("device")
+local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local Log = require("wereadlite.log")
 local Net = require("wereadlite.net")
@@ -7,6 +9,35 @@ local Gate = {
     widget = nil,
     state = nil,
 }
+
+local UNSUPPORTED_MSG = table.concat({
+    "本插件仅支持 Kindle 等电纸书设备。",
+    "安卓版 KOReader 暂不支持，请使用官方微信读书 App。",
+}, "\n")
+
+local function is_android()
+    return type(Device.isAndroid) == "function" and Device:isAndroid()
+end
+
+function Gate.is_supported()
+    return not is_android()
+end
+
+function Gate.show_unsupported()
+    UIManager:show(InfoMessage:new{
+        text = UNSUPPORTED_MSG,
+        timeout = 4,
+    })
+    Log.warn("gate", "unsupported_platform", { android = true })
+end
+
+function Gate.block_if_unsupported()
+    if Gate.is_supported() then
+        return false
+    end
+    Gate.show_unsupported()
+    return true
+end
 
 local function close_widget()
     if not Gate.widget then
@@ -41,6 +72,11 @@ function Gate.current_state()
 end
 
 function Gate.refresh()
+    if not Gate.is_supported() then
+        close_widget()
+        Gate.state = nil
+        return
+    end
     local state = Gate.current_state()
     if Gate.widget and Gate.state == state then
         return
@@ -93,6 +129,9 @@ function Gate.refresh()
 end
 
 function Gate.open()
+    if Gate.block_if_unsupported() then
+        return
+    end
     Log.info("gate", "open")
     Gate.state = nil
     Gate.refresh()

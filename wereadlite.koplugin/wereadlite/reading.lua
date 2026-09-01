@@ -570,6 +570,7 @@ function Reading.open_url(url, book, opts)
         pcall(BookDb.save_last_read, Reading.book, {
             book_info = state.book_info,
             chapter_title = state.chapter_title or (state.cur and state.cur.title),
+            state = state,
         })
         Heartbeat.start(state)
         -- Delay the expensive full next-chapter pipeline until the reader has
@@ -660,7 +661,25 @@ function Reading.cancel_load()
 end
 
 function Reading.open_book(book)
-    if type(book) ~= "table" or not book.reader_param or book.reader_param == "" then
+    local BookDetail = require("wereadlite.book_detail")
+    book = type(book) == "table" and book or {}
+    if tostring(book.bookId or "") ~= "" and (not book.reader_param or book.reader_param == "") then
+        local cached = BookDb.get(book.bookId)
+        if type(cached) == "table" then
+            for key, value in pairs(cached) do
+                if value ~= nil and value ~= "" and (book[key] == nil or book[key] == "") then
+                    book[key] = value
+                end
+            end
+        end
+    end
+    book = BookDetail.enrich_reader_param(BookDetail.resolve_owned(book))
+    local url
+    if book.reader_param and book.reader_param ~= "" then
+        url = Reader.url_for(book.reader_param)
+    elseif book.reader_url and book.reader_url ~= "" then
+        url = book.reader_url
+    else
         show_error("缺少阅读参数")
         return
     end
@@ -672,7 +691,7 @@ function Reading.open_book(book)
     Heartbeat.stop(true)
     Reader.cleanup_reading()
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(Reader.url_for(book.reader_param), book, { resume = true })
+        local ok, status, err = Reading.open_url(url, book, { resume = true })
         if ok then
             return
         end
