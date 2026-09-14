@@ -41,34 +41,66 @@ local function merge_reader_urls(books, urls)
     end
 end
 
-function Shelf.parse_user_info(html)
-    local block = tostring(html or ""):match("userInfo:(%b{})")
+local function parse_user_info_block(html)
+    html = tostring(html or "")
+    local block = html:match("userInfo:(%b{})")
+        or html:match('userInfo:%s*(%b{})')
+        or html:match('"userInfo"%s*:%s*(%b{})')
     if not block then
         return nil
     end
     local vid = tonumber(block:match("userVid:(%d+)"))
-    local name = block:match('name:"([^"]*)"')
-    local avatar = block:match('avatar:"([^"]*)"')
-    local title = block:match('deepVTitle:"([^"]*)"')
-    local medal = block:match("medalInfo:(%b{})") or ""
+        or tonumber(block:match('"userVid"%s*:%s*(%d+)'))
     if not vid then
         return nil
     end
+    local name = block:match('name:"([^"]*)"') or block:match('"name"%s*:%s*"([^"]*)"')
+    local avatar = block:match('avatar:"([^"]*)"') or block:match('"avatar"%s*:%s*"([^"]*)"')
+    local title = block:match('deepVTitle:"([^"]*)"') or block:match('"deepVTitle"%s*:%s*"([^"]*)"')
+    local medal = block:match("medalInfo:(%b{})") or block:match('"medalInfo"%s*:%s*(%b{})') or ""
     return {
         user_vid = vid,
         name = Nuxt.unescape(name or ""),
         avatar = Nuxt.unescape(avatar or ""),
         deep_v_title = Nuxt.unescape(title or ""),
-        medal_id = medal:match('id:"([^"]*)"'),
-        medal_level = tonumber(medal:match("levelIndex:(%d+)")),
-        skey = tostring(html or ""):match('user:{vid:"%d+",skey:"([^"]*)"'),
+        medal_id = medal:match('id:"([^"]*)"') or medal:match('"id"%s*:%s*"([^"]*)"'),
+        medal_level = tonumber(medal:match("levelIndex:(%d+)"))
+            or tonumber(medal:match('"levelIndex"%s*:%s*(%d+)')),
+        skey = html:match('user:{vid:"%d+",skey:"([^"]*)"')
+            or html:match('"user"%s*:%s*{[^}]*"skey"%s*:%s*"([^"]*)"'),
+    }
+end
+
+function Shelf.parse_user_info(html)
+    local user = parse_user_info_block(html)
+    if user then
+        return user
+    end
+    -- Fallback: derive session from embedded user:{vid,skey} when userInfo block is absent.
+    html = tostring(html or "")
+    local vid = tonumber(html:match('user:{vid:"(%d+)"'))
+        or tonumber(html:match('"vid"%s*:%s*"?(%d+)"?'))
+    local skey = html:match('user:{vid:"%d+",skey:"([^"]*)"')
+        or html:match('"skey"%s*:%s*"([^"]*)"')
+    if not vid or not skey or skey == "" then
+        return nil
+    end
+    return {
+        user_vid = vid,
+        name = "",
+        avatar = "",
+        deep_v_title = "",
+        medal_id = nil,
+        medal_level = nil,
+        skey = skey,
     }
 end
 
 function Shelf.sync_session(html)
-    local vid = tostring(html or ""):match('user:{vid:"(%d+)",skey:"[^"]*"')
-    local skey = tostring(html or ""):match('user:{vid:"%d+",skey:"([^"]*)"')
-    local sfs = tostring(html or ""):match('user:{vid:"%d+",skey:"[^"]*",sfs:(%d+)')
+    html = tostring(html or "")
+    local vid = html:match('user:{vid:"(%d+)"') or html:match('"vid"%s*:%s*"?(%d+)"?')
+    local skey = html:match('user:{vid:"%d+",skey:"([^"]*)"') or html:match('"skey"%s*:%s*"([^"]*)"')
+    local sfs = html:match('user:{vid:"%d+",skey:"[^"]*",sfs:(%d+)') or html:match('"sfs"%s*:%s*(%d+)')
     if vid and vid ~= "" then
         CookieStore.set("wr_vid", vid, "nuxt")
     end
@@ -229,14 +261,16 @@ function Shelf.refresh_session(on_done, seed_books)
         accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         referer = Config.SHELF_URL,
         origin = Config.ORIGIN,
+        user_agent = Config.KINDLE_UA,
         send_cookie = true,
-        absorb_cookies = true,
         timeout = 15,
     }, function(res)
-        if job.cancelled then
+        -- Http.request may return nil when curl is missing; the failure
+        -- callback still runs, so never index job unconditionally.
+        if job and job.cancelled then
             return
         end
-        if session_job == job then
+        if session_job ~= nil and session_job == job then
             session_job = nil
         end
         local waiters = session_waiters
@@ -277,7 +311,12 @@ function Shelf.refresh_session(on_done, seed_books)
         end
         local user = Shelf.parse_user_info(body)
         if not user then
-            Log.warn("shelf", "session_refresh", { status = "auth_expired", err = "userInfo missing" })
+            Log.warn("shelf", "session_refresh", {
+                status = "auth_expired",
+                err = "userInfo missing",
+                bytes = #body,
+                has_user_info = body:find("userInfo:", 1, true) ~= nil,
+            })
             Log.warn("shelf", "auth_expired", { source = "userInfo" })
             finish_waiters(nil, "auth_expired", "userInfo missing")
             return
@@ -357,8 +396,8 @@ function Shelf.fetch_api_page(idx, on_done)
         accept = "*/*",
         referer = Config.SHELF_URL,
         origin = Config.ORIGIN,
+        user_agent = Config.KINDLE_UA,
         send_cookie = true,
-        absorb_cookies = true,
         timeout = 15,
     }, function(res)
         if not res or not res.ok then

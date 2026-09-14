@@ -3,17 +3,19 @@ local Config = require("wereadlite.config")
 local CookieStore = require("wereadlite.cookie_store")
 local Http = require("wereadlite.async_http")
 local Log = require("wereadlite.log")
+local Net = require("wereadlite.net")
 
 local Client = {}
 
 local ok_http, http = pcall(require, "socket.http")
 local ok_https, https = pcall(require, "ssl.https")
+local ok_ssl, ssl = pcall(require, "ssl")
+local ok_sock, socket = pcall(require, "socket")
 
 local MAX_REDIRECTS = 5
 
 local function tcp_create(seconds)
-    local ok, socket = pcall(require, "socket")
-    if not ok or not socket or type(socket.tcp) ~= "function" then
+    if not ok_sock or not socket or type(socket.tcp) ~= "function" then
         return nil
     end
     return function()
@@ -22,6 +24,66 @@ local function tcp_create(seconds)
             sock:settimeout(seconds)
         end
         return sock
+    end
+end
+
+--- HTTPS connector that dials a numeric IP but sends SNI/Host for `hostname`.
+-- Bypasses broken getaddrinfo on Kobo (EAI_NONAME in ~5ms despite resolv.conf).
+-- Uses socket.http's `create` (ssl.https forbids it); mirrors LuaSec https.lua tcp().
+local function https_create(hostname, connect_ip, seconds)
+    if not ok_sock or not ok_ssl or not socket or not ssl then
+        return nil
+    end
+    if type(ssl.wrap) ~= "function" then
+        return nil
+    end
+    seconds = tonumber(seconds) or 25
+    return function()
+        local conn = {}
+        conn.sock = socket.tcp()
+        local settimeout = conn.sock.settimeout
+        function conn:settimeout(...)
+            return settimeout(self.sock, ...)
+        end
+        function conn:connect(host, port)
+            local target = connect_ip or host
+            local ok, err = self.sock:connect(target, port)
+            if not ok then
+                return nil, err
+            end
+            local wrapped
+            wrapped, err = ssl.wrap(self.sock, {
+                mode = "client",
+                protocol = "any",
+                verify = "none",
+                options = { "all", "no_sslv2", "no_sslv3", "no_tlsv1" },
+            })
+            if not wrapped then
+                return nil, err or "ssl wrap failed"
+            end
+            self.sock = wrapped
+            if self.sock.sni then
+                pcall(self.sock.sni, self.sock, hostname or host)
+            end
+            self.sock:settimeout(seconds)
+            ok, err = self.sock:dohandshake()
+            if not ok then
+                return nil, err or "ssl handshake failed"
+            end
+            local mt = getmetatable(self.sock)
+            local index = mt and mt.__index
+            if type(index) == "table" then
+                for name, method in pairs(index) do
+                    if type(method) == "function" then
+                        conn[name] = function(self, ...)
+                            return method(self.sock, ...)
+                        end
+                    end
+                end
+            end
+            return 1
+        end
+        return conn
     end
 end
 
@@ -50,7 +112,6 @@ local function apply_timeout(seconds)
         old.https_set = true
         https.TIMEOUT = seconds
     end
-    local ok_sock, socket = pcall(require, "socket")
     if ok_sock and socket then
         old.socket = socket.TIMEOUT
         old.socket_set = true
@@ -119,6 +180,7 @@ end
 local function classify(code, err)
     code = tonumber(code) or 0
     local text = tostring(err or "")
+    local lower = text:lower()
     if code == 401 or code == 403 then
         return "auth_expired"
     end
@@ -128,20 +190,37 @@ local function classify(code, err)
     if code > 0 then
         return "http_error"
     end
-    if text:find("timeout", 1, true)
-        or text:find("closed", 1, true)
-        or text:find("refused", 1, true)
-        or text:find("Network is unreachable", 1, true) then
+    if lower:find("timeout", 1, true)
+        or lower:find("closed", 1, true)
+        or lower:find("refused", 1, true)
+        or lower:find("network is unreachable", 1, true)
+        or lower:find("host or service not provided", 1, true)
+        or lower:find("name or service not known", 1, true)
+        or lower:find("nodename nor servname", 1, true)
+        or lower:find("temporary failure in name resolution", 1, true)
+        or lower:find("dns", 1, true) then
         return "offline"
     end
     return "http_error"
 end
 
-local function transport_for(url)
-    if tostring(url):match("^https://") then
-        return ok_https and https
+local function url_host(url)
+    return tostring(url or ""):match("^https?://([^/:]+)")
+end
+
+local function resolve_for_url(url, opts)
+    local host = url_host(url)
+    if not host then
+        return nil, nil
     end
-    return ok_http and http
+    if host:match("^%d+%.%d+%.%d+%.%d+$") then
+        return host, host
+    end
+    if opts and opts.connect_ip and opts.connect_host == host then
+        return host, opts.connect_ip
+    end
+    local ip = Net.resolve(host)
+    return host, ip
 end
 
 function Client.request(opts)
@@ -150,7 +229,7 @@ function Client.request(opts)
     local method = opts.method or "GET"
     local body = opts.body
     local last_err
-    local timeout = opts.timeout or 20
+    local timeout = math.max(15, tonumber(opts.timeout) or 25)
 
     Log.dbg("http", "start", {
         method = method,
@@ -159,7 +238,7 @@ function Client.request(opts)
         body_bytes = body and #body or 0,
     })
 
-    if Http.available() then
+    if Http.has_curl and Http.has_curl() then
         local started = Log.now_ms()
         local res = Http.request_sync({
             url = url,
@@ -200,11 +279,50 @@ function Client.request(opts)
     end
 
     for hop = 0, MAX_REDIRECTS do
-        local client = transport_for(url)
+        local is_https = tostring(url):match("^https://") ~= nil
+        local hostname, connect_ip
+        if is_https then
+            hostname, connect_ip = resolve_for_url(url, opts)
+            if not connect_ip then
+                last_err = "dns resolve failed"
+                Log.warn("http", "failed", {
+                    method = method,
+                    url = url,
+                    err = last_err,
+                    elapsed_ms = 0,
+                })
+                return nil, "offline", last_err
+            end
+            Log.info("http", "connect_ip", {
+                host = hostname,
+                ip = connect_ip,
+                hop = hop,
+            })
+        end
+
+        local client
+        local create
+        if is_https then
+            -- Prefer socket.http + custom TLS create (IP dial + SNI).
+            if not ok_http or not http or type(http.request) ~= "function" then
+                Log.warn("http", "no_client", { url = url })
+                return nil, "offline", "http client unavailable"
+            end
+            client = http
+            create = https_create(hostname, connect_ip, timeout)
+            if not create then
+                Log.warn("http", "no_tls_create", { url = url })
+                return nil, "offline", "https create unavailable"
+            end
+        else
+            client = ok_http and http or nil
+            create = tcp_create(timeout)
+        end
         if not client or type(client.request) ~= "function" then
             Log.warn("http", "no_client", { url = url })
             return nil, "offline", "http client unavailable"
         end
+
         local headers = {
             ["User-Agent"] = opts.user_agent or Config.KINDLE_UA,
             ["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8",
@@ -213,6 +331,9 @@ function Client.request(opts)
             Referer = opts.referer or Config.SHELF_URL,
             Accept = opts.accept or "*/*",
         }
+        if hostname then
+            headers.Host = hostname
+        end
         if opts.send_cookie ~= false then
             headers.Cookie = CookieStore.header()
         end
@@ -244,12 +365,8 @@ function Client.request(opts)
             sink = ltn12.sink.table(chunks),
             timeout = timeout,
         }
-        -- LuaSec HTTPS forbids a custom create callback.
-        if not tostring(url):match("^https://") then
-            local create = tcp_create(timeout)
-            if create then
-                req.create = create
-            end
+        if create then
+            req.create = create
         end
         local called, res, code, response_headers, status = pcall(client.request, req)
         reset()
@@ -305,6 +422,9 @@ function Client.request(opts)
                 hop = hop + 1,
             })
             url = next_url
+            -- Drop pinned IP so redirect host is re-resolved.
+            opts.connect_ip = nil
+            opts.connect_host = nil
             if code == 303 then
                 method, body = "GET", nil
             end

@@ -5,6 +5,14 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.4]
+
+### Fixed
+
+- 优化评论展示
+- KOBO版修复
+- 书籍渲染问题修复
+
 ## [0.2.3]
 
 ### Fixed

@@ -107,6 +107,8 @@ function Plugin:onReaderReady()
 end
 
 function Plugin:onNetworkConnected()
+    Net.invalidate()
+    Net.ensure_dns({ fallback = true, probe = false })
     if lifecycle.state == "suspended" then
         Log.dbg("plugin", "network_connected_while_suspended", { resume_pending = true })
         lifecycle.resume_pending = true
@@ -129,6 +131,7 @@ function Plugin:onNetworkConnected()
 end
 
 function Plugin:onNetworkDisconnected()
+    Net.invalidate()
     self:_cancelHeartbeatResume()
     Reading.cancel_load()
     Reading.cancel_prefetch()

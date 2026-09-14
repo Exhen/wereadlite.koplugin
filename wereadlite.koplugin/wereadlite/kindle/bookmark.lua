@@ -102,7 +102,7 @@ local function utf8_starts(text)
     return starts, n
 end
 
-local function read_plain(path)
+local function read_file(path)
     path = tostring(path or "")
     if path == "" then
         return ""
@@ -111,9 +111,93 @@ local function read_plain(path)
     if not file then
         return ""
     end
-    local html = file:read("*a") or ""
+    local data = file:read("*a") or ""
     file:close()
-    return plain_text(html)
+    return data
+end
+
+local function read_plain(path)
+    return plain_text(read_file(path))
+end
+
+local function remove_literal(text, needle)
+    text = tostring(text or "")
+    needle = tostring(needle or "")
+    if text == "" or needle == "" then
+        return text
+    end
+    local out, i = {}, 1
+    while true do
+        local at = text:find(needle, i, true)
+        if not at then
+            out[#out + 1] = text:sub(i)
+            break
+        end
+        out[#out + 1] = text:sub(i, at - 1)
+        i = at + #needle
+    end
+    return table.concat(out)
+end
+
+-- CreDocument in-page footnotes expose "[1]" / aside text in highlight
+-- selections, but the encrypted chapter stream has empty footnote anchors.
+local function footnote_bodies(html)
+    local notes = {}
+    for block in tostring(html or ""):gmatch('<aside[^>]*class="footnote"[^>]*>([%s%S]-)</aside>') do
+        local text = normalize(plain_text(block))
+        text = text:gsub("^%[%d+%]", "")
+        if text ~= "" then
+            notes[#notes + 1] = text
+        end
+    end
+    return notes
+end
+
+local function scrub_selection(text, notes)
+    text = normalize(text)
+    -- Markers inserted by Codec.convert_footnotes, e.g. [1].
+    text = text:gsub("%[%d+%]", "")
+    for _, note in ipairs(notes or {}) do
+        text = remove_literal(text, note)
+    end
+    return normalize(text)
+end
+
+local function chapter_html(path)
+    local html = read_file(path)
+    if html == "" then
+        return ""
+    end
+    local ok, inner = pcall(function()
+        return Codec.inner_by_id(html, "readerContent")
+            or Codec.inner_by_id(html, "readerContentRenderContainer")
+    end)
+    if ok and inner and inner ~= "" then
+        return inner
+    end
+    return html
+end
+
+local function strip_footnote_markup(html)
+    html = tostring(html or "")
+    html = html:gsub('<div[^>]*role="doc%-endnotes"[^>]*>([%s%S]-)</div>', "")
+    html = html:gsub('<div[^>]*class="footnotes"[^>]*>([%s%S]-)</div>', "")
+    html = html:gsub('<span[^>]*class="fn%-ref"[^>]*>([%s%S]-)</span>', "")
+    html = html:gsub('<aside[^>]*class="footnote"[^>]*>([%s%S]-)</aside>', "")
+    html = html:gsub('<span[^>]*data%-wr%-footernote[^>]*>([%s%S]-)</span>', "")
+    return html
+end
+
+local function chapter_plain(path, should_decode)
+    local html = strip_footnote_markup(chapter_html(path))
+    local text = normalize(plain_text(html))
+    if should_decode and text ~= "" and Codec.has_map() then
+        local ok_dec, mapped = pcall(Codec.decode_text, text)
+        if ok_dec and mapped and mapped ~= "" then
+            text = normalize(mapped)
+        end
+    end
+    return text
 end
 
 local function toast(text, timeout)
@@ -226,30 +310,71 @@ function Bookmark.build_payload(item, state)
     local cur = state.cur or {}
     local chapter_uid = tonumber(cur.uid) or tostring(cur.uid or "")
     local chapter_idx = tonumber(cur.idx) or 0
-    local selected = normalize(item.text)
-    if book_id == "" or book_id == "nil" or selected == "" then
+    local raw_selected = normalize(item.text)
+    if book_id == "" or book_id == "nil" or raw_selected == "" then
         return nil, "missing book or text"
     end
     if chapter_uid == "" or chapter_uid == "nil" then
         return nil, "missing chapter"
     end
 
-    local enc = normalize(read_plain(state.html_enc_path))
+    local notes = footnote_bodies(read_file(state.html_path))
+    local selected = scrub_selection(raw_selected, notes)
+    if selected == "" then
+        selected = raw_selected
+    end
+    if selected ~= raw_selected then
+        Log.dbg("bookmark", "scrub_selection", {
+            before = utf8_len(raw_selected),
+            after = utf8_len(selected),
+            notes = #notes,
+        })
+    end
+
+    -- Locate against chapter body only (skip title/chrome and footnote markers).
+    local enc = chapter_plain(state.html_enc_path, false)
+    if enc == "" then
+        enc = normalize(read_plain(state.html_enc_path))
+    end
     if enc == "" then
         return nil, "missing chapter text"
     end
-    local dec = enc
-    if Codec.has_map() then
-        local ok_dec, mapped = pcall(Codec.decode_text, enc)
-        if ok_dec and mapped and mapped ~= "" then
-            dec = normalize(mapped)
+    local dec = chapter_plain(state.html_enc_path, true)
+    if dec == "" then
+        dec = enc
+        if Codec.has_map() then
+            local ok_dec, mapped = pcall(Codec.decode_text, enc)
+            if ok_dec and mapped and mapped ~= "" then
+                dec = normalize(mapped)
+            end
         end
     end
 
     local hint = chapter_hint(state)
     local start0, end0 = find_range(dec, selected, hint)
+    if not start0 and selected ~= raw_selected then
+        start0, end0 = find_range(dec, raw_selected, hint)
+    end
     if not start0 then
         start0, end0 = find_range(enc, selected, hint)
+    end
+    if not start0 and selected ~= raw_selected then
+        start0, end0 = find_range(enc, raw_selected, hint)
+    end
+    if not start0 then
+        -- Last resort: displayed chapter (already decoded) after scrubbing footnotes.
+        local shown = chapter_plain(state.html_path, false)
+        start0, end0 = find_range(shown, selected, hint)
+        if start0 then
+            -- Map displayed offsets back through decoded enc by re-finding the
+            -- scrubbed needle; shown-only hits still use the enc needle range.
+            local mapped_start, mapped_end = find_range(dec, selected, start0)
+            if mapped_start then
+                start0, end0 = mapped_start, mapped_end
+            else
+                start0, end0 = nil, nil
+            end
+        end
     end
     if not start0 then
         return nil, "locate failed"

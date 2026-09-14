@@ -62,7 +62,10 @@ function Gate.close()
 end
 
 function Gate.current_state()
-    if not Net.is_online() then
+    -- UI gate: Wi‑Fi/link only. DNS readiness is handled at Http.request time
+    -- (res_init + NetworkMgr:isOnline), so we do not bounce to wifi_view on
+    -- transient resolver stalls after USBMS/resume.
+    if not Net.is_connected() and not Net.is_wifi_on() then
         return "wifi"
     end
     if not Session.has_auth() then

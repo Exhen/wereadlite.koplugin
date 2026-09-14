@@ -119,6 +119,11 @@ local function show_error(text)
     })
 end
 
+local function reader_param_from_reader_url(url)
+    url = tostring(url or "")
+    return url:match("[?&]v=([%w_%-]+)") or url:match("[?&]bc=([^&]+)")
+end
+
 local function merge_chapters(state)
     if not state then
         return
@@ -425,6 +430,30 @@ local function open_review_by_id(review_id)
     return true
 end
 
+local RESUME_DELAYS = { 0.35, 0.9, 1.6 }
+
+local function schedule_resume(resume, path, state)
+    if type(resume) ~= "table" then
+        return
+    end
+    local has_target = (tonumber(resume.percent) or 0) > 0
+        or (resume.anchor and resume.anchor ~= "")
+    if not has_target then
+        return
+    end
+    for attempt, delay in ipairs(RESUME_DELAYS) do
+        UIManager:scheduleIn(delay, function()
+            Reading.goto_resume(resume, path, state)
+            if attempt == 1 then
+                Log.dbg("reading", "resume_scheduled", {
+                    percent = resume.percent,
+                    anchor = resume.anchor,
+                })
+            end
+        end)
+    end
+end
+
 local function open_document(path, resume, state)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
@@ -432,11 +461,7 @@ local function open_document(path, resume, state)
     local function after_open()
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
-        if type(resume) == "table" then
-            UIManager:scheduleIn(0.35, function()
-                Reading.goto_resume(resume, path, state)
-            end)
-        end
+        schedule_resume(resume, path, state)
     end
     local ReaderUI = require("apps/reader/readerui")
     -- seamless=true hides KOReader's "Opening file ..." infomessage (same as legado.koplugin).
@@ -666,7 +691,8 @@ function Reading.open_book(book)
     if tostring(book.bookId or "") ~= "" and (not book.reader_param or book.reader_param == "") then
         local cached = BookDb.get(book.bookId)
         if type(cached) == "table" then
-            for key, value in pairs(cached) do
+            for _, key in ipairs({ "title", "author", "cover", "intro", "category", "reader_url" }) do
+                local value = cached[key]
                 if value ~= nil and value ~= "" and (book[key] == nil or book[key] == "") then
                     book[key] = value
                 end
@@ -674,9 +700,10 @@ function Reading.open_book(book)
         end
     end
     book = BookDetail.enrich_reader_param(BookDetail.resolve_owned(book))
+    local entry_param = reader_param_from_reader_url(book.reader_url) or book.reader_param
     local url
-    if book.reader_param and book.reader_param ~= "" then
-        url = Reader.url_for(book.reader_param)
+    if entry_param and entry_param ~= "" then
+        url = Reader.url_for(entry_param)
     elseif book.reader_url and book.reader_url ~= "" then
         url = book.reader_url
     else
@@ -689,6 +716,8 @@ function Reading.open_book(book)
     Reading.state = nil
     Reading.catalog_complete = false
     Heartbeat.stop(true)
+    Reader.cancel_prefetch()
+    Reader.clear_prefetched()
     Reader.cleanup_reading()
     UIManager:nextTick(function()
         local ok, status, err = Reading.open_url(url, book, { resume = true })
@@ -711,6 +740,12 @@ end
 function Reading.open_next()
     local url = Reader.next_url(Reading.state)
     if not url then
+        Log.warn("reading", "next_missing", {
+            book_id = Reading.state and Reading.state.book_id,
+            uid = current_uid(),
+            chapters = #(Reading.chapters or {}),
+        })
+        show_error("无法打开下一章")
         return false
     end
     UIManager:nextTick(function()

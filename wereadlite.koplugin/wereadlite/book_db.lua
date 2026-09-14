@@ -159,21 +159,6 @@ local function reader_param_from_reader_url(url)
     return url:match("[?&]v=([%w_%-]+)") or url:match("[?&]bc=([^&]+)")
 end
 
-local function reader_param_from_state(state)
-    if type(state) ~= "table" then
-        return nil
-    end
-    local param = state.cur and state.cur.param
-    if param and param ~= "" then
-        return param
-    end
-    param = state.cur_param and state.cur_param.param
-    if param and param ~= "" then
-        return param
-    end
-    return nil
-end
-
 local function merge_last_read(row, decoded)
     if type(decoded) ~= "table" then
         return row
@@ -191,9 +176,6 @@ function BookDb.save_last_read(book, extra)
     extra = extra or {}
     local info = type(extra.book_info) == "table" and extra.book_info or {}
     local reader_param = book.reader_param
-    if (not reader_param or reader_param == "") then
-        reader_param = reader_param_from_state(extra.state)
-    end
     if (not reader_param or reader_param == "") then
         reader_param = reader_param_from_reader_url(book.reader_url)
     end
@@ -267,6 +249,10 @@ function BookDb.get_last_read()
         }, Json.decode(as_text(row[7])))
         if (not result.reader_param or result.reader_param == "") then
             result.reader_param = reader_param_from_reader_url(result.reader_url)
+        end
+        local url_param = reader_param_from_reader_url(result.reader_url)
+        if url_param and url_param ~= "" then
+            result.reader_param = url_param
         end
         return result
     end)

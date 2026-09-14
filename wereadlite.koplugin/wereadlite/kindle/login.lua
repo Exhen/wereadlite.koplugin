@@ -147,7 +147,7 @@ local function save_qr(b64)
     return dest
 end
 
-function Login.fetch_qr(on_done, on_uid)
+function Login.fetch_qr(on_done)
     Login.cancel()
     local gen = Session.gen
     if not Http.available() then
@@ -176,9 +176,6 @@ function Login.fetch_qr(on_done, on_uid)
         end
         local cgi_key = Login.cgi_key()
         Log.info("login", "getuid", { ok = true })
-        if type(on_uid) == "function" then
-            on_uid(nil, { uid = uid, cgi_key = cgi_key })
-        end
         local confirm = CONFIRM_PREFIX .. uid
         local url = string.format(
             "%s?url=%s&platform=desktop",

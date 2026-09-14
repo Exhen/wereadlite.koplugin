@@ -820,6 +820,10 @@ function Reader.cancel_prefetch()
     end
 end
 
+function Reader.clear_prefetched()
+    Reader._prefetched = {}
+end
+
 -- WeRead encodes per-character offsets on <span wco="N">; API range matches those coords.
 -- Inject underlines in O(N + M): one index scan, mark spans, single table.concat emit.
 local UNDERLINE_LINK_OPEN = '<a class="wereadlite-highlight" style="color:inherit;-cr-hint:presentational-hint;text-decoration:none;border-bottom:1px dashed currentColor" href="wereadlite://review/'
@@ -834,22 +838,67 @@ local function build_wco_index(html)
         if not span_start then
             break
         end
-        local gt = html:find(">", span_start, true)
-        if not gt then
-            break
-        end
-        local wco = tonumber(html:sub(span_start, gt):match('wco%s*=%s*"(%d+)"'))
-        if wco then
-            local close_lt = html:find("</span>", gt + 1, true)
-            if close_lt and close_lt > gt then
-                doc[#doc + 1] = {
-                    wco = wco,
-                    open_gt = gt,
-                    close_lt = close_lt,
-                }
+        local open_end = span_start + 5
+        local next_ch = html:sub(open_end, open_end)
+        -- Only real <span ...> tags, not <spanish> / <spanfoo>.
+        if next_ch ~= ">" and next_ch ~= "/" and not next_ch:match("%s") then
+            p = open_end
+        else
+            local gt = html:find(">", span_start, true)
+            if not gt then
+                break
             end
+            local open = html:sub(span_start + 1, gt - 1)
+            local self_closing = open:match("/%s*$") ~= nil
+            local wco = tonumber(open:match('wco%s*=%s*"(%d+)"'))
+            local close_lt
+            if self_closing then
+                close_lt = nil
+            else
+                -- Match the corresponding </span>, not the first nested closer.
+                local depth, q = 1, gt + 1
+                while q <= n and depth > 0 do
+                    local next_open = html:find("<span", q, true)
+                    local next_close = html:find("</span>", q, true)
+                    if not next_close then
+                        break
+                    end
+                    if next_open and next_open < next_close then
+                        local oe = next_open + 5
+                        local ch = html:sub(oe, oe)
+                        if ch == ">" or ch == "/" or ch:match("%s") then
+                            local ogt = html:find(">", next_open, true) or next_open
+                            local o = html:sub(next_open + 1, ogt - 1)
+                            if not o:match("/%s*$") then
+                                depth = depth + 1
+                            end
+                            q = ogt + 1
+                        else
+                            q = oe
+                        end
+                    else
+                        depth = depth - 1
+                        if depth == 0 then
+                            close_lt = next_close
+                        end
+                        q = next_close + 7
+                    end
+                end
+            end
+            if wco and close_lt and close_lt > gt then
+                local inner = html:sub(gt + 1, close_lt - 1)
+                -- Parent spans (e.g. class="bold") wrap per-char children. Indexing
+                -- them makes emit_wco_underlines output the first child twice.
+                if not inner:find("<", 1, true) then
+                    doc[#doc + 1] = {
+                        wco = wco,
+                        open_gt = gt,
+                        close_lt = close_lt,
+                    }
+                end
+            end
+            p = gt + 1
         end
-        p = gt + 1
     end
     local by_wco = {}
     for i = 1, #doc do
@@ -999,9 +1048,17 @@ end
 
 local FETCH_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
-local function load_background_mode(opts)
+local function load_background_mode(opts, on_ready)
     opts = type(opts) == "table" and opts or {}
-    return opts.background == true or opts.prefetch == true
+    if opts.background == false then
+        return false
+    end
+    if opts.background == true or opts.prefetch == true then
+        return true
+    end
+    -- Default to async when a completion callback exists so Kobo never blocks
+    -- the UI thread on LuaSocket/SSL (wantread / DNS stalls).
+    return type(on_ready) == "function"
 end
 
 local function validate_fetch_body(body)
@@ -1086,8 +1143,9 @@ local function fetch_async(url, job, callback)
         timeout = 30,
         accept = FETCH_ACCEPT,
         referer = Config.READER_URL,
+        user_agent = Config.KINDLE_UA,
         send_cookie = true,
-        absorb_cookies = true,
+        absorb_cookies = false,
     }, function(res)
         job.active_http = nil
         UIManager:nextTick(function()
@@ -1577,7 +1635,7 @@ end
 
 function Reader.load(url, book, on_progress, on_ready, opts)
     opts = type(opts) == "table" and opts or {}
-    if load_background_mode(opts) and type(on_ready) == "function" then
+    if load_background_mode(opts, on_ready) then
         return load_background(url, book, on_progress, on_ready, opts)
     end
 

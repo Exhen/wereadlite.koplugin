@@ -88,6 +88,17 @@ local function fetch_apikey(only_show)
     return data
 end
 
+local apikey_waiters = {}
+local apikey_fetching = false
+
+local function notify_apikey_waiters(key, status, err)
+    local waiters = apikey_waiters
+    apikey_waiters = {}
+    for i = 1, #waiters do
+        waiters[i](key, status, err)
+    end
+end
+
 local function fetch_apikey_async(only_show, callback)
     callback = type(callback) == "function" and callback or function() end
     local url = Config.SKILL_APIKEY_URL
@@ -100,7 +111,7 @@ local function fetch_apikey_async(only_show, callback)
         url = url,
         method = "GET",
         send_cookie = true,
-        absorb_cookies = true,
+        absorb_cookies = false,
         accept = "application/json, */*",
         user_agent = Config.WEB_UA,
         referer = Config.SKILL_PAGE,
@@ -194,33 +205,48 @@ function Skill.ensure_key_async(callback, force)
             return
         end
     end
+    if apikey_fetching then
+        apikey_waiters[#apikey_waiters + 1] = callback
+        return
+    end
+    apikey_fetching = true
     fetch_apikey_async(true, function(data, status, err)
         if not data then
             Log.warn("skill", "apikey_show", { status = status })
+            apikey_fetching = false
             callback(nil, status, err)
+            notify_apikey_waiters(nil, status, err)
             return
         end
         local key = key_from(data)
         if key then
             Settings.set_skill_apikey(key)
             Log.info("skill", "apikey_ready", { len = #key })
+            apikey_fetching = false
             callback(key, "ok")
+            notify_apikey_waiters(key, "ok")
             return
         end
         fetch_apikey_async(false, function(created, cstatus, cerr)
             if not created then
                 Log.warn("skill", "apikey_create", { status = cstatus })
+                apikey_fetching = false
                 callback(nil, cstatus, cerr)
+                notify_apikey_waiters(nil, cstatus, cerr)
                 return
             end
             key = key_from(created)
             if not key then
+                apikey_fetching = false
                 callback(nil, "http_error", "未能获取 Skill API Key")
+                notify_apikey_waiters(nil, "http_error", "未能获取 Skill API Key")
                 return
             end
             Settings.set_skill_apikey(key)
             Log.info("skill", "apikey_ready", { len = #key })
+            apikey_fetching = false
             callback(key, "ok")
+            notify_apikey_waiters(key, "ok")
         end)
     end)
 end

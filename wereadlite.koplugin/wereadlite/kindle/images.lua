@@ -283,6 +283,7 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
                 timeout = tonumber(opts.timeout) or 6,
                 accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 referer = Config.READER_URL or Config.ORIGIN,
+                user_agent = Config.KINDLE_UA,
                 send_cookie = false,
                 absorb_cookies = false,
             }, function(res)

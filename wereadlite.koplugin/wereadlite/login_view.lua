@@ -262,16 +262,6 @@ function LoginView:_start()
             self._wait_started = true
             self:_begin_wait(gen)
         end
-    end, function(err, early)
-        if self._closed or gen ~= self._gen or err or not early then
-            return
-        end
-        self._uid = early.uid
-        self._cgi_key = early.cgi_key
-        if not self._wait_started then
-            self._wait_started = true
-            self:_begin_wait(gen)
-        end
     end)
 end
 

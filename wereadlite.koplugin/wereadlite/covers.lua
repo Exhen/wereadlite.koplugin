@@ -145,6 +145,7 @@ function Covers.download_async(url, dest_stem, referer, callback, timeout)
         url = url,
         accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         referer = referer or Config.SHELF_URL,
+        user_agent = Config.KINDLE_UA,
         timeout = tonumber(timeout) or 30,
         absorb_cookies = false,
     }, function(res)

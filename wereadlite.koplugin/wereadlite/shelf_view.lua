@@ -794,7 +794,7 @@ function ShelfView:_last_book()
     end
     for _, book in ipairs(Shelf.books or {}) do
         if tostring(book.bookId or "") == tostring(last.bookId) then
-            if not last.reader_param or last.reader_param == "" then
+            if book.reader_param and book.reader_param ~= "" then
                 last.reader_param = book.reader_param
             end
             if not last.reader_url or last.reader_url == "" then
