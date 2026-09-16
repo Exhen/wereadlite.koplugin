@@ -474,6 +474,20 @@ local function finish_subprocess(job, res)
         release_worker(job)
         return
     end
+    if job.backend == "task" then
+        job.done = true
+        active_jobs[job] = nil
+        release_worker(job)
+        if job.callback then
+            local ok = type(res) == "table" and res.ok
+            local payload = type(res) == "table" and res.result or res
+            if ok == nil then
+                ok = res ~= nil
+            end
+            job.callback(ok ~= false, payload)
+        end
+        return
+    end
     local attempt = tonumber(job.attempt) or 1
     local max_retries = tonumber(job.opts and job.opts.connect_retries) or Http.CONNECT_RETRIES
     if is_transient(res) and attempt <= max_retries then
@@ -617,17 +631,22 @@ start_subprocess_job = function(job)
     end
 
     local pid, parent_read_fd = util.runInSubProcess(function(_, child_write_fd)
-        -- fork copies parent's glibc _res; always reload in the child (PR #15244).
-        -- Hostname resolve uses UDP DNS bypass inside Client (getaddrinfo is broken
-        -- on many Kobos even when resolv.conf lists a nameserver).
+        -- fork copies parent's glibc _res; reload resolv.conf in the child
+        -- (official KOReader workaround, PR #15244 / #6424).
         pcall(function()
             local child_net = require("wereadlite.net")
             child_net.invalidate()
             child_net.ensure_nameserver_fallback()
             child_net.res_init(true)
         end)
-        local res = socket_request(opts)
-        local ok, str = pcall(buf.encode, table.pack(res))
+        local packed
+        if type(opts.task_fn) == "function" then
+            local ok, result = pcall(opts.task_fn)
+            packed = { ok = ok, result = result }
+        else
+            packed = socket_request(opts)
+        end
+        local ok, str = pcall(buf.encode, table.pack(packed))
         if ok and str then
             util.writeToFD(child_write_fd, str, true)
         else
@@ -968,6 +987,36 @@ function Http.cancel_all()
     return #jobs
 end
 
+--- Best-effort: kill leftover curl shells under our http cache (Kindle suspend).
+function Http.kill_orphans()
+    local dir = Paths.http_dir()
+    if not dir or dir == "" then
+        return 0
+    end
+    local killed = 0
+    local lfs_ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if lfs_ok and lfs then
+        local ok, iter = pcall(lfs.dir, dir)
+        if ok and iter then
+            for name in iter do
+                if name ~= "." and name ~= ".." then
+                    local pid_path = dir .. "/" .. name .. "/pid"
+                    local pid = tonumber((read_file(pid_path) or ""):match("%d+"))
+                    if pid then
+                        os.execute("pkill -9 -P " .. tostring(pid) .. " >/dev/null 2>&1")
+                        os.execute("kill -9 " .. tostring(pid) .. " >/dev/null 2>&1")
+                        killed = killed + 1
+                    end
+                end
+            end
+        end
+    end
+    -- Fallback pattern match (BusyBox pkill on Kindle).
+    os.execute("pkill -9 -f wereadlite.koplugin/.*/cache/http/ >/dev/null 2>&1")
+    os.execute("pkill -9 -f wereadlite.koplugin/cache/http/ >/dev/null 2>&1")
+    return killed
+end
+
 function Http.active_count()
     local count = 0
     for _ in pairs(active_jobs) do
@@ -991,13 +1040,25 @@ function Http.request(opts, callback)
         cancelled = false,
         done = false,
         child = nil,
+        wait_since = os.time(),
     }
     active_jobs[pending] = true
     Log.info("http", "wait_connected", { url = opts.url, method = pending.method })
+    local function finish_pending(res)
+        if pending.cancelled or pending.done then
+            return
+        end
+        pending.done = true
+        active_jobs[pending] = nil
+        if callback then
+            callback(res or fail_res("network wait timeout", "offline"))
+        end
+    end
     Net.when_online(function()
         if pending.cancelled or pending.done then
             return
         end
+        pending.dispatched = true
         active_jobs[pending] = nil
         local child = dispatch(opts, function(res)
             pending.done = true
@@ -1008,10 +1069,85 @@ function Http.request(opts, callback)
         end)
         pending.child = child
         if not child then
-            pending.done = true
+            finish_pending(fail_res("request_not_started", "offline"))
         end
     end)
+    -- Hard cap: never leave shelf stuck on “loading” if Wi‑Fi callbacks were dropped.
+    local wait_cap = math.max(45, (Net.WAIT_TRIES or 35) * (Net.WAIT_POLL or 2) + 5)
+    UIManager:scheduleIn(wait_cap, function()
+        if pending.cancelled or pending.done or pending.dispatched then
+            return
+        end
+        Log.warn("http", "wait_connected_timeout", { url = opts.url, seconds = wait_cap })
+        pending.cancelled = true
+        finish_pending(fail_res("network wait timeout", "offline"))
+    end)
     return pending
+end
+
+--- Run an arbitrary function in a Trapper-style subprocess (Kobo / no-curl).
+-- callback(ok, result) — result is task_fn's return value, or the error string.
+-- Used for official httpasync.fetch_many batches without freezing the UI.
+function Http.run_task(task_fn, callback, opts)
+    opts = opts or {}
+    callback = type(callback) == "function" and callback or function() end
+    if type(task_fn) ~= "function" then
+        UIManager:nextTick(function()
+            callback(false, "bad task")
+        end)
+        return nil
+    end
+    if not get_ffiutil() or not get_buffer() then
+        -- No fork (e.g. some desktop builds): run on next tick.
+        Log.info("http", "task_inline", { label = opts.label or "task" })
+        UIManager:nextTick(function()
+            local ok, result = pcall(task_fn)
+            callback(ok, result)
+        end)
+        return nil
+    end
+    local timeout = math.max(30, tonumber(opts.timeout) or 120)
+    local job = {
+        url = opts.label or "task",
+        method = "TASK",
+        backend = "task",
+        callback = callback,
+        opts = {
+            task_fn = task_fn,
+            timeout = timeout,
+        },
+        timeout = timeout,
+        deadline = os.time() + timeout + 20,
+        attempt = 1,
+        cancelled = false,
+        done = false,
+    }
+    active_jobs[job] = true
+    local function launch()
+        if job.cancelled or job.done then
+            return
+        end
+        if workers_running >= Http.MAX_WORKERS then
+            job.queued = true
+            job_queue[#job_queue + 1] = job
+            Log.info("http", "task_queued", { label = job.url, queue = #job_queue })
+            return job
+        end
+        workers_running = workers_running + 1
+        Log.info("http", "task_launch", { label = job.url })
+        start_subprocess_job(job)
+        return job
+    end
+    if opts.skip_online_check or Net.prepare_for_request() then
+        return launch()
+    end
+    Log.info("http", "task_wait_connected", { label = job.url })
+    Net.when_online(function()
+        if not job.cancelled and not job.done then
+            launch()
+        end
+    end)
+    return job
 end
 
 function Http.request_sync(opts)

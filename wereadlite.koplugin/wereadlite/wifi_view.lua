@@ -8,7 +8,7 @@ function WifiView.new(opts)
     opts = opts or {}
     return Panel:new{
         title = Config.NAME,
-        body = "未连接到网络。\n请先设置 Wi-Fi，连接成功后会自动继续。",
+        body = "未连接到网络。\n请先打开 Wi-Fi 并连接，成功后会自动继续。\n若仍失败，请先退出到系统（Nickel）连一次 Wi-Fi。",
         buttons = {
             {
                 text = "Wi-Fi 设置",

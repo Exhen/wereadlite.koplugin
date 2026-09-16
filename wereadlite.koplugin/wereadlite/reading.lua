@@ -458,17 +458,30 @@ local function open_document(path, resume, state)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
     Reader.clear_sidecars(path)
+    -- switchDocument closes the current doc first; our onClose hook must not
+    -- delete the target file when reopening/replacing a WeRead chapter.
+    Reading._preserve_html = path
     local function after_open()
+        Reading._preserve_html = nil
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
         schedule_resume(resume, path, state)
     end
     local ReaderUI = require("apps/reader/readerui")
     -- seamless=true hides KOReader's "Opening file ..." infomessage (same as legado.koplugin).
+    local ok_switch, switch_err = true, nil
     if ReaderUI.instance and ReaderUI.instance.switchDocument then
-        ReaderUI.instance:switchDocument(path, true, after_open)
+        ok_switch, switch_err = pcall(function()
+            ReaderUI.instance:switchDocument(path, true, after_open)
+        end)
     else
-        ReaderUI:showReader(path, nil, true, nil, after_open)
+        ok_switch, switch_err = pcall(function()
+            ReaderUI:showReader(path, nil, true, nil, after_open)
+        end)
+    end
+    if not ok_switch then
+        Reading._preserve_html = nil
+        error(switch_err)
     end
 end
 
@@ -527,13 +540,21 @@ function Reading.open_url(url, book, opts)
     opts = opts or {}
     url = tostring(url or "")
     Reading.cancel_load()
+    if opts.continue_sections then
+        Reading._continuing_sections = true
+    end
     Reading.cancel_prefetch_schedule()
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
     local bar
-    if Settings.show_chapter_load_progress() then
-        local ok_bar, opened = pcall(LoadProgress.open)
+    -- Always show the load dialog so the user can force-cancel large chapters.
+    do
+        local ok_bar, opened = pcall(LoadProgress.open, {
+            on_cancel = function()
+                Reading.cancel_load()
+            end,
+        })
         if not ok_bar then
             Log.warn("reading", "progress_ui", { err = opened })
             bar = nil
@@ -543,8 +564,18 @@ function Reading.open_url(url, book, opts)
     end
     Reading._load_bar = bar
     local function report(stage, done, total)
-        if bar then
+        if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
+        elseif bar and not Settings.show_chapter_load_progress() then
+            -- Minimal mode: keep a static "正在加载" title with cancel only.
+            if not bar._minimal_set then
+                bar._minimal_set = true
+                pcall(function()
+                    bar.title_widget:setText("正在加载…")
+                    bar.subtitle_widget:setText(" ")
+                    bar:paint()
+                end)
+            end
         end
     end
     local function close_bar()
@@ -558,15 +589,22 @@ function Reading.open_url(url, book, opts)
     end
 
     local function complete(state, status, err)
+        Reading._continuing_sections = false
         if my_generation ~= Reading._load_generation then
             if state and state.html_path then
                 Reader.remove_chapter(state.html_path)
             end
+            close_bar()
             return
         end
         Reading._load_task = nil
         close_bar()
         if not state then
+            -- User cancelled: do not toast a failure.
+            if status == "cancelled" or tostring(err or ""):find("cancel", 1, true) then
+                Log.info("reading", "open_cancelled")
+                return
+            end
             Log.warn("reading", "open_async", { status = status, err = err })
             show_error(status == "offline" and "网络不可用" or "打开章节失败")
             return
@@ -654,7 +692,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
-    local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete)
+    local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
         return nil, "http_error", state
@@ -673,6 +711,7 @@ end
 
 function Reading.cancel_load()
     Reading._load_generation = (Reading._load_generation or 0) + 1
+    Reading._continuing_sections = false
     local task = Reading._load_task
     Reading._load_task = nil
     if task and type(task.cancel) == "function" then
@@ -683,6 +722,7 @@ function Reading.cancel_load()
     if bar then
         pcall(bar.close, bar)
     end
+    Log.info("reading", "load_cancelled")
 end
 
 function Reading.open_book(book)
@@ -715,7 +755,7 @@ function Reading.open_book(book)
     Reading.chapters = {}
     Reading.state = nil
     Reading.catalog_complete = false
-    Heartbeat.stop(true)
+    Heartbeat.stop(false)
     Reader.cancel_prefetch()
     Reader.clear_prefetched()
     Reader.cleanup_reading()
@@ -771,7 +811,7 @@ function Reading.show_wechat_shelf()
     end
     Reading._returning = true
     Reading.cancel_load()
-    Heartbeat.stop(true)
+    Heartbeat.stop(false)
     Reader.cleanup_reading()
     local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
     if ok_fm and FileManager then
@@ -796,6 +836,77 @@ function Reading.show_wechat_shelf()
     Reading._returning = false
 end
 
+function Reading.show_toc()
+    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+    local ui = ok and ReaderUI and ReaderUI.instance
+    if not ui then
+        show_error("目录不可用")
+        return false
+    end
+    local Event = require("ui/event")
+    local handled = false
+    pcall(function()
+        handled = ui:handleEvent(Event:new("ShowToc"))
+    end)
+    if not handled and ui.toc and type(ui.toc.onShowToc) == "function" then
+        pcall(function()
+            ui.toc:onShowToc()
+        end)
+    end
+    return true
+end
+
+-- Load the next segment window of the current (oversized) chapter.
+function Reading.continue_sections()
+    local state = Reading.state
+    local url, segment_start = Reader.continue_sections_request(state)
+    if not url then
+        return false
+    end
+    if Reading._continuing_sections or Reading._load_task then
+        return true
+    end
+    Reading._continuing_sections = true
+    local count = tonumber(state.section_count) or 0
+    local end_sect = tonumber(state.section_end) or 0
+    local max_n = Settings.max_segments_per_load()
+    UIManager:show(InfoMessage:new{
+        text = string.format(
+            "正在加载后续内容（%d–%d / %d）…",
+            end_sect + 2,
+            math.min(count, end_sect + 1 + max_n),
+            count
+        ),
+        timeout = 2,
+    })
+    Log.info("reading", "continue_sections", {
+        url = url,
+        segment_start = segment_start,
+        section_end = end_sect,
+        section_count = count,
+    })
+    UIManager:nextTick(function()
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            segment_start = segment_start,
+            continue_sections = true,
+        })
+        if not ok then
+            Reading._continuing_sections = false
+            Log.warn("reading", "continue_sections_fail", { status = status, err = err })
+            if status == "auth_expired" then
+                show_error("登录已过期，请重新登录")
+            elseif status == "offline" then
+                show_error("网络不可用")
+            else
+                show_error("加载后续内容失败")
+            end
+        end
+        -- Flag cleared in open_url complete/cancel when load finishes.
+    end)
+    return true
+end
+
 function Reading.return_to_shelf()
     local ReaderUI = require("apps/reader/readerui")
     local reader = ReaderUI.instance
@@ -814,6 +925,17 @@ function Reading.handle_end_of_book(status_widget)
     if not Reading.is_ours(file) then
         return false
     end
+
+    -- Oversized chapter: HTML end is only the current segment window.
+    if Reader.has_more_sections(Reading.state) then
+        Log.info("reading", "end_of_window", {
+            section_end = Reading.state and Reading.state.section_end,
+            section_count = Reading.state and Reading.state.section_count,
+        })
+        Reading.continue_sections()
+        return true
+    end
+
     local dialog
     if Reading.is_last() then
         dialog = ButtonDialog:new{
@@ -822,6 +944,13 @@ function Reading.handle_end_of_book(status_widget)
             title_align = "center",
             buttons = {
                 {
+                    {
+                        text = "打开目录",
+                        callback = function()
+                            UIManager:close(dialog)
+                            Reading.show_toc()
+                        end,
+                    },
                     {
                         text = "返回书架",
                         callback = function()
@@ -841,6 +970,13 @@ function Reading.handle_end_of_book(status_widget)
         title_align = "center",
         buttons = {
             {
+                {
+                    text = "打开目录",
+                    callback = function()
+                        UIManager:close(dialog)
+                        Reading.show_toc()
+                    end,
+                },
                 {
                     text = "下一章",
                     callback = function()
@@ -896,7 +1032,7 @@ end
 
 function Reading.cleanup_temp()
     Reading.cancel_load()
-    Heartbeat.stop(true)
+    Heartbeat.stop(false)
     Reader.cleanup_reading()
 end
 
@@ -945,7 +1081,7 @@ local function install_close_hook()
         local file = self.document and self.document.file
         local ours = Reading.is_ours(file)
         if ours then
-            Heartbeat.stop(true)
+            Heartbeat.stop(false)
         end
         local result
         if original then
@@ -953,7 +1089,12 @@ local function install_close_hook()
         end
         if ours then
             Reading.remove_from_history(file)
-            Reader.remove_chapter(file)
+            local preserve = tostring(Reading._preserve_html or "")
+            if preserve ~= "" and tostring(file or "") == preserve then
+                Log.dbg("reading", "close_preserve_html", { file = file })
+            else
+                Reader.remove_chapter(file)
+            end
         end
         return result
     end

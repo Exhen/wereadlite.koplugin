@@ -110,6 +110,7 @@ function Gate.refresh()
     else
         local Shelf = require("wereadlite.kindle.shelf")
         local ShelfView = require("wereadlite.shelf_view")
+        Shelf.cancel_session_refresh()
         Shelf.reset()
         Gate.widget = ShelfView:new{
             on_close = opts.on_close,
@@ -141,9 +142,17 @@ function Gate.open()
 end
 
 function Gate.on_network_changed()
-    if Gate.is_open() then
-        Gate.refresh()
+    if not Gate.is_open() then
+        return
     end
+    local state = Gate.current_state()
+    if Gate.widget and Gate.state == "app" and state == "app" then
+        if type(Gate.widget.retry_load) == "function" then
+            Gate.widget:retry_load()
+        end
+        return
+    end
+    Gate.refresh()
 end
 
 return Gate

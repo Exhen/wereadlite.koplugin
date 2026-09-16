@@ -1,91 +1,26 @@
+--[[--
+Blocking HTTP client for wereadlite.
+
+Official KOReader pattern (newsdownloader / assistant / #5002):
+  socket.http / ssl.https + socketutil:set_timeout + socket.skip(1, request(...))
+
+On Kobo (no curl), callers run this inside async_http's subprocess
+(Trapper-style ffiUtil.runInSubProcess).
+]]
+
 local ltn12 = require("ltn12")
+local socket = require("socket")
 local Config = require("wereadlite.config")
 local CookieStore = require("wereadlite.cookie_store")
 local Http = require("wereadlite.async_http")
 local Log = require("wereadlite.log")
-local Net = require("wereadlite.net")
 
 local Client = {}
 
 local ok_http, http = pcall(require, "socket.http")
 local ok_https, https = pcall(require, "ssl.https")
-local ok_ssl, ssl = pcall(require, "ssl")
-local ok_sock, socket = pcall(require, "socket")
 
 local MAX_REDIRECTS = 5
-
-local function tcp_create(seconds)
-    if not ok_sock or not socket or type(socket.tcp) ~= "function" then
-        return nil
-    end
-    return function()
-        local sock = socket.tcp()
-        if sock and sock.settimeout then
-            sock:settimeout(seconds)
-        end
-        return sock
-    end
-end
-
---- HTTPS connector that dials a numeric IP but sends SNI/Host for `hostname`.
--- Bypasses broken getaddrinfo on Kobo (EAI_NONAME in ~5ms despite resolv.conf).
--- Uses socket.http's `create` (ssl.https forbids it); mirrors LuaSec https.lua tcp().
-local function https_create(hostname, connect_ip, seconds)
-    if not ok_sock or not ok_ssl or not socket or not ssl then
-        return nil
-    end
-    if type(ssl.wrap) ~= "function" then
-        return nil
-    end
-    seconds = tonumber(seconds) or 25
-    return function()
-        local conn = {}
-        conn.sock = socket.tcp()
-        local settimeout = conn.sock.settimeout
-        function conn:settimeout(...)
-            return settimeout(self.sock, ...)
-        end
-        function conn:connect(host, port)
-            local target = connect_ip or host
-            local ok, err = self.sock:connect(target, port)
-            if not ok then
-                return nil, err
-            end
-            local wrapped
-            wrapped, err = ssl.wrap(self.sock, {
-                mode = "client",
-                protocol = "any",
-                verify = "none",
-                options = { "all", "no_sslv2", "no_sslv3", "no_tlsv1" },
-            })
-            if not wrapped then
-                return nil, err or "ssl wrap failed"
-            end
-            self.sock = wrapped
-            if self.sock.sni then
-                pcall(self.sock.sni, self.sock, hostname or host)
-            end
-            self.sock:settimeout(seconds)
-            ok, err = self.sock:dohandshake()
-            if not ok then
-                return nil, err or "ssl handshake failed"
-            end
-            local mt = getmetatable(self.sock)
-            local index = mt and mt.__index
-            if type(index) == "table" then
-                for name, method in pairs(index) do
-                    if type(method) == "function" then
-                        conn[name] = function(self, ...)
-                            return method(self.sock, ...)
-                        end
-                    end
-                end
-            end
-            return 1
-        end
-        return conn
-    end
-end
 
 local function headers_from_raw(raw)
     local headers = {}
@@ -101,39 +36,28 @@ end
 
 local function apply_timeout(seconds)
     seconds = tonumber(seconds) or 15
-    local old = {}
-    if ok_http and http then
-        old.http = http.TIMEOUT
-        old.http_set = true
-        http.TIMEOUT = seconds
-    end
-    if ok_https and https then
-        old.https = https.TIMEOUT
-        old.https_set = true
-        https.TIMEOUT = seconds
-    end
-    if ok_sock and socket then
-        old.socket = socket.TIMEOUT
-        old.socket_set = true
-        socket.TIMEOUT = seconds
-    end
     local ok_su, socketutil = pcall(require, "socketutil")
     if ok_su and socketutil and type(socketutil.set_timeout) == "function" then
         pcall(socketutil.set_timeout, socketutil, seconds, seconds + 20)
-        old.socketutil = socketutil
+        return function()
+            pcall(socketutil.reset_timeout, socketutil)
+        end
+    end
+    local old_http, old_https
+    if ok_http and http then
+        old_http = http.TIMEOUT
+        http.TIMEOUT = seconds
+    end
+    if ok_https and https then
+        old_https = https.TIMEOUT
+        https.TIMEOUT = seconds
     end
     return function()
-        if old.http_set then
-            http.TIMEOUT = old.http
+        if old_http ~= nil then
+            http.TIMEOUT = old_http
         end
-        if old.https_set then
-            https.TIMEOUT = old.https
-        end
-        if old.socket_set then
-            socket.TIMEOUT = old.socket
-        end
-        if old.socketutil then
-            pcall(old.socketutil.reset_timeout, old.socketutil)
+        if old_https ~= nil then
+            https.TIMEOUT = old_https
         end
     end
 end
@@ -179,8 +103,7 @@ end
 
 local function classify(code, err)
     code = tonumber(code) or 0
-    local text = tostring(err or "")
-    local lower = text:lower()
+    local lower = tostring(err or ""):lower()
     if code == 401 or code == 403 then
         return "auth_expired"
     end
@@ -196,31 +119,25 @@ local function classify(code, err)
         or lower:find("network is unreachable", 1, true)
         or lower:find("host or service not provided", 1, true)
         or lower:find("name or service not known", 1, true)
-        or lower:find("nodename nor servname", 1, true)
-        or lower:find("temporary failure in name resolution", 1, true)
-        or lower:find("dns", 1, true) then
+        or lower:find("temporary failure in name resolution", 1, true) then
         return "offline"
     end
     return "http_error"
 end
 
-local function url_host(url)
-    return tostring(url or ""):match("^https?://([^/:]+)")
+local function transport_for(url)
+    if tostring(url):match("^https://") then
+        return ok_https and https
+    end
+    return ok_http and http
 end
 
-local function resolve_for_url(url, opts)
-    local host = url_host(url)
-    if not host then
-        return nil, nil
+local function table_sink(chunks)
+    local ok_su, socketutil = pcall(require, "socketutil")
+    if ok_su and socketutil and type(socketutil.table_sink) == "function" then
+        return socketutil.table_sink(chunks)
     end
-    if host:match("^%d+%.%d+%.%d+%.%d+$") then
-        return host, host
-    end
-    if opts and opts.connect_ip and opts.connect_host == host then
-        return host, opts.connect_ip
-    end
-    local ip = Net.resolve(host)
-    return host, ip
+    return ltn12.sink.table(chunks)
 end
 
 function Client.request(opts)
@@ -267,62 +184,14 @@ function Client.request(opts)
             })
             return nil, result, res.err or text, code, response_headers
         end
-        Log.dbg("http", "done", {
-            method = method,
-            url = url,
-            code = code,
-            result = "ok",
-            bytes = #text,
-            elapsed_ms = math.floor(elapsed + 0.5),
-        })
         return text, "ok", nil, code, response_headers
     end
 
     for hop = 0, MAX_REDIRECTS do
-        local is_https = tostring(url):match("^https://") ~= nil
-        local hostname, connect_ip
-        if is_https then
-            hostname, connect_ip = resolve_for_url(url, opts)
-            if not connect_ip then
-                last_err = "dns resolve failed"
-                Log.warn("http", "failed", {
-                    method = method,
-                    url = url,
-                    err = last_err,
-                    elapsed_ms = 0,
-                })
-                return nil, "offline", last_err
-            end
-            Log.info("http", "connect_ip", {
-                host = hostname,
-                ip = connect_ip,
-                hop = hop,
-            })
-        end
-
-        local client
-        local create
-        if is_https then
-            -- Prefer socket.http + custom TLS create (IP dial + SNI).
-            if not ok_http or not http or type(http.request) ~= "function" then
-                Log.warn("http", "no_client", { url = url })
-                return nil, "offline", "http client unavailable"
-            end
-            client = http
-            create = https_create(hostname, connect_ip, timeout)
-            if not create then
-                Log.warn("http", "no_tls_create", { url = url })
-                return nil, "offline", "https create unavailable"
-            end
-        else
-            client = ok_http and http or nil
-            create = tcp_create(timeout)
-        end
+        local client = transport_for(url)
         if not client or type(client.request) ~= "function" then
-            Log.warn("http", "no_client", { url = url })
             return nil, "offline", "http client unavailable"
         end
-
         local headers = {
             ["User-Agent"] = opts.user_agent or Config.KINDLE_UA,
             ["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8",
@@ -331,9 +200,6 @@ function Client.request(opts)
             Referer = opts.referer or Config.SHELF_URL,
             Accept = opts.accept or "*/*",
         }
-        if hostname then
-            headers.Host = hostname
-        end
         if opts.send_cookie ~= false then
             headers.Cookie = CookieStore.header()
         end
@@ -351,29 +217,28 @@ function Client.request(opts)
             headers["Content-Length"] = tostring(#body)
             headers["Content-Type"] = headers["Content-Type"] or "application/json;charset=UTF-8"
         end
+
         local chunks = {}
         local started = Log.now_ms()
-        if Log.is_verbose() then
-            Log.http_request(method, url, headers, body, { timeout = timeout, hop = hop })
-        end
         local reset = apply_timeout(timeout)
-        local req = {
+        local request = {
             url = url,
             method = method,
             headers = headers,
             source = body and ltn12.source.string(body) or nil,
-            sink = ltn12.sink.table(chunks),
-            timeout = timeout,
+            sink = table_sink(chunks),
         }
-        if create then
-            req.create = create
-        end
-        local called, res, code, response_headers, status = pcall(client.request, req)
+
+        -- newsdownloader pattern: code, headers, status = socket.skip(1, http.request(...))
+        local ok_call, code, response_headers, status = pcall(function()
+            return socket.skip(1, client.request(request))
+        end)
         reset()
         local text = table.concat(chunks)
         local elapsed = Log.now_ms() - started
-        if not called then
-            last_err = tostring(res)
+
+        if not ok_call then
+            last_err = tostring(code)
             Log.warn("http", "threw", {
                 method = method,
                 url = url,
@@ -382,8 +247,25 @@ function Client.request(opts)
             })
             return nil, "offline", last_err
         end
-        if not res then
-            last_err = tostring(code or status or "request failed")
+
+        -- Timeout sentinels from socketutil
+        local ok_su, socketutil = pcall(require, "socketutil")
+        if ok_su and socketutil then
+            if code == socketutil.TIMEOUT_CODE
+                or code == socketutil.SSL_HANDSHAKE_CODE
+                or code == socketutil.SINK_TIMEOUT_CODE then
+                Log.warn("http", "failed", {
+                    method = method,
+                    url = url,
+                    err = tostring(status or code),
+                    elapsed_ms = math.floor(elapsed + 0.5),
+                })
+                return nil, "offline", tostring(status or code)
+            end
+        end
+
+        if code == nil and response_headers == nil then
+            last_err = tostring(status or "network unreachable")
             Log.warn("http", "failed", {
                 method = method,
                 url = url,
@@ -392,57 +274,34 @@ function Client.request(opts)
             })
             return nil, classify(0, last_err), last_err
         end
+
         code = tonumber(code)
         if opts.absorb_cookies ~= false then
             absorb_cookies(response_headers)
         end
         local location = header_get(response_headers, "location")
         local result = classify(code, status)
-        if Log.is_verbose() then
-            Log.http_response(method, url, code, status, response_headers, text, {
-                result = result,
-                elapsed_ms = elapsed,
-            })
-        else
-            Log.dbg("http", "done", {
-                method = method,
-                url = url,
-                code = code,
-                result = result,
-                bytes = #text,
-                elapsed_ms = math.floor(elapsed + 0.5),
-            })
-        end
+        Log.dbg("http", "done", {
+            method = method,
+            url = url,
+            code = code,
+            result = result,
+            bytes = #text,
+            elapsed_ms = math.floor(elapsed + 0.5),
+        })
+
         if code and code >= 300 and code < 400 and location and hop < MAX_REDIRECTS then
-            local next_url = absolute_url(url, location)
-            Log.info("http", "redirect", {
-                code = code,
-                from = url,
-                to = next_url,
-                hop = hop + 1,
-            })
-            url = next_url
-            -- Drop pinned IP so redirect host is re-resolved.
-            opts.connect_ip = nil
-            opts.connect_host = nil
+            url = absolute_url(url, location)
             if code == 303 then
                 method, body = "GET", nil
             end
         else
             if result ~= "ok" then
-                Log.warn("http", "status", {
-                    result = result,
-                    code = code,
-                    url = url,
-                    status = status,
-                    bytes = #text,
-                })
                 return nil, result, text, code, response_headers
             end
             return text, result, nil, code, response_headers
         end
     end
-    Log.warn("http", "redirect_limit", { url = url, err = last_err })
     return nil, "http_error", last_err or "too many redirects"
 end
 

@@ -5,6 +5,14 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.5]
+
+### Fixed
+
+- 优化超大章节的加载体验
+- 优化评论弹窗的体验
+- 网络稳定性修复
+
 ## [0.2.4]
 
 ### Fixed
