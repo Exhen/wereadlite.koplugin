@@ -196,9 +196,20 @@ function Reader.reading_dir(book_id)
     return dir
 end
 
-function Reader.html_path(book_id, uid, kind)
+function Reader.html_path(book_id, uid, kind, section_start, section_end)
     local suffix = kind == "enc" and ".enc.html" or ".html"
-    return Reader.reading_dir(book_id) .. "/" .. tostring(uid or "chapter") .. suffix
+    local name = tostring(uid or "chapter")
+    -- Include the loaded section window so 触底续载 writes a new file instead of
+    -- overwriting the open document (switchDocument would otherwise delete it).
+    if section_start ~= nil and section_end ~= nil then
+        name = string.format(
+            "%s_%d-%d",
+            name,
+            math.max(0, tonumber(section_start) or 0),
+            math.max(0, tonumber(section_end) or 0)
+        )
+    end
+    return Reader.reading_dir(book_id) .. "/" .. name .. suffix
 end
 
 local function html_pair(path)
@@ -514,6 +525,43 @@ function Reader.is_last(state)
         return true
     end
     return Reader.next_url(state) == nil
+end
+
+function Reader.has_more_sections(state)
+    if not state then
+        return false
+    end
+    local count = tonumber(state.section_count) or 0
+    if count < 2 then
+        return false
+    end
+    local last = tonumber(state.section_end)
+    if last == nil then
+        return false
+    end
+    return last < count - 1
+end
+
+-- URL + absolute start sect for loading the next segment window after section_end.
+function Reader.continue_sections_request(state)
+    if not Reader.has_more_sections(state) then
+        return nil
+    end
+    local bc = query_bc(state and state.url)
+    if is_bc(state.cur and state.cur.param) then
+        bc = state.cur.param
+    elseif is_bc(state.cur_param and state.cur_param.param) then
+        bc = state.cur_param.param
+    end
+    if not is_bc(bc) then
+        return nil
+    end
+    local next_start = (tonumber(state.section_end) or 0) + 1
+    local count = math.max(1, tonumber(state.section_count) or 1)
+    if next_start >= count then
+        return nil
+    end
+    return Reader.url_for(bc, { sect = next_start }), next_start
 end
 
 local function query_escape(value)
@@ -1166,57 +1214,132 @@ local function fetch_async(url, job, callback)
     end)
 end
 
-local function download_sections_sync(state, url, html, report)
+-- Clamp a section download window around the current reading position.
+-- force_start: load forward from that section (触底续载), instead of centering.
+-- Keeps absolute WeRead wco / bookmark ranges valid via state.char_base.
+local function section_window(section_count, cur_sect, max_segments, force_start)
+    local count = math.max(1, tonumber(section_count) or 1)
+    local max_n = math.max(1, tonumber(max_segments) or Settings.MAX_SEGMENTS_DEFAULT or 3)
+    if force_start ~= nil then
+        local start_sect = math.max(0, math.min(count - 1, tonumber(force_start) or 0))
+        local last_sect = math.min(count - 1, start_sect + max_n - 1)
+        return start_sect, last_sect
+    end
+    local cur = math.max(0, math.min(count - 1, tonumber(cur_sect) or 0))
+    if count <= max_n then
+        return 0, count - 1
+    end
+    local half = math.floor((max_n - 1) / 2)
+    local start_sect = cur - half
+    if start_sect < 0 then
+        start_sect = 0
+    end
+    local last_sect = start_sect + max_n - 1
+    if last_sect >= count then
+        last_sect = count - 1
+        start_sect = math.max(0, last_sect - max_n + 1)
+    end
+    return start_sect, last_sect
+end
+
+-- Absolute chapter char base of a partial HTML body (min wco), for bookmark/heartbeat.
+local function body_char_base(html)
+    local min_wco
+    for wco in tostring(html or ""):gmatch('wco%s*=%s*"(%d+)"') do
+        local n = tonumber(wco)
+        if n and (not min_wco or n < min_wco) then
+            min_wco = n
+        end
+    end
+    return min_wco or 0
+end
+
+local function download_sections_sync(state, url, html, report, opts)
+    opts = type(opts) == "table" and opts or {}
     local pages = {}
     local bc = resolve_bc(state, url)
     local section_count = tonumber(state.section_count) or 0
     if section_count < 1 then
         section_count = 1
     end
-    local last_sect = section_count - 1
+    local cur_sect = math.max(0, tonumber(state.section) or 0)
+    local max_segments = Settings.max_segments_per_load()
+    local force_start = opts.segment_start
+    local start_sect, last_sect = section_window(section_count, cur_sect, max_segments, force_start)
+    state.section_start = start_sect
+    state.section_end = last_sect
     if is_bc(bc) then
-        local total = last_sect + 1
-        report("download", 0, total)
+        local total = last_sect - start_sect + 1
+        -- First fetch already returned cur_sect body; reuse it instead of refetching.
+        local seed_html = html
+        local seed_sect = cur_sect
+        local first_needs_net = not (seed_html and start_sect == seed_sect)
+        if first_needs_net then
+            report("segments", 0, total)
+        end
         Log.dbg("reader", "sections", {
-            cur = math.max(0, tonumber(state.section) or 0),
+            cur = cur_sect,
+            start = start_sect,
             last = last_sect,
             total = total,
+            chapter_sections = section_count,
+            max_segments = max_segments,
             offset = state.chapter_offset,
-            refetch = true,
+            reuse_seed = seed_html ~= nil,
+            force_start = force_start,
         })
-        for sect = 0, last_sect do
-            Log.dbg("reader", "section_fetch", { sect = sect })
-            local page = Reader.fetch(Reader.url_for(bc, { sect = sect }))
+        for sect = start_sect, last_sect do
+            local page
+            if seed_html and sect == seed_sect then
+                page = seed_html
+                seed_html = nil
+                Log.dbg("reader", "section_reuse", { sect = sect })
+            else
+                Log.dbg("reader", "section_fetch", { sect = sect })
+                page = Reader.fetch(Reader.url_for(bc, { sect = sect }))
+            end
             if not page then
-                if sect == 0 then
-                    return nil, "http_error", "chapter section 0 missing"
+                if sect == start_sect then
+                    return nil, "http_error", "chapter section missing"
                 end
                 Log.warn("reader", "section_skip", { sect = sect })
                 break
             end
             pages[#pages + 1] = page
-            report("download", #pages, total)
+            report("segments", #pages, total)
         end
     else
         pages[1] = html
+        state.section_start = 0
+        state.section_end = 0
+        report("segments", 1, 1)
     end
     if #pages == 0 then
         return nil, "http_error", "chapter empty"
     end
-    report("download", #pages, #pages)
+    report("segments", #pages, #pages)
     return pages
 end
 
-local function download_sections_background(state, url, html, report, job, on_pages, on_fail)
+local function download_sections_background(state, url, html, report, job, on_pages, on_fail, opts)
+    opts = type(opts) == "table" and opts or {}
     local pages = {}
     local bc = resolve_bc(state, url)
     local section_count = tonumber(state.section_count) or 0
     if section_count < 1 then
         section_count = 1
     end
-    local last_sect = section_count - 1
+    local cur_sect = math.max(0, tonumber(state.section) or 0)
+    local max_segments = Settings.max_segments_per_load()
+    local force_start = opts.segment_start
+    local start_sect, last_sect = section_window(section_count, cur_sect, max_segments, force_start)
+    state.section_start = start_sect
+    state.section_end = last_sect
     if not is_bc(bc) then
         pages[1] = html
+        state.section_start = 0
+        state.section_end = 0
+        report("segments", 1, 1)
         UIManager:nextTick(function()
             if job.cancelled then
                 return
@@ -1225,15 +1348,25 @@ local function download_sections_background(state, url, html, report, job, on_pa
         end)
         return
     end
-    local total = last_sect + 1
-    report("download", 0, total)
+    local total = last_sect - start_sect + 1
+    local seed_html = html
+    local seed_sect = cur_sect
+    local first_needs_net = not (seed_html and start_sect == seed_sect)
+    if first_needs_net then
+        report("segments", 0, total)
+    end
     Log.dbg("reader", "sections_async", {
-        cur = math.max(0, tonumber(state.section) or 0),
+        cur = cur_sect,
+        start = start_sect,
         last = last_sect,
         total = total,
+        chapter_sections = section_count,
+        max_segments = max_segments,
         offset = state.chapter_offset,
+        reuse_seed = seed_html ~= nil,
+        force_start = force_start,
     })
-    local sect = 0
+    local sect = start_sect
     local function fetch_next()
         if job.cancelled then
             return
@@ -1243,7 +1376,7 @@ local function download_sections_background(state, url, html, report, job, on_pa
                 on_fail("http_error", "chapter empty")
                 return
             end
-            report("download", #pages, total)
+            report("segments", #pages, total)
             UIManager:nextTick(function()
                 if not job.cancelled then
                     on_pages(pages)
@@ -1251,15 +1384,13 @@ local function download_sections_background(state, url, html, report, job, on_pa
             end)
             return
         end
-        local sect_url = Reader.url_for(bc, { sect = sect })
-        Log.dbg("reader", "section_fetch_async", { sect = sect })
-        fetch_async(sect_url, job, function(page, status, err)
+        local function accept_page(page, status, err)
             if job.cancelled then
                 return
             end
             if not page then
-                if sect == 0 then
-                    on_fail(status or "http_error", err or "chapter section 0 missing")
+                if sect == start_sect then
+                    on_fail(status or "http_error", err or "chapter section missing")
                     return
                 end
                 Log.warn("reader", "section_skip", { sect = sect })
@@ -1268,10 +1399,20 @@ local function download_sections_background(state, url, html, report, job, on_pa
                 return
             end
             pages[#pages + 1] = page
-            report("download", #pages, total)
+            report("segments", #pages, total)
             sect = sect + 1
             UIManager:nextTick(fetch_next)
-        end)
+        end
+        if seed_html and sect == seed_sect then
+            local page = seed_html
+            seed_html = nil
+            Log.dbg("reader", "section_reuse_async", { sect = sect })
+            accept_page(page)
+            return
+        end
+        local sect_url = Reader.url_for(bc, { sect = sect })
+        Log.dbg("reader", "section_fetch_async", { sect = sect })
+        fetch_async(sect_url, job, accept_page)
     end
     UIManager:nextTick(fetch_next)
 end
@@ -1339,127 +1480,131 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         local chapter_title = (state.cur and state.cur.title) or state.book_title or ""
         local uid = (state.cur and state.cur.uid) or (state.cur_param and state.cur_param.uid) or "chapter"
         local dir = Reader.reading_dir(state.book_id)
-        local path = Reader.html_path(state.book_id, uid)
-        local enc_path = Reader.html_path(state.book_id, uid, "enc")
-        report("load", #pages, #pages)
+        local path = Reader.html_path(state.book_id, uid, nil, state.section_start, state.section_end)
+        local enc_path = Reader.html_path(state.book_id, uid, "enc", state.section_start, state.section_end)
+        report("segments", #pages, #pages)
 
         local RESUME_ID = "wereadlite_resume"
-        local resume_index = math.min(#decrypted, math.max(1, cur_sect + 1))
-        if #decrypted > 0 and cur_sect > 0 then
+        local start_sect = math.max(0, tonumber(state.section_start) or 0)
+        -- pages[1] corresponds to start_sect; map absolute cur_sect into local page index.
+        local local_sect = math.max(0, cur_sect - start_sect)
+        local resume_index = math.min(#decrypted, math.max(1, local_sect + 1))
+        if #decrypted > 0 and cur_sect > start_sect then
             decrypted[resume_index] = '<a id="' .. RESUME_ID .. '"></a>' .. decrypted[resume_index]
         end
 
         local body = table.concat(decrypted, "\n")
+        local char_base = body_char_base(body)
+        state.char_base = char_base
         local postprocess_started = Log.now_ms()
         local plain = body:gsub("<[^>]+>", ""):gsub("%s+", "")
         local chars = 0
         for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
             chars = chars + 1
         end
+        state.loaded_chars = chars
         local resume_percent = 0
         local offset = tonumber(state.chapter_offset) or 0
+        -- Resume within the loaded window using absolute chapterOffset vs char_base.
         if offset > 0 and chars > 0 then
-            resume_percent = math.max(0, math.min(100, (offset / chars) * 100))
-        elseif cur_sect > 0 and section_count > 0 then
-            resume_percent = math.max(0, math.min(100, (cur_sect / section_count) * 100))
+            local local_off = math.max(0, offset - char_base)
+            resume_percent = math.max(0, math.min(100, (local_off / chars) * 100))
+        elseif local_sect > 0 and #decrypted > 0 then
+            resume_percent = math.max(0, math.min(100, (local_sect / #decrypted) * 100))
         end
-        state.resume_anchor = (offset <= 0 and cur_sect > 0) and RESUME_ID or nil
+        state.resume_anchor = (offset <= 0 and cur_sect > start_sect) and RESUME_ID or nil
         state.resume_percent = resume_percent
         Log.dbg("reader", "postprocess", {
             body_bytes = #body,
             chars = chars,
+            char_base = char_base,
+            section_start = start_sect,
+            section_end = state.section_end,
             elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
         })
 
-        local function continue_after_underlines()
+        local encrypted_body = table.concat(encrypted, "\n")
+
+        local function wrap_body(body_html, is_enc)
+            return Codec.wrap_html({
+                title = chapter_title,
+                body = body_html,
+                font_path = font_path,
+                source_css = source_css,
+                encrypted = is_enc and true or nil,
+            })
+        end
+
+        local function finish_write(decrypted_html, encrypted_html)
             if job and job.cancelled then
                 return
             end
+            if not write_html(path, decrypted_html) then
+                return fail("http_error", "write chapter html failed")
+            end
+            write_html(enc_path, encrypted_html)
+            state.url = url
+            state.html_path = path
+            state.html_enc_path = enc_path
+            state.chapter_title = chapter_title
+            Log.info("reader", "chapter_ready", {
+                book_id = state.book_id,
+                uid = uid,
+                title = chapter_title,
+                html = path,
+                sections = #pages,
+                section_start = state.section_start,
+                section_end = state.section_end,
+                char_base = state.char_base,
+                resume_percent = resume_percent,
+                resume_anchor = state.resume_anchor,
+                chapter_offset = offset,
+                background = background,
+            })
+            if type(ready_cb()) == "function" then
+                invoke_ready(state)
+            end
+            return state
+        end
+
+        -- Images first, then underlines: progress stages stay monotonic and match UI copy.
+        local function finalize_with_body(final_body)
+            if job and job.cancelled then
+                return
+            end
+            body = final_body or body
             local wrap_started = Log.now_ms()
-            local decrypted_source = Codec.wrap_html({
-                title = chapter_title,
-                body = body,
-                font_path = font_path,
-                source_css = source_css,
-            })
-            local encrypted_source = Codec.wrap_html({
-                title = chapter_title,
-                body = table.concat(encrypted, "\n"),
-                font_path = font_path,
-                source_css = source_css,
-                encrypted = true,
-            })
+            local decrypted_source = wrap_body(body, false)
+            local encrypted_source = wrap_body(encrypted_body, true)
             Log.dbg("reader", "wrap", {
                 css_bytes = #source_css,
                 decrypted_bytes = #decrypted_source,
                 elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
             })
-
-            local function finish(decrypted_html)
-                if job and job.cancelled then
-                    return
-                end
-                local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
-                if not write_html(path, decrypted_html) then
-                    return fail("http_error", "write chapter html failed")
-                end
-                write_html(enc_path, encrypted_html)
-                state.url = url
-                state.html_path = path
-                state.html_enc_path = enc_path
-                state.chapter_title = chapter_title
-                Log.info("reader", "chapter_ready", {
-                    book_id = state.book_id,
-                    uid = uid,
-                    title = chapter_title,
-                    html = path,
-                    sections = #pages,
-                    resume_percent = resume_percent,
-                    resume_anchor = state.resume_anchor,
-                    chapter_offset = offset,
-                    background = background,
-                })
-                if type(ready_cb()) == "function" then
-                    invoke_ready(state)
-                end
-                return state
-            end
-
-            if type(ready_cb()) == "function" then
-                local task = Images.localize_async(decrypted_source, dir, function(done, total)
-                    report("images", done, total)
-                end, function(decrypted_html)
-                    finish(decrypted_html)
-                end)
-                if job then
-                    job.image_task = task
-                end
-                return nil, "pending", task
-            end
-
-            local decrypted_html = Images.localize(decrypted_source, dir, function(done, total)
-                report("images", done, total)
-            end)
-            return finish(decrypted_html)
+            -- Image binaries were fetched in the images stage; only remap URLs here.
+            local decrypted_html = Images.localize(decrypted_source, dir, nil, { fetch = false })
+            local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
+            return finish_write(decrypted_html, encrypted_html)
         end
 
-        local function run_underlines()
+        local function run_reviews()
             if job and job.cancelled then
                 return
             end
-            local function finish_underlines(marked_body, underline_count, review_data, review_marks)
+            local function finish_reviews(marked_body, underline_count, review_data, review_marks)
                 if job and job.cancelled then
                     return
                 end
-                body = marked_body or body
                 state.review_data = review_data or {}
                 state.review_marks = review_marks or {}
                 report("reviews", 1, 1)
                 Log.info("reader", "underlines_stage_done", { count = underline_count or 0 })
                 if background then
-                    UIManager:nextTick(continue_after_underlines)
+                    UIManager:nextTick(function()
+                        finalize_with_body(marked_body)
+                    end)
                 else
-                    continue_after_underlines()
+                    finalize_with_body(marked_body)
                 end
             end
             if Settings.load_review_comments() then
@@ -1480,30 +1625,63 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                     local marked_body, underline_count, review_data, review_marks = add_chapter_underlines(
                         body, state.book_id, chapter_uid, underlines
                     )
-                    finish_underlines(marked_body, underline_count, review_data, review_marks)
+                    finish_reviews(marked_body, underline_count, review_data, review_marks)
                 end)
                 return
             end
             state.review_data = {}
             state.review_marks = {}
             Log.info("reader", "underlines_stage_skip", { reason = "disabled" })
+            report("reviews", 1, 1)
             if background then
-                UIManager:nextTick(continue_after_underlines)
+                UIManager:nextTick(function()
+                    finalize_with_body(body)
+                end)
             else
-                return continue_after_underlines()
+                return finalize_with_body(body)
             end
         end
 
+        local function run_images()
+            if job and job.cancelled then
+                return
+            end
+            report("images", 0, 0)
+            local decrypted_source = wrap_body(body, false)
+            local function after_images()
+                if background then
+                    UIManager:nextTick(run_reviews)
+                else
+                    run_reviews()
+                end
+            end
+            if type(ready_cb()) == "function" then
+                local task = Images.localize_async(decrypted_source, dir, function(done, total)
+                    report("images", done, total)
+                end, function(_)
+                    -- Only warming the image cache; final HTML is rebuilt after reviews.
+                    after_images()
+                end)
+                if job then
+                    job.image_task = task
+                end
+                return nil, "pending", task
+            end
+            Images.localize(decrypted_source, dir, function(done, total)
+                report("images", done, total)
+            end)
+            return after_images()
+        end
+
         if background then
-            UIManager:nextTick(run_underlines)
+            UIManager:nextTick(run_images)
             return nil, "pending"
         end
-        -- Underlines always go async; continue via on_ready.
-        run_underlines()
+        run_images()
         return nil, "pending"
     end
 
-    report("load", 0, #pages)
+    report("segments", #pages, #pages)
     if background then
         local index = 1
         local function decode_next()
@@ -1530,7 +1708,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             decrypted[#decrypted + 1] = dec_part
             encrypted[#encrypted + 1] = collect_content(page, false) or ""
             Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
-            report("load", index, #pages)
             index = index + 1
             UIManager:nextTick(decode_next)
         end
@@ -1552,7 +1729,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         decrypted[#decrypted + 1] = dec_part
         encrypted[#encrypted + 1] = collect_content(page, false) or ""
         Log.dbg("reader", "decode", { page = i, pages = #pages, bytes = #dec_part })
-        report("load", i, #pages)
     end
     return after_decode()
 end
@@ -1567,6 +1743,9 @@ local function load_background(url, book, on_progress, on_ready, opts)
         url = tostring(url or ""),
     }
     function job:cancel()
+        if self.cancelled then
+            return
+        end
         self.cancelled = true
         if self.active_http then
             AsyncHttp.cancel(self.active_http)
@@ -1575,6 +1754,13 @@ local function load_background(url, book, on_progress, on_ready, opts)
         if self.image_task and type(self.image_task.cancel) == "function" then
             pcall(self.image_task.cancel, self.image_task)
             self.image_task = nil
+        end
+        local ready = self.on_ready
+        self.on_ready = nil
+        if type(ready) == "function" then
+            UIManager:nextTick(function()
+                pcall(ready, nil, "cancelled", "cancelled")
+            end)
         end
     end
 
@@ -1596,7 +1782,8 @@ local function load_background(url, book, on_progress, on_ready, opts)
         title = book and book.title,
         background = true,
     })
-    report("download", 0, 1)
+    -- Stay on "获取书籍信息" until the first HTML response arrives.
+    report("info", 0, 0)
     fetch_async(url, job, function(html, status, err)
         if job.cancelled then
             return
@@ -1606,7 +1793,6 @@ local function load_background(url, book, on_progress, on_ready, opts)
             invoke_ready(nil, status, err)
             return
         end
-        report("download", 1, 1)
         local state = Reader.parse(html)
         Log.dbg("reader", "parse", {
             book_id = state.book_id,
@@ -1622,13 +1808,14 @@ local function load_background(url, book, on_progress, on_ready, opts)
             background = true,
         })
         merge_book_meta(state, book)
+        report("info", 1, 1)
         download_sections_background(state, url, html, report, job, function(pages)
             assemble_chapter(state, pages, url, book, nil, nil, opts, job)
         end, function(fail_status, fail_err)
             if not job.cancelled then
                 invoke_ready(nil, fail_status, fail_err)
             end
-        end)
+        end, opts)
     end)
     return nil, "pending", job
 end
@@ -1645,7 +1832,7 @@ function Reader.load(url, book, on_progress, on_ready, opts)
             pcall(on_progress, stage, done, total)
         end
     end
-    report("download", 0, 1)
+    report("info", 0, 0)
     Log.dbg("reader", "load_start", {
         url = url,
         book_id = book.bookId,
@@ -1656,7 +1843,6 @@ function Reader.load(url, book, on_progress, on_ready, opts)
         Log.warn("reader", "load_fetch", { url = url, status = status, err = err })
         return nil, status, err
     end
-    report("download", 1, 1)
     local state = Reader.parse(html)
     Log.dbg("reader", "parse", {
         book_id = state.book_id,
@@ -1671,7 +1857,8 @@ function Reader.load(url, book, on_progress, on_ready, opts)
         bytes = #html,
     })
     merge_book_meta(state, book)
-    local pages, pages_status, pages_err = download_sections_sync(state, url, html, report)
+    report("info", 1, 1)
+    local pages, pages_status, pages_err = download_sections_sync(state, url, html, report, opts)
     if not pages then
         return nil, pages_status, pages_err
     end

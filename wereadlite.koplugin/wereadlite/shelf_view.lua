@@ -238,12 +238,30 @@ function ShelfView:init()
 end
 
 function ShelfView:start_load()
-    if self._closed or self._started then
+    if self._closed then
+        return
+    end
+    if self._started and not self._load_failed then
         return
     end
     self._started = true
+    self._load_failed = false
     Log.info("shelf", "start_load")
     self:_load_first()
+end
+
+function ShelfView:retry_load()
+    if self._closed then
+        return
+    end
+    if Shelf.user and Shelf.has_books() then
+        return
+    end
+    Shelf.cancel_session_refresh()
+    self._started = false
+    self._load_failed = false
+    self:_set_body(self:_status_widget("正在加载书架…"))
+    self:start_load()
 end
 
 function ShelfView:_pager_line_height()
@@ -630,6 +648,7 @@ end
 
 function ShelfView:_fail(status, err)
     Log.warn("shelf", "load", { status = status, err = err })
+    self._load_failed = true
     if status == "auth_expired" or tostring(err or ""):find("userInfo missing", 1, true) then
         self:_expire()
         return
@@ -656,6 +675,9 @@ function ShelfView:_load_first()
             return
         end
         if not user then
+            if status == "cancelled" then
+                return
+            end
             self:_fail(status, err)
             return
         end
@@ -2025,52 +2047,37 @@ function ShelfView:_prefetch_covers()
         return
     end
     local concurrency = math.max(1, tonumber(Settings.image_concurrency()) or 4)
-    local pending = 0
-    local index = 1
     local finished = 0
     local total = #queue
-    local pump
-    local function done_one(path, err, cached)
+    local function maybe_done()
         finished = finished + 1
-        pending = math.max(0, pending - 1)
+        if finished < total then
+            return
+        end
         if self._closed or gen ~= self._cover_gen then
             return
         end
-        if path and not cached then
-            self:_schedule_cover_refresh(gen)
-        end
-        if finished >= total then
-            if not searching then
-                self:_preload_next_api()
-            end
-            return
-        end
-        pump()
-    end
-    local function start(job)
-        pending = pending + 1
-        if job.kind == "avatar" then
-            Covers.ensure_avatar_async(job.user, done_one)
-        else
-            Covers.ensure_async(job.book, done_one)
+        if not searching then
+            self:_preload_next_api()
         end
     end
-    pump = function()
-        if self._closed or gen ~= self._cover_gen then
-            return
-        end
-        while pending < concurrency and index <= total do
-            local job = queue[index]
-            index = index + 1
-            start(job)
-        end
-    end
-    Log.dbg("shelf", "covers_async", { jobs = total, concurrency = concurrency, page = self.page })
+    Log.dbg("shelf", "covers_async", { jobs = total, concurrency = concurrency, page = self.page, via = "fetch_many" })
     UIManager:nextTick(function()
         if self._closed or gen ~= self._cover_gen then
             return
         end
-        pump()
+        Covers.prefetch_many_async(queue, {
+            concurrency = concurrency,
+            on_item = function(path, err, cached)
+                if not self._closed and gen == self._cover_gen and path and not cached then
+                    self:_schedule_cover_refresh(gen)
+                end
+                maybe_done()
+            end,
+            on_done = function()
+                -- on_item already counts each job (including cache hits).
+            end,
+        })
     end)
 end
 

@@ -23,6 +23,9 @@ local Settings = {
     IMAGE_CONCURRENCY_MIN = 1,
     IMAGE_CONCURRENCY_MAX = 8,
     IMAGE_CONCURRENCY_DEFAULT = 4,
+    MAX_SEGMENTS_MIN = 1,
+    MAX_SEGMENTS_MAX = 30,
+    MAX_SEGMENTS_DEFAULT = 3,
 }
 
 local store
@@ -314,6 +317,52 @@ function Settings.show_image_concurrency_dialog()
         default_text = "恢复默认 4",
         callback = function(spin)
             Settings.set_image_concurrency(spin.value)
+        end,
+    })
+end
+
+function Settings.max_segments_per_load()
+    local data = Settings.load()
+    return clamp(
+        data:readSetting("max_segments_per_load"),
+        Settings.MAX_SEGMENTS_MIN,
+        Settings.MAX_SEGMENTS_MAX,
+        Settings.MAX_SEGMENTS_DEFAULT
+    )
+end
+
+function Settings.set_max_segments_per_load(value)
+    value = clamp(
+        value,
+        Settings.MAX_SEGMENTS_MIN,
+        Settings.MAX_SEGMENTS_MAX,
+        Settings.MAX_SEGMENTS_DEFAULT
+    )
+    local data = Settings.load()
+    data:saveSetting("max_segments_per_load", value)
+    data:flush()
+    Log.info("settings", "max_segments_per_load", { value = value })
+    return value
+end
+
+function Settings.show_max_segments_per_load_dialog()
+    local SpinWidget = require("ui/widget/spinwidget")
+    UIManager:show(SpinWidget:new{
+        title_text = "章节分段上限",
+        info_text = "超大章节每次最多下载的段数。读到本段末尾会自动续载后续分段。默认 3。",
+        value = Settings.max_segments_per_load(),
+        value_min = Settings.MAX_SEGMENTS_MIN,
+        value_max = Settings.MAX_SEGMENTS_MAX,
+        default_value = Settings.MAX_SEGMENTS_DEFAULT,
+        value_step = 1,
+        value_hold_step = 3,
+        precision = "%d",
+        ok_text = "应用",
+        cancel_text = "取消",
+        ok_always_enabled = true,
+        default_text = "恢复默认 3",
+        callback = function(spin)
+            Settings.set_max_segments_per_load(spin.value)
         end,
     })
 end
@@ -1121,6 +1170,12 @@ function Settings.show_reading_menu(on_changed, ctx)
             text = string.format("图片并发   %d", Settings.image_concurrency()),
             callback = function()
                 Settings.show_image_concurrency_dialog()
+            end,
+        },
+        {
+            text = string.format("章节分段上限   %d", Settings.max_segments_per_load()),
+            callback = function()
+                Settings.show_max_segments_per_load_dialog()
             end,
         },
     }, "wereadlite_settings_reading")

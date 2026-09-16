@@ -213,6 +213,9 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
     end
 
     if #urls == 0 then
+        state.done = 1
+        state.total = 1
+        report()
         UIManager:nextTick(finish)
         return state
     end
@@ -607,6 +610,7 @@ function Images.localize(html, book_dir, on_progress, opts)
         end
     end
     if #urls == 0 then
+        report(1, 1)
         return html
     end
     report(0, #urls)

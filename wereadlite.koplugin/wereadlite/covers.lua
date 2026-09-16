@@ -253,4 +253,114 @@ function Covers.ensure_avatar_async(user, callback)
     end)
 end
 
+--- Batch-download covers via Http.request (curl or Trapper-style subprocess).
+-- jobs: { { kind="book", book=table } | { kind="avatar", user=table } , ... }
+-- on_item(path, err, cached, job) for each; on_done() when the batch finishes.
+function Covers.prefetch_many_async(jobs, opts)
+    opts = opts or {}
+    local on_item = type(opts.on_item) == "function" and opts.on_item or function() end
+    local on_done = type(opts.on_done) == "function" and opts.on_done or function() end
+    jobs = type(jobs) == "table" and jobs or {}
+
+    local tasks = {}
+    local cached_hits = 0
+    for _, job in ipairs(jobs) do
+        if type(job) == "table" then
+            if job.kind == "avatar" then
+                local cached = Covers.cached_avatar()
+                if cached then
+                    cached_hits = cached_hits + 1
+                    on_item(cached, nil, true, job)
+                elseif type(job.user) == "table" and job.user.avatar and job.user.avatar ~= "" then
+                    tasks[#tasks + 1] = {
+                        kind = "avatar",
+                        url = tostring(job.user.avatar):gsub("/0$", "/132"),
+                        stem = Covers.dir() .. "/avatar",
+                        job = job,
+                    }
+                else
+                    on_item(nil, "no avatar", false, job)
+                end
+            else
+                local book = job.book or job
+                local book_id = tostring(book.bookId or "")
+                local cached = book_id ~= "" and Covers.cached(book_id) or nil
+                if cached then
+                    cached_hits = cached_hits + 1
+                    on_item(cached, nil, true, job)
+                elseif book.cover and tostring(book.cover) ~= "" and book_id ~= "" then
+                    tasks[#tasks + 1] = {
+                        kind = "book",
+                        book_id = book_id,
+                        url = tostring(book.cover),
+                        stem = Covers.path_for(book_id),
+                        job = job,
+                    }
+                else
+                    on_item(nil, "no cover", false, job)
+                end
+            end
+        end
+    end
+
+    if #tasks == 0 then
+        UIManager:nextTick(on_done)
+        return
+    end
+
+    -- Always use Http.request: curl on Kindle/desktop, subprocess+ssl.https on Kobo
+    -- (official #5002 / Trapper pattern). Do not use custom DNS or IP dial.
+    local concurrency = math.max(1, tonumber(opts.concurrency) or 4)
+    -- On Kobo, async_http is serial (MAX_WORKERS=1); keep pump concurrency low.
+    if not (Http.has_curl and Http.has_curl()) then
+        concurrency = 1
+    end
+    local referer = opts.referer or Config.SHELF_URL
+    local via = (Http.has_curl and Http.has_curl()) and "curl" or "subprocess"
+    Log.info("covers", "prefetch_many", {
+        tasks = #tasks,
+        cached = cached_hits,
+        concurrency = concurrency,
+        via = via,
+    })
+    local pending = 0
+    local index = 1
+    local finished = 0
+    local ok_count = 0
+    local total = #tasks
+    local pump
+    local function done_one(task, path, err)
+        finished = finished + 1
+        pending = math.max(0, pending - 1)
+        if path then
+            ok_count = ok_count + 1
+            on_item(path, nil, false, task.job)
+        else
+            on_item(nil, err or "http_error", false, task.job)
+        end
+        if finished >= total then
+            Log.info("covers", "prefetch_many_done", {
+                via = via,
+                ok = ok_count,
+                fail = total - ok_count,
+                total = total,
+            })
+            on_done()
+            return
+        end
+        pump()
+    end
+    pump = function()
+        while pending < concurrency and index <= total do
+            local task = tasks[index]
+            index = index + 1
+            pending = pending + 1
+            Covers.download_async(task.url, task.stem, referer, function(path, err)
+                done_one(task, path, err)
+            end)
+        end
+    end
+    UIManager:nextTick(pump)
+end
+
 return Covers

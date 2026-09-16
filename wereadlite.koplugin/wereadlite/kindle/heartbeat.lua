@@ -165,7 +165,10 @@ function Heartbeat.payload(state, reading_seconds)
     end
     local text = enc_text(state)
     local chars = utf8_len(text)
-    local offset = math.floor(percent * math.max(0, chars - 1) + 0.5)
+    local local_offset = math.floor(percent * math.max(0, chars - 1) + 0.5)
+    -- Mid-chapter window: report absolute co = char_base + position in loaded text.
+    local char_base = math.max(0, tonumber(state.char_base) or 0)
+    local offset = local_offset + char_base
     local now = now_seconds()
     local ts = math.floor(now * 1000)
     local ct = math.floor(now)
@@ -175,7 +178,7 @@ function Heartbeat.payload(state, reading_seconds)
         c = uid,
         ci = idx,
         co = offset,
-        sm = snippet(text, offset),
+        sm = snippet(text, local_offset),
         pr = math.floor(percent * 100 + 0.5),
         rt = rt,
         ts = ts,
@@ -262,7 +265,6 @@ end
 
 function Heartbeat.stop(flush)
     local elapsed = last_report and (now_seconds() - last_report) or 0
-    local state = Heartbeat.state
     Log.dbg("heartbeat", "stop", { flush = flush == true, elapsed = elapsed })
     generation = generation + 1
     if task then
@@ -273,11 +275,9 @@ function Heartbeat.stop(flush)
         Http.cancel(request_job)
         request_job = nil
     end
-    if flush and state and elapsed >= 5 then
-        Heartbeat.state = state
-        paused = false
-        pcall(Heartbeat.report, elapsed)
-    end
+    -- Never start a new bookread during stop/teardown.  flush used to fire a
+    -- POST while ReaderUI/FileManager was rebuilding; the orphan curl can keep
+    -- Wi‑Fi busy across Kindle suspend and soft-brick wake.
     Heartbeat.state = nil
     last_report = nil
     enc_cache_path = nil

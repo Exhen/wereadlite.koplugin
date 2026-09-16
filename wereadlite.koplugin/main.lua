@@ -290,10 +290,16 @@ function Plugin:onSuspend()
     Reading.cancel_load()
     Reading.cancel_prefetch()
     Session.cancel_refresh()
+    -- Keep heartbeat state so resume can continue; only cancel in-flight work.
     Heartbeat.pause("suspend")
     local cancelled = Http.cancel_all()
+    local orphans = 0
+    if type(Http.kill_orphans) == "function" then
+        orphans = Http.kill_orphans() or 0
+    end
     Log.info("plugin", "suspend", {
         cancelled_http = cancelled,
+        orphan_http = orphans,
         generation = lifecycle.generation,
     })
 end

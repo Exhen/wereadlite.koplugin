@@ -19,6 +19,19 @@ local session_job
 local session_waiters = {}
 local session_seed_books = false
 
+local function session_job_stale(job)
+    if not job or job.done or job.cancelled then
+        return true
+    end
+    if job.backend == "pending_online" then
+        local since = tonumber(job.wait_since) or 0
+        if since > 0 and os.time() - since >= 50 then
+            return true
+        end
+    end
+    return false
+end
+
 local function looks_like_login(html)
     html = tostring(html or "")
     if html:find("userInfo:", 1, true) then
@@ -247,14 +260,36 @@ end
 -- be refreshed after a long suspend before bookmark APIs are used again.
 function Shelf.refresh_session(on_done, seed_books)
     on_done = on_done or function() end
-    if session_job and not session_job.done and not session_job.cancelled then
+    if session_job and not session_job_stale(session_job) then
         session_waiters[#session_waiters + 1] = on_done
         session_seed_books = session_seed_books or seed_books == true
         return session_job
     end
-    session_waiters = { on_done }
-    session_seed_books = seed_books == true
-    Log.info("shelf", "session_refresh_start", { seed_books = seed_books == true })
+    -- Stale/cancelled job: Http.cancel does not invoke waiters. Carry them into
+    -- the new refresh so shelf loaders are not left hanging on "正在加载".
+    local pending = {}
+    local pending_seed = false
+    if session_job then
+        for _, waiter in ipairs(session_waiters) do
+            pending[#pending + 1] = waiter
+        end
+        pending_seed = session_seed_books == true
+        local stale = session_job
+        session_job = nil
+        -- Point waiters at pending before cancel so a sync cancel callback
+        -- cannot observe/clear the carried list.
+        session_waiters = pending
+        session_seed_books = pending_seed
+        Http.cancel(stale)
+        Log.info("shelf", "session_refresh_stale_requeue", {
+            waiters = #pending,
+            seed_books = pending_seed,
+        })
+    end
+    pending[#pending + 1] = on_done
+    session_waiters = pending
+    session_seed_books = pending_seed or seed_books == true
+    Log.info("shelf", "session_refresh_start", { seed_books = session_seed_books })
     local job
     job = Http.request({
         url = Config.SHELF_URL,
@@ -344,15 +379,21 @@ end
 
 function Shelf.cancel_session_refresh()
     local job = session_job
+    local waiters = session_waiters
     session_job = nil
     session_waiters = {}
     session_seed_books = false
-    if not job or job.done or job.cancelled then
-        return false
+    local cancelled = false
+    if job and not job.done and not job.cancelled then
+        Http.cancel(job)
+        cancelled = true
+        Log.info("shelf", "session_refresh_cancel", { url = job.url, waiters = #waiters })
     end
-    Http.cancel(job)
-    Log.info("shelf", "session_refresh_cancel", { url = job.url })
-    return true
+    -- Explicit cancel: notify waiters so UI does not hang on a dead job.
+    for _, waiter in ipairs(waiters) do
+        pcall(waiter, nil, "cancelled", "session refresh cancelled")
+    end
+    return cancelled
 end
 
 function Shelf.ensure_user(on_done, force)

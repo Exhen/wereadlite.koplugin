@@ -234,15 +234,22 @@ local function retry_auth_expired(err, retried, on_retry, on_fail)
 end
 
 local function chapter_hint(state)
+    local base = math.max(0, tonumber(state and state.char_base) or 0)
     local offset = tonumber(state and state.chapter_offset) or 0
     if offset > 0 then
-        return offset
+        -- find_range searches the loaded fragment; convert absolute offset to local.
+        return math.max(0, offset - base)
     end
     local ok, ReaderUI = pcall(require, "apps/reader/readerui")
     local ui = ok and ReaderUI and ReaderUI.instance
     local percent = ui and ui.view and ui.view.footer and tonumber(ui.view.footer.percent_finished)
     if percent then
-        return math.floor(percent * 100000)
+        local chars = tonumber(state and state.loaded_chars) or 0
+        if chars <= 0 then
+            local enc = chapter_plain(state and state.html_enc_path, false)
+            chars = utf8_len(enc)
+        end
+        return math.floor(percent * math.max(0, chars))
     end
     return 0
 end
@@ -380,6 +387,12 @@ function Bookmark.build_payload(item, state)
         return nil, "locate failed"
     end
 
+    -- Loaded HTML may be a mid-chapter window (e.g. sect 4-6). Local UTF-8
+    -- indices must be shifted by char_base so WeRead gets absolute ranges.
+    local char_base = math.max(0, tonumber(state.char_base) or 0)
+    local abs_start = start0 + char_base
+    local abs_end = end0 + char_base
+
     local mark = utf8_sub(enc, start0 + 1, end0)
     if mark == "" then
         mark = selected
@@ -393,13 +406,21 @@ function Bookmark.build_payload(item, state)
         Log.warn("bookmark", "no_book_version", { book_id = book_id })
     end
 
+    Log.dbg("bookmark", "range", {
+        local_start = start0,
+        local_end = end0,
+        char_base = char_base,
+        abs_start = abs_start,
+        abs_end = abs_end,
+    })
+
     return {
         bookId = book_id,
         chapterUid = chapter_uid,
         bookVersion = version,
         type = 1,
         style = 0,
-        range = string.format("%d-%d", start0, end0),
+        range = string.format("%d-%d", abs_start, abs_end),
         markText = mark,
         createTime = os.time(),
         chapterIdx = chapter_idx,
