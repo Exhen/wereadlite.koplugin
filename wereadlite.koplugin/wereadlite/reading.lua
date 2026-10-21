@@ -432,13 +432,15 @@ end
 
 local RESUME_DELAYS = { 0.35, 0.9, 1.6 }
 
+local function has_resume_target(resume)
+    return type(resume) == "table"
+        and ((tonumber(resume.percent) or 0) > 0
+            or (resume.anchor ~= nil and resume.anchor ~= ""))
+end
+
+-- Fallback when the jump could not be made while the reader was opening.
 local function schedule_resume(resume, path, state)
-    if type(resume) ~= "table" then
-        return
-    end
-    local has_target = (tonumber(resume.percent) or 0) > 0
-        or (resume.anchor and resume.anchor ~= "")
-    if not has_target then
+    if not has_resume_target(resume) then
         return
     end
     for attempt, delay in ipairs(RESUME_DELAYS) do
@@ -454,6 +456,34 @@ local function schedule_resume(resume, path, state)
     end
 end
 
+-- Jump to the saved position before the reader is first painted, so the first
+-- page shown is already the right one: one paint instead of a paint at the top
+-- followed by one repaint per later retry.  Returns true when the jump was made.
+local function resume_before_first_paint(reader, resume, path, state)
+    if not reader or not has_resume_target(resume) then
+        return false
+    end
+    -- The jump queues refreshes of its own; the reader's first show() queues the
+    -- real one, so anything queued here would only add a flash.
+    local refreshes = UIManager._refresh_stack and #UIManager._refresh_stack or 0
+    local funcs = UIManager._refresh_func_stack and #UIManager._refresh_func_stack or 0
+    local ok, jumped = pcall(Reading.goto_resume, resume, path, state, reader)
+    pcall(function()
+        for i = #UIManager._refresh_stack, refreshes + 1, -1 do
+            UIManager._refresh_stack[i] = nil
+        end
+        for i = #UIManager._refresh_func_stack, funcs + 1, -1 do
+            UIManager._refresh_func_stack[i] = nil
+        end
+    end)
+    if not ok then
+        Log.warn("reading", "resume_early", { err = jumped })
+        return false
+    end
+    Log.dbg("reading", "resume_early", { jumped = jumped })
+    return jumped
+end
+
 local function open_document(path, resume, state)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
@@ -461,7 +491,8 @@ local function open_document(path, resume, state)
     -- switchDocument closes the current doc first; our onClose hook must not
     -- delete the target file when reopening/replacing a WeRead chapter.
     Reading._preserve_html = path
-    local function after_open()
+    -- KOReader calls this as reader:after_open_callback(), with the new ReaderUI.
+    local function after_open(reader)
         Reading._preserve_html = nil
         -- This runs before the new reader is shown. A shelf left underneath
         -- the reader would be repainted as soon as the next chapter switch
@@ -474,7 +505,9 @@ local function open_document(path, resume, state)
         end
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
-        schedule_resume(resume, path, state)
+        if not resume_before_first_paint(reader, resume, path, state) then
+            schedule_resume(resume, path, state)
+        end
     end
     local ReaderUI = require("apps/reader/readerui")
     -- seamless=true hides KOReader's "Opening file ..." infomessage (same as legado.koplugin).
@@ -494,17 +527,20 @@ local function open_document(path, resume, state)
     end
 end
 
-function Reading.goto_resume(resume, expected_path, expected_state)
+function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
     resume = resume or {}
-    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
-    local ui = ok and ReaderUI and ReaderUI.instance
+    local ui = ui_override
     if not ui then
-        return
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        ui = ok and ReaderUI and ReaderUI.instance
+    end
+    if not ui then
+        return false
     end
     local current_path = ui.document and ui.document.file
     if expected_state and Reading.state ~= expected_state then
         Log.dbg("reading", "resume_stale", { reason = "state" })
-        return
+        return false
     end
     if expected_path and tostring(current_path or "") ~= tostring(expected_path) then
         Log.dbg("reading", "resume_stale", {
@@ -512,7 +548,7 @@ function Reading.goto_resume(resume, expected_path, expected_state)
             expected = expected_path,
             current = current_path,
         })
-        return
+        return false
     end
     local percent = tonumber(resume.percent) or 0
     local anchor = resume.anchor
@@ -529,20 +565,22 @@ function Reading.goto_resume(resume, expected_path, expected_state)
             end)
             if valid and ui.rolling then
                 Log.dbg("reading", "resume_anchor", { xp = xp })
-                pcall(function()
+                local jumped = pcall(function()
                     ui.rolling:onGotoXPointer(xp, xp)
                 end)
-                return
+                return jumped
             end
         end
     end
     if percent > 0 and percent < 100 then
         Log.dbg("reading", "resume_percent", { percent = percent })
         local Event = require("ui/event")
-        pcall(function()
+        local jumped = pcall(function()
             ui:handleEvent(Event:new("GotoPercent", percent))
         end)
+        return jumped
     end
+    return false
 end
 
 function Reading.open_url(url, book, opts)
