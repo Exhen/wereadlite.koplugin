@@ -556,7 +556,7 @@ function Reading.open_url(url, book, opts)
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
-    local bar
+    local bar, bar_timer
     -- Shown only when a network load is actually needed (not on a prefetch
     -- hit), so the user can still force-cancel large chapters.
     local function show_bar()
@@ -576,6 +576,21 @@ function Reading.open_url(url, book, opts)
         end
         Reading._load_bar = bar
     end
+    -- A quick load finishes before this fires, so the screen is not flashed
+    -- twice by a dialog that is gone a moment later.
+    local BAR_DELAY = 0.8
+    local function show_bar_later()
+        if bar or bar_timer then
+            return
+        end
+        bar_timer = function()
+            bar_timer = nil
+            if my_generation == Reading._load_generation then
+                show_bar()
+            end
+        end
+        UIManager:scheduleIn(BAR_DELAY, bar_timer)
+    end
     local function report(stage, done, total)
         if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
@@ -592,6 +607,10 @@ function Reading.open_url(url, book, opts)
         end
     end
     local function close_bar()
+        if bar_timer then
+            UIManager:unschedule(bar_timer)
+            bar_timer = nil
+        end
         if Reading._load_bar == bar then
             Reading._load_bar = nil
         end
@@ -687,7 +706,7 @@ function Reading.open_url(url, book, opts)
 
     -- Same chapter already loading in background: adopt that job (no second fetch).
     if Reader.is_prefetching(url) then
-        show_bar()
+        show_bar_later()
         local adopted, job = Reader.adopt_prefetch(url, report, complete)
         if adopted then
             Reading._load_task = job
@@ -706,7 +725,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
-    show_bar()
+    show_bar_later()
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
@@ -940,6 +959,21 @@ function Reading.return_to_shelf()
     end)
 end
 
+-- Turning past the last page makes KOReader re-draw the very same page (page-update
+-- footer/view refresh).  We are about to replace the document, so drop that queued
+-- repaint instead of letting the old page flash once before the next chapter shows.
+local function discard_pending_paint()
+    pcall(function()
+        UIManager._refresh_stack = {}
+        UIManager._refresh_func_stack = {}
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and UIManager._dirty then
+            UIManager._dirty[ui.dialog or ui] = nil
+        end
+    end)
+end
+
 function Reading.handle_end_of_book(status_widget)
     local file = status_widget and status_widget.ui and status_widget.ui.document and status_widget.ui.document.file
     if not Reading.is_ours(file) then
@@ -985,6 +1019,7 @@ function Reading.handle_end_of_book(status_widget)
         return true
     end
     -- Chapter end: go straight to the next chapter without asking.
+    discard_pending_paint()
     if Reading._load_task then
         return true
     end
