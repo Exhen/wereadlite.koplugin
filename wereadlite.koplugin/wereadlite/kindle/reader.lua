@@ -10,7 +10,10 @@ local Skill = require("wereadlite.skill")
 local Settings = require("wereadlite.settings")
 local AsyncHttp = require("wereadlite.async_http")
 local Paths = require("wereadlite.paths")
+local Slice = require("wereadlite.slice")
 local UIManager = require("ui/uimanager")
+
+local unpack = table.unpack or unpack
 
 local Reader = {}
 Reader._prefetch_job = nil
@@ -299,8 +302,12 @@ function Reader.cleanup_reading(keep_html)
 end
 
 local function parse_url_params(html, env)
-    local map = {}
+    local map, blocks = {}, 0
     for block in tostring(html or ""):gmatch("{cUid:[^}]+}") do
+        blocks = blocks + 1
+        if blocks % 64 == 0 then
+            Slice.point()
+        end
         local uid = as_text(field(block, "cUid", env))
         local param = as_text(field(block, "param", env))
         if uid ~= "" and is_bc(param) then
@@ -311,8 +318,12 @@ local function parse_url_params(html, env)
 end
 
 local function parse_chapters(html, env, params)
-    local chapters, seen = {}, {}
+    local chapters, seen, blocks = {}, {}, 0
     for block in tostring(html or ""):gmatch("{chapterUid:[^}]+}") do
+        blocks = blocks + 1
+        if blocks % 64 == 0 then
+            Slice.point()
+        end
         local uid = as_text(field(block, "chapterUid", env))
         if uid ~= "" and not seen[uid] then
             seen[uid] = true
@@ -333,27 +344,65 @@ local function parse_chapters(html, env, params)
     return chapters
 end
 
+local function is_word_byte(b)
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+end
+
+-- Same matches as html:gmatch("([%w_]+)" .. suffix .. value_pattern) but located with
+-- plain searches for the suffix: gmatch retries the identifier pattern at every word of
+-- the whole page (readerContent included), which is very slow on a big chapter.
+-- value_pattern is anchored, captures the value and ends with () for the match end.
+local function each_assignment(html, suffix, value_pattern, fn)
+    local init, floor, hits = 1, 1, 0
+    while true do
+        local at, stop = html:find(suffix, init, true)
+        if not at then
+            return
+        end
+        hits = hits + 1
+        if hits % 256 == 0 then
+            Slice.point()
+        end
+        -- The identifier is the run of word characters right before the suffix; it
+        -- cannot reach back into the previous match.
+        local first = at
+        while first > floor and is_word_byte(html:byte(first - 1)) do
+            first = first - 1
+        end
+        local value, after
+        if first < at then
+            value, after = html:match(value_pattern, stop + 1)
+        end
+        if value then
+            fn(html:sub(first, at - 1), value)
+            init, floor = after, after
+        else
+            init = stop + 1
+        end
+    end
+end
+
 local function parse_chapter_objects(html, env)
     local objects = {}
     html = tostring(html or "")
-    for name, uid in html:gmatch("([%w_]+)%.chapterUid=([%w_]+)") do
+    each_assignment(html, ".chapterUid=", "^([%w_]+)()", function(name, uid)
         objects[name] = objects[name] or {}
         objects[name].uid = as_text(Nuxt.scalar(uid, env))
-    end
-    for name, idx in html:gmatch("([%w_]+)%.chapterIdx=([%w_]+)") do
+    end)
+    each_assignment(html, ".chapterIdx=", "^([%w_]+)()", function(name, idx)
         objects[name] = objects[name] or {}
         objects[name].idx = as_number(Nuxt.scalar(idx, env))
-    end
-    for name, quoted in html:gmatch('([%w_]+)%.title="([^"]*)"') do
+    end)
+    each_assignment(html, '.title="', '^([^"]*)"()', function(name, quoted)
         objects[name] = objects[name] or {}
         objects[name].title = Nuxt.unescape(quoted)
-    end
-    for name, tok in html:gmatch("([%w_]+)%.title=([%w_]+)") do
+    end)
+    each_assignment(html, ".title=", "^([%w_]+)()", function(name, tok)
         objects[name] = objects[name] or {}
         if objects[name].title == nil or objects[name].title == "" then
             objects[name].title = as_text(Nuxt.scalar(tok, env))
         end
-    end
+    end)
     return objects
 end
 
@@ -425,9 +474,13 @@ end
 
 function Reader.parse(html)
     local env = Nuxt.env(html)
+    Slice.point()
     local params = parse_url_params(html, env)
+    Slice.point()
     local chapters = parse_chapters(html, env, params)
+    Slice.point()
     local objects = parse_chapter_objects(html, env)
+    Slice.point()
     local book_info = Nuxt.parse_field(html, "bookInfo", env)
     if type(book_info) ~= "table" then
         book_info = {}
@@ -881,7 +934,12 @@ local UNDERLINE_LINK_OPEN = '<a class="wereadlite-highlight" style="color:inheri
 local function build_wco_index(html)
     local doc = {}
     local p, n = 1, #html
+    local scanned = 0
     while p <= n do
+        scanned = scanned + 1
+        if scanned % 128 == 0 then
+            Slice.point()
+        end
         local span_start = html:find("<span", p, true)
         if not span_start then
             break
@@ -948,13 +1006,25 @@ local function build_wco_index(html)
             p = gt + 1
         end
     end
-    local by_wco = {}
-    for i = 1, #doc do
-        by_wco[i] = doc[i]
+    -- Spans are normally already in wco order; only sort when they are not.
+    -- (Spans with equal wco may end up in any order either way; nothing depends on it.)
+    local sorted = true
+    for i = 2, #doc do
+        if doc[i - 1].wco > doc[i].wco then
+            sorted = false
+            break
+        end
     end
-    table.sort(by_wco, function(a, b)
-        return a.wco < b.wco
-    end)
+    local by_wco = doc
+    if not sorted then
+        by_wco = {}
+        for i = 1, #doc do
+            by_wco[i] = doc[i]
+        end
+        table.sort(by_wco, function(a, b)
+            return a.wco < b.wco
+        end)
+    end
     return doc, by_wco
 end
 
@@ -972,11 +1042,34 @@ local function wco_lower_bound(by_wco, start0)
     return idx
 end
 
+-- Once underlines are injected the per-character <span wco="N"> wrappers are dead
+-- weight: crengine builds a DOM node for each, which dominates open time and memory.
+-- Bookmarks and heartbeat only read the text, so unwrap the leaf spans.  (Spans that
+-- carry an underline link contain a tag and are left alone.)
+local WCO_LEAF_SPAN = '<span%s+wco%s*=%s*"%d+"%s*>([^<]*)</span>'
+
+local function strip_wco_spans(html)
+    html = tostring(html or "")
+    local out, pos, n = {}, 1, #html
+    while pos <= n do
+        -- Cut right after a </span>, so a wrapper never straddles two chunks.
+        local _, stop = html:find("</span>", pos + 16384, true)
+        stop = stop or n
+        out[#out + 1] = html:sub(pos, stop):gsub(WCO_LEAF_SPAN, "%1")
+        pos = stop + 1
+        Slice.point()
+    end
+    return table.concat(out)
+end
+
 local function emit_wco_underlines(html, doc)
     local out = {}
     local cursor = 1
     local marked = 0
     for i = 1, #doc do
+        if i % 128 == 0 then
+            Slice.point()
+        end
         local span = doc[i]
         if cursor <= span.open_gt then
             out[#out + 1] = html:sub(cursor, span.open_gt)
@@ -1065,6 +1158,9 @@ local function add_chapter_underlines(body, book_id, chapter_uid, underlines)
                 end
                 span.mark = id
                 spans = spans + 1
+                if spans % 512 == 0 then
+                    Slice.point()
+                end
             end
             Log.dbg("reader", "underline_range", {
                 index = count,
@@ -1119,6 +1215,43 @@ local function validate_fetch_body(body)
         return nil, "auth_expired"
     end
     return body
+end
+
+-- The chapter's underlines only need the book and chapter ids, so ask for them as soon
+-- as the first page is parsed instead of after the text has been decoded.
+local function start_underlines(state, job)
+    if not job or not Settings.load_review_comments() then
+        return
+    end
+    local chapter_uid = state.cur and state.cur.uid
+    if not chapter_uid or state.book_id == "" or state.book_id == "nil" then
+        return
+    end
+    local fut = { uid = chapter_uid, waiters = {} }
+    job.underlines = fut
+    Skill.chapter_underlines_async(state.book_id, chapter_uid, function(...)
+        fut.done = true
+        fut.result = table.pack(...)
+        local waiters = fut.waiters
+        fut.waiters = {}
+        for _, waiter in ipairs(waiters) do
+            waiter(unpack(fut.result, 1, fut.result.n))
+        end
+    end)
+end
+
+-- Uses the early request when there is one for this chapter, else asks now.
+local function underlines_for(state, job, chapter_uid, callback)
+    local fut = job and job.underlines
+    if fut and tostring(fut.uid) == tostring(chapter_uid) then
+        if fut.done then
+            callback(unpack(fut.result, 1, fut.result.n))
+        else
+            fut.waiters[#fut.waiters + 1] = callback
+        end
+        return
+    end
+    Skill.chapter_underlines_async(state.book_id, chapter_uid, callback)
 end
 
 local function merge_book_meta(state, book)
@@ -1186,7 +1319,10 @@ local function fetch_async(url, job, callback)
         return
     end
     Log.dbg("reader", "fetch_async", { url = url })
-    job.active_http = AsyncHttp.request({
+    -- Several section requests may be in flight at once; cancel() aborts them all.
+    job.http_active = job.http_active or {}
+    local handle
+    handle = AsyncHttp.request({
         url = url,
         timeout = 30,
         accept = FETCH_ACCEPT,
@@ -1195,7 +1331,9 @@ local function fetch_async(url, job, callback)
         send_cookie = true,
         absorb_cookies = false,
     }, function(res)
-        job.active_http = nil
+        if handle then
+            job.http_active[handle] = nil
+        end
         UIManager:nextTick(function()
             if job and job.cancelled then
                 return
@@ -1212,6 +1350,9 @@ local function fetch_async(url, job, callback)
             callback(body, status, err)
         end)
     end)
+    if handle then
+        job.http_active[handle] = true
+    end
 end
 
 -- Clamp a section download window around the current reading position.
@@ -1242,16 +1383,29 @@ local function section_window(section_count, cur_sect, max_segments, force_start
     return start_sect, last_sect
 end
 
--- Absolute chapter char base of a partial HTML body (min wco), for bookmark/heartbeat.
-local function body_char_base(html)
-    local min_wco
+-- Smallest wco of a partial HTML body (nil when it has none).  The chapter's absolute
+-- char base is the smallest over all pages; it keeps bookmark/heartbeat ranges valid.
+local function min_wco_of(html)
+    local min_wco, spans = nil, 0
     for wco in tostring(html or ""):gmatch('wco%s*=%s*"(%d+)"') do
         local n = tonumber(wco)
         if n and (not min_wco or n < min_wco) then
             min_wco = n
         end
+        spans = spans + 1
+        if spans % 512 == 0 then
+            Slice.point()
+        end
     end
-    return min_wco or 0
+    return min_wco
+end
+
+-- Number of visible characters in an HTML fragment.
+local function text_length(html)
+    local plain = tostring(html or ""):gsub("<[^>]+>", ""):gsub("%s+", "")
+    Slice.point()
+    local _, chars = plain:gsub("[%z\1-\127\194-\244][\128-\191]*", "")
+    return chars
 end
 
 local function download_sections_sync(state, url, html, report, opts)
@@ -1366,55 +1520,75 @@ local function download_sections_background(state, url, html, report, job, on_pa
         reuse_seed = seed_html ~= nil,
         force_start = force_start,
     })
-    local sect = start_sect
-    local function fetch_next()
+    -- Every section is requested at once; pages are then taken in order.  The first
+    -- section must load; the first missing later section ends the chapter there.
+    local results, pending = {}, 0
+    local failed_first
+    local finished = false
+    local function finish_if_ready()
+        if finished or job.cancelled or pending > 0 then
+            return
+        end
+        finished = true
+        if failed_first then
+            on_fail(failed_first.status or "http_error", failed_first.err or "chapter section missing")
+            return
+        end
+        for s = start_sect, last_sect do
+            local page = results[s]
+            if not page then
+                Log.warn("reader", "section_skip", { sect = s })
+                break
+            end
+            pages[#pages + 1] = page
+        end
+        if #pages == 0 then
+            on_fail("http_error", "chapter empty")
+            return
+        end
+        report("segments", #pages, total)
+        UIManager:nextTick(function()
+            if not job.cancelled then
+                on_pages(pages)
+            end
+        end)
+    end
+    local loaded = 0
+    local function accept_page(s, page, status, err)
         if job.cancelled then
             return
         end
-        if sect > last_sect then
-            if #pages == 0 then
-                on_fail("http_error", "chapter empty")
-                return
-            end
-            report("segments", #pages, total)
-            UIManager:nextTick(function()
-                if not job.cancelled then
-                    on_pages(pages)
-                end
-            end)
-            return
+        pending = pending - 1
+        if page then
+            results[s] = page
+            loaded = loaded + 1
+            report("segments", loaded, total)
+        elseif s == start_sect then
+            failed_first = { status = status, err = err }
         end
-        local function accept_page(page, status, err)
-            if job.cancelled then
-                return
-            end
-            if not page then
-                if sect == start_sect then
-                    on_fail(status or "http_error", err or "chapter section missing")
-                    return
-                end
-                Log.warn("reader", "section_skip", { sect = sect })
-                sect = last_sect + 1
-                UIManager:nextTick(fetch_next)
-                return
-            end
-            pages[#pages + 1] = page
-            report("segments", #pages, total)
-            sect = sect + 1
-            UIManager:nextTick(fetch_next)
-        end
-        if seed_html and sect == seed_sect then
-            local page = seed_html
-            seed_html = nil
-            Log.dbg("reader", "section_reuse_async", { sect = sect })
-            accept_page(page)
-            return
-        end
-        local sect_url = Reader.url_for(bc, { sect = sect })
-        Log.dbg("reader", "section_fetch_async", { sect = sect })
-        fetch_async(sect_url, job, accept_page)
+        finish_if_ready()
     end
-    UIManager:nextTick(fetch_next)
+    UIManager:nextTick(function()
+        if job.cancelled then
+            return
+        end
+        for s = start_sect, last_sect do
+            pending = pending + 1
+        end
+        for s = start_sect, last_sect do
+            if seed_html and s == seed_sect then
+                local page = seed_html
+                seed_html = nil
+                Log.dbg("reader", "section_reuse_async", { sect = s })
+                accept_page(s, page)
+            else
+                Log.dbg("reader", "section_fetch_async", { sect = s })
+                fetch_async(Reader.url_for(bc, { sect = s }), job, function(page, status, err)
+                    accept_page(s, page, status, err)
+                end)
+            end
+        end
+    end)
 end
 
 local function assemble_chapter(state, pages, url, book, on_progress, on_ready, opts, job)
@@ -1463,11 +1637,61 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         end
     end
 
+    -- Background work is cut into short slices so it never blocks page turns:
+    -- compute runs across several UI ticks, continue(...) then gets its results.
+    -- A prefetch nobody waits for yields often and leaves idle gaps; a load the
+    -- user waits on (or an adopted prefetch) runs in bigger slices at full speed.
+    local function sliced(compute, continue)
+        Slice.run(compute, function(ok, ...)
+            if job and job.cancelled then
+                return
+            end
+            if ok then
+                return continue(...)
+            end
+            -- Never lose the chapter over a slicing problem: redo the work in one go.
+            Log.warn("reader", "slice_fallback", { err = tostring((...)) })
+            local redo = table.pack(pcall(compute))
+            if redo[1] then
+                return continue(unpack(redo, 2, redo.n))
+            end
+            return fail("http_error", "chapter processing failed")
+        end, {
+            cancelled = function()
+                return job and job.cancelled
+            end,
+            fast = function()
+                return not opts.prefetch or (job and job.adopted)
+            end,
+        })
+    end
+
     local encrypted, decrypted, source_css = {}, {}, ""
+    -- Smallest wco and total visible characters of the decoded pages so far.
+    local first_wco, loaded_chars = nil, 0
     local cur_sect = math.max(0, tonumber(state.section) or 0)
     local section_count = tonumber(state.section_count) or 0
     if section_count < 1 then
         section_count = 1
+    end
+
+    -- CPU-heavy part of one page: decoded and original markup, plus what
+    -- after_decode needs to know about it.  Pure, so it can be sliced.
+    local function decode_page(page, need_css)
+        local css = need_css and Codec.reader_styles(page) or ""
+        local dec_part = collect_content(page, true)
+        if not dec_part then
+            return css
+        end
+        local enc_part = collect_content(page, false) or ""
+        return css, dec_part, enc_part, min_wco_of(dec_part), text_length(dec_part)
+    end
+
+    local function add_page_summary(page_wco, page_chars)
+        if page_wco and (not first_wco or page_wco < first_wco) then
+            first_wco = page_wco
+        end
+        loaded_chars = loaded_chars + (page_chars or 0)
     end
 
     local function after_decode()
@@ -1494,14 +1718,10 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         end
 
         local body = table.concat(decrypted, "\n")
-        local char_base = body_char_base(body)
+        local char_base = first_wco or 0
         state.char_base = char_base
         local postprocess_started = Log.now_ms()
-        local plain = body:gsub("<[^>]+>", ""):gsub("%s+", "")
-        local chars = 0
-        for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-            chars = chars + 1
-        end
+        local chars = loaded_chars
         state.loaded_chars = chars
         local resume_percent = 0
         local offset = tonumber(state.chapter_offset) or 0
@@ -1573,18 +1793,24 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                 return
             end
             body = final_body or body
-            local wrap_started = Log.now_ms()
-            local decrypted_source = wrap_body(body, false)
-            local encrypted_source = wrap_body(encrypted_body, true)
-            Log.dbg("reader", "wrap", {
-                css_bytes = #source_css,
-                decrypted_bytes = #decrypted_source,
-                elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
-            })
-            -- Image binaries were fetched in the images stage; only remap URLs here.
-            local decrypted_html = Images.localize(decrypted_source, dir, nil, { fetch = false })
-            local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
-            return finish_write(decrypted_html, encrypted_html)
+            local function render()
+                local wrap_started = Log.now_ms()
+                local decrypted_source = wrap_body(strip_wco_spans(body), false)
+                local encrypted_source = wrap_body(strip_wco_spans(encrypted_body), true)
+                Log.dbg("reader", "wrap", {
+                    css_bytes = #source_css,
+                    decrypted_bytes = #decrypted_source,
+                    elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
+                })
+                -- Image binaries were fetched in the images stage; only remap URLs here.
+                local decrypted_html = Images.localize(decrypted_source, dir, nil, { fetch = false })
+                local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
+                return decrypted_html, encrypted_html
+            end
+            if background then
+                return sliced(render, finish_write)
+            end
+            return finish_write(render())
         end
 
         local function run_reviews()
@@ -1614,7 +1840,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                     book_id = state.book_id,
                     chapter_uid = chapter_uid,
                 })
-                Skill.chapter_underlines_async(state.book_id, chapter_uid, function(underlines, status, err)
+                underlines_for(state, job, chapter_uid, function(underlines, status, err)
                     if job and job.cancelled then
                         return
                     end
@@ -1622,10 +1848,13 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                         Log.warn("reader", "underlines_fetch_fail", { status = status, err = err })
                         underlines = {}
                     end
-                    local marked_body, underline_count, review_data, review_marks = add_chapter_underlines(
-                        body, state.book_id, chapter_uid, underlines
-                    )
-                    finish_reviews(marked_body, underline_count, review_data, review_marks)
+                    local function mark()
+                        return add_chapter_underlines(body, state.book_id, chapter_uid, underlines)
+                    end
+                    if background then
+                        return sliced(mark, finish_reviews)
+                    end
+                    finish_reviews(mark())
                 end)
                 return
             end
@@ -1693,33 +1922,39 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                 return
             end
             local page = pages[index]
-            if source_css == "" then
-                source_css = Codec.reader_styles(page)
-            end
-            local dec_part = collect_content(page, true)
-            if not dec_part then
-                if index == 1 then
-                    fail(state.need_pay and "need_pay" or "http_error", state.need_pay and "本章需要购买" or "readerContent missing")
+            local need_css = source_css == ""
+            sliced(function()
+                return decode_page(page, need_css)
+            end, function(css, dec_part, enc_part, page_wco, page_chars)
+                if need_css then
+                    source_css = css
+                end
+                if not dec_part then
+                    if index == 1 then
+                        fail(state.need_pay and "need_pay" or "http_error", state.need_pay and "本章需要购买" or "readerContent missing")
+                        return
+                    end
+                    UIManager:nextTick(after_decode)
                     return
                 end
-                UIManager:nextTick(after_decode)
-                return
-            end
-            decrypted[#decrypted + 1] = dec_part
-            encrypted[#encrypted + 1] = collect_content(page, false) or ""
-            Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
-            index = index + 1
-            UIManager:nextTick(decode_next)
+                decrypted[#decrypted + 1] = dec_part
+                encrypted[#encrypted + 1] = enc_part
+                add_page_summary(page_wco, page_chars)
+                Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
+                index = index + 1
+                UIManager:nextTick(decode_next)
+            end)
         end
         UIManager:nextTick(decode_next)
         return
     end
 
     for i, page in ipairs(pages) do
-        if source_css == "" then
-            source_css = Codec.reader_styles(page)
+        local need_css = source_css == ""
+        local css, dec_part, enc_part, page_wco, page_chars = decode_page(page, need_css)
+        if need_css then
+            source_css = css
         end
-        local dec_part = collect_content(page, true)
         if not dec_part then
             if i == 1 then
                 return fail(state.need_pay and "need_pay" or "http_error", state.need_pay and "本章需要购买" or "readerContent missing")
@@ -1727,7 +1962,8 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             break
         end
         decrypted[#decrypted + 1] = dec_part
-        encrypted[#encrypted + 1] = collect_content(page, false) or ""
+        encrypted[#encrypted + 1] = enc_part
+        add_page_summary(page_wco, page_chars)
         Log.dbg("reader", "decode", { page = i, pages = #pages, bytes = #dec_part })
     end
     return after_decode()
@@ -1736,7 +1972,7 @@ end
 local function load_background(url, book, on_progress, on_ready, opts)
     local job = {
         cancelled = false,
-        active_http = nil,
+        http_active = {},
         image_task = nil,
         on_progress = on_progress,
         on_ready = on_ready,
@@ -1747,10 +1983,10 @@ local function load_background(url, book, on_progress, on_ready, opts)
             return
         end
         self.cancelled = true
-        if self.active_http then
-            AsyncHttp.cancel(self.active_http)
-            self.active_http = nil
+        for handle in pairs(self.http_active or {}) do
+            pcall(AsyncHttp.cancel, handle)
         end
+        self.http_active = nil
         if self.image_task and type(self.image_task.cancel) == "function" then
             pcall(self.image_task.cancel, self.image_task)
             self.image_task = nil
@@ -1793,29 +2029,52 @@ local function load_background(url, book, on_progress, on_ready, opts)
             invoke_ready(nil, status, err)
             return
         end
-        local state = Reader.parse(html)
-        Log.dbg("reader", "parse", {
-            book_id = state.book_id,
-            title = state.book_title,
-            uid = state.cur and state.cur.uid,
-            idx = state.cur and state.cur.idx,
-            chapters = #(state.chapters or {}),
-            section = state.section,
-            section_count = state.section_count,
-            need_pay = state.need_pay,
-            has_token = state.token ~= nil and state.token ~= "",
-            bytes = #html,
-            background = true,
-        })
-        merge_book_meta(state, book)
-        report("info", 1, 1)
-        download_sections_background(state, url, html, report, job, function(pages)
-            assemble_chapter(state, pages, url, book, nil, nil, opts, job)
-        end, function(fail_status, fail_err)
-            if not job.cancelled then
-                invoke_ready(nil, fail_status, fail_err)
+        -- Parsing the page state is heavy; slice it like the rest of the background work.
+        Slice.run(function()
+            return Reader.parse(html)
+        end, function(parsed, state)
+            if job.cancelled then
+                return
             end
-        end, opts)
+            if not parsed then
+                Log.warn("reader", "slice_fallback", { err = tostring(state) })
+                parsed, state = pcall(Reader.parse, html)
+                if not parsed then
+                    invoke_ready(nil, "http_error", tostring(state))
+                    return
+                end
+            end
+            Log.dbg("reader", "parse", {
+                book_id = state.book_id,
+                title = state.book_title,
+                uid = state.cur and state.cur.uid,
+                idx = state.cur and state.cur.idx,
+                chapters = #(state.chapters or {}),
+                section = state.section,
+                section_count = state.section_count,
+                need_pay = state.need_pay,
+                has_token = state.token ~= nil and state.token ~= "",
+                bytes = #html,
+                background = true,
+            })
+            merge_book_meta(state, book)
+            start_underlines(state, job)
+            report("info", 1, 1)
+            download_sections_background(state, url, html, report, job, function(pages)
+                assemble_chapter(state, pages, url, book, nil, nil, opts, job)
+            end, function(fail_status, fail_err)
+                if not job.cancelled then
+                    invoke_ready(nil, fail_status, fail_err)
+                end
+            end, opts)
+        end, {
+            cancelled = function()
+                return job.cancelled
+            end,
+            fast = function()
+                return not opts.prefetch or job.adopted
+            end,
+        })
     end)
     return nil, "pending", job
 end

@@ -463,6 +463,15 @@ local function open_document(path, resume, state)
     Reading._preserve_html = path
     local function after_open()
         Reading._preserve_html = nil
+        -- This runs before the new reader is shown. A shelf left underneath
+        -- the reader would be repainted as soon as the next chapter switch
+        -- closes the current document, so drop it now.
+        local ok_gate, gate_err = pcall(function()
+            require("wereadlite.gate").close()
+        end)
+        if not ok_gate then
+            Log.warn("reading", "close_shelf", { err = gate_err })
+        end
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
         schedule_resume(resume, path, state)
@@ -548,8 +557,12 @@ function Reading.open_url(url, book, opts)
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
     local bar
-    -- Always show the load dialog so the user can force-cancel large chapters.
-    do
+    -- Shown only when a network load is actually needed (not on a prefetch
+    -- hit), so the user can still force-cancel large chapters.
+    local function show_bar()
+        if bar then
+            return
+        end
         local ok_bar, opened = pcall(LoadProgress.open, {
             on_cancel = function()
                 Reading.cancel_load()
@@ -561,8 +574,8 @@ function Reading.open_url(url, book, opts)
         else
             bar = opened
         end
+        Reading._load_bar = bar
     end
-    Reading._load_bar = bar
     local function report(stage, done, total)
         if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
@@ -674,6 +687,7 @@ function Reading.open_url(url, book, opts)
 
     -- Same chapter already loading in background: adopt that job (no second fetch).
     if Reader.is_prefetching(url) then
+        show_bar()
         local adopted, job = Reader.adopt_prefetch(url, report, complete)
         if adopted then
             Reading._load_task = job
@@ -692,6 +706,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
+    show_bar()
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
@@ -788,7 +803,12 @@ function Reading.open_next()
         show_error("无法打开下一章")
         return false
     end
+    local from_state = Reading.state
     UIManager:nextTick(function()
+        -- A repeated page-turn at the chapter end must not skip a chapter.
+        if Reading.state ~= from_state then
+            return
+        end
         local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
         if ok then
             return
@@ -964,30 +984,11 @@ function Reading.handle_end_of_book(status_widget)
         UIManager:show(dialog)
         return true
     end
-    dialog = ButtonDialog:new{
-        name = "wereadlite_next_chapter",
-        title = "本章已读完",
-        title_align = "center",
-        buttons = {
-            {
-                {
-                    text = "打开目录",
-                    callback = function()
-                        UIManager:close(dialog)
-                        Reading.show_toc()
-                    end,
-                },
-                {
-                    text = "下一章",
-                    callback = function()
-                        UIManager:close(dialog)
-                        Reading.open_next()
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog)
+    -- Chapter end: go straight to the next chapter without asking.
+    if Reading._load_task then
+        return true
+    end
+    Reading.open_next()
     return true
 end
 

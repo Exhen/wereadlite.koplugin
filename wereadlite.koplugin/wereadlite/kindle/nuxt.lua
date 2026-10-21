@@ -1,3 +1,5 @@
+local Slice = require("wereadlite.slice")
+
 local Nuxt = {}
 
 function Nuxt.unescape(text)
@@ -22,13 +24,22 @@ function Nuxt.parse_args(text)
     local args = {}
     local index, length = 1, #tostring(text or "")
     text = tostring(text or "")
+    local steps = 0
     while index <= length do
+        steps = steps + 1
+        if steps % 512 == 0 then
+            Slice.point()
+        end
         local char = text:sub(index, index)
         if char:match("%s") or char == "," then
             index = index + 1
         elseif char == '"' then
             local chunk, cursor = {}, index + 1
             while cursor <= length do
+                steps = steps + 1
+                if steps % 512 == 0 then
+                    Slice.point()
+                end
                 local current = text:sub(cursor, cursor)
                 if current == "\\" then
                     local next_char = text:sub(cursor + 1, cursor + 1)
@@ -141,7 +152,12 @@ end
 local function parse_quoted(text, index, length)
     local chunk = {}
     local cursor = index + 1
+    local steps = 0
     while cursor <= length do
+        steps = steps + 1
+        if steps % 2048 == 0 then
+            Slice.point()
+        end
         local current = text:sub(cursor, cursor)
         if current == "\\" then
             local next_char = text:sub(cursor + 1, cursor + 1)
@@ -169,7 +185,12 @@ local parse_array_at
 parse_object_at = function(text, index, env, length)
     local obj = {}
     index = index + 1
+    local steps = 0
     while index <= length do
+        steps = steps + 1
+        if steps % 128 == 0 then
+            Slice.point()
+        end
         index = skip_sep(text, index, length)
         if text:sub(index, index) == "}" then
             return obj, index + 1
@@ -201,7 +222,12 @@ end
 parse_array_at = function(text, index, env, length)
     local arr = {}
     index = index + 1
+    local steps = 0
     while index <= length do
+        steps = steps + 1
+        if steps % 128 == 0 then
+            Slice.point()
+        end
         index = skip_sep(text, index, length)
         if text:sub(index, index) == "]" then
             return arr, index + 1
