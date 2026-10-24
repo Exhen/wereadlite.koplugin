@@ -432,13 +432,15 @@ end
 
 local RESUME_DELAYS = { 0.35, 0.9, 1.6 }
 
+local function has_resume_target(resume)
+    return type(resume) == "table"
+        and ((tonumber(resume.percent) or 0) > 0
+            or (resume.anchor ~= nil and resume.anchor ~= ""))
+end
+
+-- Fallback when the jump could not be made while the reader was opening.
 local function schedule_resume(resume, path, state)
-    if type(resume) ~= "table" then
-        return
-    end
-    local has_target = (tonumber(resume.percent) or 0) > 0
-        or (resume.anchor and resume.anchor ~= "")
-    if not has_target then
+    if not has_resume_target(resume) then
         return
     end
     for attempt, delay in ipairs(RESUME_DELAYS) do
@@ -454,6 +456,34 @@ local function schedule_resume(resume, path, state)
     end
 end
 
+-- Jump to the saved position before the reader is first painted, so the first
+-- page shown is already the right one: one paint instead of a paint at the top
+-- followed by one repaint per later retry.  Returns true when the jump was made.
+local function resume_before_first_paint(reader, resume, path, state)
+    if not reader or not has_resume_target(resume) then
+        return false
+    end
+    -- The jump queues refreshes of its own; the reader's first show() queues the
+    -- real one, so anything queued here would only add a flash.
+    local refreshes = UIManager._refresh_stack and #UIManager._refresh_stack or 0
+    local funcs = UIManager._refresh_func_stack and #UIManager._refresh_func_stack or 0
+    local ok, jumped = pcall(Reading.goto_resume, resume, path, state, reader)
+    pcall(function()
+        for i = #UIManager._refresh_stack, refreshes + 1, -1 do
+            UIManager._refresh_stack[i] = nil
+        end
+        for i = #UIManager._refresh_func_stack, funcs + 1, -1 do
+            UIManager._refresh_func_stack[i] = nil
+        end
+    end)
+    if not ok then
+        Log.warn("reading", "resume_early", { err = jumped })
+        return false
+    end
+    Log.dbg("reading", "resume_early", { jumped = jumped })
+    return jumped
+end
+
 local function open_document(path, resume, state)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
@@ -461,11 +491,23 @@ local function open_document(path, resume, state)
     -- switchDocument closes the current doc first; our onClose hook must not
     -- delete the target file when reopening/replacing a WeRead chapter.
     Reading._preserve_html = path
-    local function after_open()
+    -- KOReader calls this as reader:after_open_callback(), with the new ReaderUI.
+    local function after_open(reader)
         Reading._preserve_html = nil
+        -- This runs before the new reader is shown. A shelf left underneath
+        -- the reader would be repainted as soon as the next chapter switch
+        -- closes the current document, so drop it now.
+        local ok_gate, gate_err = pcall(function()
+            require("wereadlite.gate").close()
+        end)
+        if not ok_gate then
+            Log.warn("reading", "close_shelf", { err = gate_err })
+        end
         Reading.remove_from_history(path)
         Reader.cleanup_reading(path)
-        schedule_resume(resume, path, state)
+        if not resume_before_first_paint(reader, resume, path, state) then
+            schedule_resume(resume, path, state)
+        end
     end
     local ReaderUI = require("apps/reader/readerui")
     -- seamless=true hides KOReader's "Opening file ..." infomessage (same as legado.koplugin).
@@ -485,17 +527,20 @@ local function open_document(path, resume, state)
     end
 end
 
-function Reading.goto_resume(resume, expected_path, expected_state)
+function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
     resume = resume or {}
-    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
-    local ui = ok and ReaderUI and ReaderUI.instance
+    local ui = ui_override
     if not ui then
-        return
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        ui = ok and ReaderUI and ReaderUI.instance
+    end
+    if not ui then
+        return false
     end
     local current_path = ui.document and ui.document.file
     if expected_state and Reading.state ~= expected_state then
         Log.dbg("reading", "resume_stale", { reason = "state" })
-        return
+        return false
     end
     if expected_path and tostring(current_path or "") ~= tostring(expected_path) then
         Log.dbg("reading", "resume_stale", {
@@ -503,7 +548,7 @@ function Reading.goto_resume(resume, expected_path, expected_state)
             expected = expected_path,
             current = current_path,
         })
-        return
+        return false
     end
     local percent = tonumber(resume.percent) or 0
     local anchor = resume.anchor
@@ -520,20 +565,22 @@ function Reading.goto_resume(resume, expected_path, expected_state)
             end)
             if valid and ui.rolling then
                 Log.dbg("reading", "resume_anchor", { xp = xp })
-                pcall(function()
+                local jumped = pcall(function()
                     ui.rolling:onGotoXPointer(xp, xp)
                 end)
-                return
+                return jumped
             end
         end
     end
     if percent > 0 and percent < 100 then
         Log.dbg("reading", "resume_percent", { percent = percent })
         local Event = require("ui/event")
-        pcall(function()
+        local jumped = pcall(function()
             ui:handleEvent(Event:new("GotoPercent", percent))
         end)
+        return jumped
     end
+    return false
 end
 
 function Reading.open_url(url, book, opts)
@@ -547,9 +594,13 @@ function Reading.open_url(url, book, opts)
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
-    local bar
-    -- Always show the load dialog so the user can force-cancel large chapters.
-    do
+    local bar, bar_timer
+    -- Shown only when a network load is actually needed (not on a prefetch
+    -- hit), so the user can still force-cancel large chapters.
+    local function show_bar()
+        if bar then
+            return
+        end
         local ok_bar, opened = pcall(LoadProgress.open, {
             on_cancel = function()
                 Reading.cancel_load()
@@ -561,8 +612,23 @@ function Reading.open_url(url, book, opts)
         else
             bar = opened
         end
+        Reading._load_bar = bar
     end
-    Reading._load_bar = bar
+    -- A quick load finishes before this fires, so the screen is not flashed
+    -- twice by a dialog that is gone a moment later.
+    local BAR_DELAY = 0.8
+    local function show_bar_later()
+        if bar or bar_timer then
+            return
+        end
+        bar_timer = function()
+            bar_timer = nil
+            if my_generation == Reading._load_generation then
+                show_bar()
+            end
+        end
+        UIManager:scheduleIn(BAR_DELAY, bar_timer)
+    end
     local function report(stage, done, total)
         if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
@@ -579,6 +645,10 @@ function Reading.open_url(url, book, opts)
         end
     end
     local function close_bar()
+        if bar_timer then
+            UIManager:unschedule(bar_timer)
+            bar_timer = nil
+        end
         if Reading._load_bar == bar then
             Reading._load_bar = nil
         end
@@ -674,6 +744,7 @@ function Reading.open_url(url, book, opts)
 
     -- Same chapter already loading in background: adopt that job (no second fetch).
     if Reader.is_prefetching(url) then
+        show_bar_later()
         local adopted, job = Reader.adopt_prefetch(url, report, complete)
         if adopted then
             Reading._load_task = job
@@ -692,6 +763,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
+    show_bar_later()
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
@@ -788,7 +860,12 @@ function Reading.open_next()
         show_error("无法打开下一章")
         return false
     end
+    local from_state = Reading.state
     UIManager:nextTick(function()
+        -- A repeated page-turn at the chapter end must not skip a chapter.
+        if Reading.state ~= from_state then
+            return
+        end
         local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
         if ok then
             return
@@ -920,6 +997,21 @@ function Reading.return_to_shelf()
     end)
 end
 
+-- Turning past the last page makes KOReader re-draw the very same page (page-update
+-- footer/view refresh).  We are about to replace the document, so drop that queued
+-- repaint instead of letting the old page flash once before the next chapter shows.
+local function discard_pending_paint()
+    pcall(function()
+        UIManager._refresh_stack = {}
+        UIManager._refresh_func_stack = {}
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and UIManager._dirty then
+            UIManager._dirty[ui.dialog or ui] = nil
+        end
+    end)
+end
+
 function Reading.handle_end_of_book(status_widget)
     local file = status_widget and status_widget.ui and status_widget.ui.document and status_widget.ui.document.file
     if not Reading.is_ours(file) then
@@ -964,30 +1056,12 @@ function Reading.handle_end_of_book(status_widget)
         UIManager:show(dialog)
         return true
     end
-    dialog = ButtonDialog:new{
-        name = "wereadlite_next_chapter",
-        title = "本章已读完",
-        title_align = "center",
-        buttons = {
-            {
-                {
-                    text = "打开目录",
-                    callback = function()
-                        UIManager:close(dialog)
-                        Reading.show_toc()
-                    end,
-                },
-                {
-                    text = "下一章",
-                    callback = function()
-                        UIManager:close(dialog)
-                        Reading.open_next()
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog)
+    -- Chapter end: go straight to the next chapter without asking.
+    discard_pending_paint()
+    if Reading._load_task then
+        return true
+    end
+    Reading.open_next()
     return true
 end
 

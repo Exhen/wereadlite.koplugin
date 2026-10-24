@@ -1,6 +1,7 @@
 local Config = require("wereadlite.config")
 local Log = require("wereadlite.log")
 local Client = require("wereadlite.kindle.client")
+local Slice = require("wereadlite.slice")
 
 local Codec = {}
 
@@ -16,11 +17,19 @@ local function file_exists(path)
     return size and size > 1024
 end
 
-function Codec.b64decode(data)
-    local s = tostring(data or ""):gsub("-", "+"):gsub("_", "/"):gsub("[^A-Za-z0-9%+/%=]", "")
-    if #s % 4 ~= 0 then
-        s = s .. string.rep("=", 4 - (#s % 4))
+-- LuaSocket's C base64 decoder is far faster than the per-character Lua loop;
+-- only trust it after a quick self check.
+local unb64
+do
+    local ok, mime = pcall(require, "mime")
+    if ok and type(mime) == "table" and type(mime.unb64) == "function"
+        and mime.unb64("YWJj") == "abc" and mime.unb64("TWFuTWFu") == "ManMan" then
+        unb64 = mime.unb64
     end
+end
+
+-- Decodes complete, already sanitized and padded base64 quanta.
+local function b64decode_lua(s)
     local out = {}
     local function value(ch)
         if ch == "=" or ch == "" then
@@ -41,6 +50,25 @@ function Codec.b64decode(data)
         end
     end
     return table.concat(out)
+end
+
+function Codec.b64decode(data)
+    local s = tostring(data or ""):gsub("-", "+"):gsub("_", "/"):gsub("[^A-Za-z0-9%+/%=]", "")
+    if #s % 4 ~= 0 then
+        s = s .. string.rep("=", 4 - (#s % 4))
+    end
+    if unb64 and s:find("^[A-Za-z0-9%+/]+=?=?$") then
+        -- Whole quanta go through the C decoder; the padded last one stays in Lua.
+        local head, tail = s, ""
+        if s:sub(-1) == "=" then
+            head, tail = s:sub(1, -5), s:sub(-4)
+        end
+        local decoded = head == "" and "" or unb64(head)
+        if decoded then
+            return decoded .. b64decode_lua(tail)
+        end
+    end
+    return b64decode_lua(s)
 end
 
 local function positions(s)
@@ -76,19 +104,41 @@ local function positions(s)
 end
 
 local function unswap(s, p)
-    local c = {}
-    for i = 1, #s do
-        c[i] = s:sub(i, i)
+    -- Only a handful of positions are swapped, so keep just those characters
+    -- aside instead of exploding the whole string into a table.
+    local swapped = {}
+    local function at(k)
+        local ch = swapped[k]
+        if ch == nil then
+            ch = s:sub(k, k)
+        end
+        return ch
     end
     for i = #p, 1, -2 do
         local a = p[i] + 2
         local b = p[i - 1] + 2
-        c[a], c[b] = c[b], c[a]
+        local ca, cb = at(a), at(b)
+        swapped[a], swapped[b] = cb, ca
         a = a - 1
         b = b - 1
-        c[a], c[b] = c[b], c[a]
+        ca, cb = at(a), at(b)
+        swapped[a], swapped[b] = cb, ca
     end
-    return table.concat(c)
+    local keys = {}
+    for k in pairs(swapped) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    local out, last = {}, 0
+    for _, k in ipairs(keys) do
+        if k > last + 1 then
+            out[#out + 1] = s:sub(last + 1, k - 1)
+        end
+        out[#out + 1] = swapped[k]
+        last = k
+    end
+    out[#out + 1] = s:sub(last + 1)
+    return table.concat(out)
 end
 
 local function md5_hex(message)
@@ -139,25 +189,6 @@ end
 function Codec.looks_like_shards(text)
     text = tostring(text or "")
     return #text > 40 and text:match("^[%x]+") and #text:match("^[%x]+") == 32
-end
-
-local function utf8_replace(text, mapper)
-    local out, i, n = {}, 1, #text
-    while i <= n do
-        local b = text:byte(i)
-        local len = 1
-        if b >= 240 then
-            len = 4
-        elseif b >= 224 then
-            len = 3
-        elseif b >= 192 then
-            len = 2
-        end
-        local ch = text:sub(i, i + len - 1)
-        out[#out + 1] = mapper(ch, b, len) or ch
-        i = i + len
-    end
-    return table.concat(out)
 end
 
 -- fzys_map.bin: WRMP + ver/count (BE u16) + (from,to) BMP pairs.
@@ -213,45 +244,41 @@ local function utf8_encode(cp)
     return ""
 end
 
-local function utf8_codepoint(ch)
-    local b1, b2, b3 = ch:byte(1, 3)
-    if not b1 then
-        return nil
+-- UTF-8 text of every mapped 3-byte character -> its replacement.  Lets gsub swap
+-- characters in C instead of walking the text byte by byte in Lua.
+local function char_map()
+    if Codec._char_map then
+        return Codec._char_map
     end
-    if b1 < 128 then
-        return b1
+    local out = {}
+    for from, to in pairs(load_map()) do
+        if from >= 2048 and from < 65536 then
+            out[utf8_encode(from)] = utf8_encode(to)
+        end
     end
-    if b1 < 224 and b2 then
-        return (b1 - 192) * 64 + (b2 - 128)
-    end
-    if b1 < 240 and b2 and b3 then
-        return (b1 - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
-    end
+    Codec._char_map = out
+    return out
 end
 
+-- Pattern of one 3-byte UTF-8 character (every character the map can touch).
+local CJK_CHAR = "[\224-\239][\128-\191][\128-\191]"
+
 function Codec.has_map()
-    return next(load_map()) ~= nil
+    local has = next(load_map()) ~= nil
+    if has then
+        -- Built once, on the first load (which the user waits for) rather than
+        -- in the middle of a background prefetch.
+        char_map()
+    end
+    return has
 end
 
 function Codec.decode_text(text)
-    local map = load_map()
-    if not next(map) then
-        return tostring(text or "")
+    text = tostring(text or "")
+    if not next(load_map()) then
+        return text
     end
-    return utf8_replace(tostring(text or ""), function(ch, b, len)
-        if len ~= 3 then
-            return ch
-        end
-        local cp = utf8_codepoint(ch)
-        if not cp then
-            return ch
-        end
-        local mapped = map[cp]
-        if mapped then
-            return utf8_encode(mapped)
-        end
-        return ch
-    end)
+    return (text:gsub(CJK_CHAR, char_map()))
 end
 
 local SKIP_DECODE_TAGS = {
@@ -290,13 +317,48 @@ local function find_close_tag_end(html, start, name)
     return n
 end
 
-function Codec.decode_html(html)
-    html = tostring(html or "")
-    if html == "" or not next(load_map()) then
-        return html
+-- Comments and style/script/textarea blocks need the tag-by-tag walk below; most
+-- chapters have none.  (A "<" followed by whitespace still reads as a tag name there.)
+local function has_special_blocks(html)
+    if html:find("<!--", 1, true) then
+        return true
     end
-    local out, i, n = {}, 1, #html
+    local lower = html:lower()
+    return lower:find("<style", 1, true) ~= nil
+        or lower:find("<script", 1, true) ~= nil
+        or lower:find("<textarea", 1, true) ~= nil
+        or lower:find("<%s") ~= nil
+end
+
+-- Decodes the text between the tags of a chunk without comments or special blocks;
+-- tags are copied as they are (they can carry text of their own, e.g. footnotes).
+local function decode_between_tags(chunk)
+    local out, i, n = {}, 1, #chunk
     while i <= n do
+        local lt = chunk:find("<", i, true)
+        if not lt then
+            out[#out + 1] = Codec.decode_text(chunk:sub(i))
+            break
+        end
+        if lt > i then
+            out[#out + 1] = Codec.decode_text(chunk:sub(i, lt - 1))
+        end
+        local gt = chunk:find(">", lt + 1, true) or n
+        out[#out + 1] = chunk:sub(lt, gt)
+        i = gt + 1
+    end
+    return table.concat(out)
+end
+
+-- General tag-by-tag walk that also leaves comments and style/script/textarea blocks alone.
+local function decode_html_walk(html)
+    local out, i, n = {}, 1, #html
+    local steps = 0
+    while i <= n do
+        steps = steps + 1
+        if steps % 128 == 0 then
+            Slice.point()
+        end
         local lt = html:find("<", i, true)
         if not lt then
             out[#out + 1] = Codec.decode_text(html:sub(i))
@@ -324,6 +386,33 @@ function Codec.decode_html(html)
                 i = gt + 1
             end
         end
+    end
+    return table.concat(out)
+end
+
+function Codec.decode_html(html)
+    html = tostring(html or "")
+    if html == "" or not next(load_map()) then
+        return html
+    end
+    if has_special_blocks(html) then
+        return decode_html_walk(html)
+    end
+    Slice.point()
+    -- Chunks are cut right after a ">", so neither a tag nor a character is ever split.
+    -- Without tags that carry non-ASCII text, one gsub per chunk does all the work.
+    local out, pos, n = {}, 1, #html
+    while pos <= n do
+        local stop = html:find(">", pos + 8192, true) or n
+        local chunk = html:sub(pos, stop)
+        if chunk:find("<[^>]*[\128-\255]") then
+            chunk = decode_between_tags(chunk)
+        else
+            chunk = Codec.decode_text(chunk)
+        end
+        out[#out + 1] = chunk
+        pos = stop + 1
+        Slice.point()
     end
     return table.concat(out)
 end
@@ -454,7 +543,12 @@ function Codec.convert_footnotes(html)
     end
     local notes, pieces, cursor = {}, {}, 1
     local search = 1
+    local scanned = 0
     while true do
+        scanned = scanned + 1
+        if scanned % 32 == 0 then
+            Slice.point()
+        end
         local at = html:find("data-wr-footernote", search, true)
         if not at then
             break
@@ -482,21 +576,25 @@ function Codec.convert_footnotes(html)
     end
     pieces[#pieces + 1] = html:sub(cursor)
     html = table.concat(pieces)
+    Slice.point()
 
-    html = html:gsub("<[iI][mM][gG]([^>]*)/?>", function(attrs)
-        local class = tag_attr(attrs, "class") or ""
-        if not class:find("qqreader-footnote", 1, true) and not class:find("js_readerFooterNote", 1, true) then
-            return "<img" .. attrs .. ">"
-        end
-        local note = decode_attr(tag_attr(attrs, "data-wr-footernote")
-            or tag_attr(attrs, "alt")
-            or tag_attr(attrs, "title")
-            or "")
-        if note == "" then
-            return "<img" .. attrs .. ">"
-        end
-        return push_note(notes, "", note)
-    end)
+    -- The rewrite below only touches <img> tags; skip the pass when there are none.
+    if html:lower():find("<img", 1, true) then
+        html = html:gsub("<[iI][mM][gG]([^>]*)/?>", function(attrs)
+            local class = tag_attr(attrs, "class") or ""
+            if not class:find("qqreader-footnote", 1, true) and not class:find("js_readerFooterNote", 1, true) then
+                return "<img" .. attrs .. ">"
+            end
+            local note = decode_attr(tag_attr(attrs, "data-wr-footernote")
+                or tag_attr(attrs, "alt")
+                or tag_attr(attrs, "title")
+                or "")
+            if note == "" then
+                return "<img" .. attrs .. ">"
+            end
+            return push_note(notes, "", note)
+        end)
+    end
 
     if #notes == 0 then
         return html
@@ -582,10 +680,42 @@ local function strip_reader_typography(css)
     return remove_css_property(css, "%f[%a][fF][oO][nN][tT]%f[^%w-]")
 end
 
-local function strip_inline_typography(html)
-    return tostring(html or ""):gsub("<[^>]+>", function(tag)
+local TYPOGRAPHY_WORDS = { "font", "line-height", "letter-spacing", "word-spacing", "text-indent" }
+
+-- Cheap necessary condition for strip_reader_typography to change anything.
+local function mentions_typography(text)
+    local lower = text:lower()
+    for _, word in ipairs(TYPOGRAPHY_WORDS) do
+        if lower:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function strip_tag_typography(tag)
+    if mentions_typography(tag) then
         return strip_reader_typography(tag)
-    end)
+    end
+    return tag
+end
+
+local function strip_inline_typography(html)
+    html = tostring(html or "")
+    local out, pos, n = {}, 1, #html
+    while pos <= n do
+        -- Cut right after a ">" so a tag never straddles two chunks; chunks that
+        -- say nothing about typography are copied as they are.
+        local stop = html:find(">", pos + 2048, true) or n
+        local chunk = html:sub(pos, stop)
+        if mentions_typography(chunk) then
+            chunk = chunk:gsub("<[^>]+>", strip_tag_typography)
+        end
+        out[#out + 1] = chunk
+        pos = stop + 1
+        Slice.point()
+    end
+    return table.concat(out)
 end
 
 function Codec.reader_content(html, decode)
@@ -594,11 +724,17 @@ function Codec.reader_content(html, decode)
     if not inner or inner == "" then
         error("readerContent missing")
     end
-    local text = inner:gsub("<!%-%-.-%-%->", ""):gsub("<[^>]+>", ""):gsub("%s+", "")
+    -- Only used to tell whether there is anything to show: keep each pass short.
+    local text = inner:gsub("<!%-%-.-%-%->", "")
+    Slice.point()
+    text = text:gsub("<[^>]+>", "")
+    Slice.point()
+    text = text:gsub("%s+", "")
     local has_image = inner:find("<[iI][mM][gG]%f[%s/>]") ~= nil
     if text == "" and not has_image then
         error("readerContent empty")
     end
+    Slice.point()
     local title_head, title_block, title_tail
     if decode ~= false then
         title_head, title_block, title_tail = carve_element_by_id(inner, "readerChapterTitle")
@@ -622,7 +758,9 @@ function Codec.reader_content(html, decode)
     if decode == false then
         return strip_inline_typography(inner)
     end
-    return strip_inline_typography(Codec.convert_footnotes(inner))
+    inner = Codec.convert_footnotes(inner)
+    Slice.point()
+    return strip_inline_typography(inner)
 end
 
 function Codec.reader_styles(html)

@@ -1,6 +1,7 @@
 local Config = require("wereadlite.config")
 local Log = require("wereadlite.log")
 local Settings = require("wereadlite.settings")
+local Slice = require("wereadlite.slice")
 local UIManager = require("ui/uimanager")
 
 local Images = {}
@@ -106,23 +107,17 @@ local function collect_urls(html)
         end
     end
     html = tostring(html or "")
+    -- Most chapters have neither images nor CSS backgrounds: skip every scan
+    -- below unless the document mentions something they could find.
+    local lower = html:lower()
+    if not lower:find("<img", 1, true) and not lower:find("background", 1, true) then
+        return urls
+    end
     local style_blocks = {}
     for css in html:gmatch("<[sS][tT][yY][lL][eE][^>]*>(.-)</[sS][tT][yY][lL][eE]%s*>") do
         style_blocks[#style_blocks + 1] = css
     end
     local styles = table.concat(style_blocks, "\n")
-    local markup = html:gsub("<[sS][tT][yY][lL][eE][^>]*>.-</[sS][tT][yY][lL][eE]%s*>", "")
-    local used_classes = {}
-    for quoted in markup:gmatch('[cC][lL][aA][sS][sS]%s*=%s*"([^"]+)"') do
-        for name in quoted:gmatch("[^%s]+") do
-            used_classes[name] = true
-        end
-    end
-    for quoted in markup:gmatch("[cC][lL][aA][sS][sS]%s*=%s*'([^']+)'") do
-        for name in quoted:gmatch("[^%s]+") do
-            used_classes[name] = true
-        end
-    end
     for attrs in html:gmatch("<[iI][mM][gG]%f[%s/>]([^>]*)>") do
         local src = attrs:match('%f[%w][sS][rR][cC]%s*=%s*"([^"]+)"')
             or attrs:match("%f[%w][sS][rR][cC]%s*=%s*'([^']+)'")
@@ -341,11 +336,14 @@ apply_local = function(html, item, path)
     end
     -- Also replace the complete CSS url() token.  This covers CSS escaping
     -- and whitespace around the URL where a plain string replacement can
-    -- leave the declaration pointing at the remote resource.
-    local escaped = item.url:gsub("([%%%]%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
-    html = html:gsub("([uU][rR][lL]%s*%(%s*['\"]?)" .. escaped .. "(['\"]?%s*%))", function(prefix, suffix)
-        return prefix .. local_src .. suffix
-    end)
+    -- leave the declaration pointing at the remote resource.  Only text that
+    -- replace_all left behind can match, so skip the scan when none is left.
+    if html:find(item.url, 1, true) then
+        local escaped = item.url:gsub("([%%%]%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+        html = html:gsub("([uU][rR][lL]%s*%(%s*['\"]?)" .. escaped .. "(['\"]?%s*%))", function(prefix, suffix)
+            return prefix .. local_src .. suffix
+        end)
+    end
     return html, local_src
 end
 
@@ -619,6 +617,7 @@ function Images.localize(html, book_dir, on_progress, opts)
     local ok_count, fail_count, done = 0, 0, 0
     local jobs = {}
     for i, item in ipairs(urls) do
+        Slice.point()
         item.stem = stem_for(cache_dir, item.url)
         item.referer = referer
         item.index = i
