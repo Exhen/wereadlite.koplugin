@@ -13,6 +13,19 @@ local Shelf = {
     next_idx = 0,
     kk_idx = -1,
     eof = false,
+    -- When the book list was last confirmed by the server, and for which
+    -- account.  The list stays in memory across visits (a book is read in a
+    -- separate document, which does not unload the plugin), so coming back to
+    -- the shelf can show it at once and check for changes in the background.
+    fetched_at = nil,
+    cached_vid = nil,
+    -- Bumped whenever the list is replaced, so a page request that was in flight
+    -- for the old list can be told apart from one for the current list.
+    generation = 0,
+    -- A cached list younger than this is shown without asking the server.
+    CACHE_FRESH = 60,
+    -- A cached list older than this is not shown at all; the shelf loads normally.
+    CACHE_MAX_AGE = 6 * 3600,
 }
 
 local session_job
@@ -161,6 +174,9 @@ function Shelf.reset()
     Shelf.next_idx = 0
     Shelf.kk_idx = -1
     Shelf.eof = false
+    Shelf.fetched_at = nil
+    Shelf.cached_vid = nil
+    Shelf.generation = Shelf.generation + 1
 end
 
 local function put_books(idx, books)
@@ -240,19 +256,91 @@ local function missing_api_idx(first, last)
     end
 end
 
+-- True when the books and total in a fresh shelf page are the ones already held.
+local function same_first_page(books, total)
+    if (tonumber(Shelf.total) or 0) ~= (tonumber(total) or 0) then
+        return false
+    end
+    for i, book in ipairs(books) do
+        local held = Shelf.books[i]
+        if type(held) ~= "table" or tostring(held.bookId) ~= tostring(book.bookId) then
+            return false
+        end
+    end
+    return true
+end
+
 local function seed_from_html(html)
     local books, total, kk_idx = Shelf.parse_books_html(html)
     if not books or #books == 0 then
         return
     end
-    Shelf.books = {}
-    put_books(0, books)
-    Shelf.total = total
-    Shelf.kk_idx = kk_idx
-    Shelf.next_idx = #books
-    if Shelf.total > 0 and Shelf.range_loaded(1, Shelf.total) then
-        Shelf.eof = true
+    if same_first_page(books, total) then
+        -- Nothing moved: refresh the first page in place and keep the later pages
+        -- that are already loaded instead of fetching them again.
+        for i, book in ipairs(books) do
+            local held = Shelf.books[i]
+            for key, value in pairs(book) do
+                held[key] = value
+            end
+        end
+        Shelf.kk_idx = kk_idx
+    else
+        Shelf.generation = Shelf.generation + 1
+        Shelf.books = {}
+        put_books(0, books)
+        Shelf.total = total
+        Shelf.kk_idx = kk_idx
+        Shelf.next_idx = #books
+        Shelf.eof = false
+        if Shelf.total > 0 and Shelf.range_loaded(1, Shelf.total) then
+            Shelf.eof = true
+        end
     end
+    Shelf.fetched_at = os.time()
+    Shelf.cached_vid = tostring(CookieStore.get("wr_vid") or "")
+end
+
+function Shelf.cache_age()
+    if not Shelf.fetched_at then
+        return nil
+    end
+    return math.max(0, os.time() - Shelf.fetched_at)
+end
+
+-- Can the shelf already held in memory be shown right away?  It must belong to
+-- the signed-in account, be recent enough, and cover the whole first page as it
+-- is laid out now (the grid size may have changed since).
+function Shelf.cache_usable()
+    local age = Shelf.cache_age()
+    if not age or age > Shelf.CACHE_MAX_AGE or not Shelf.user or not Shelf.has_books() then
+        return false
+    end
+    if Shelf.cached_vid == nil or Shelf.cached_vid ~= tostring(CookieStore.get("wr_vid") or "") then
+        return false
+    end
+    return Shelf.range_loaded(1, Shelf.books_needed(1))
+end
+
+-- A cached shelf this young is not worth asking the server about again.
+function Shelf.cache_fresh()
+    local age = Shelf.cache_age()
+    return age ~= nil and age < Shelf.CACHE_FRESH
+end
+
+-- What the first page looks like: changes when a book is added, removed or
+-- moved, or the account's name/avatar/book count changes.
+function Shelf.signature()
+    local parts = { tostring(Shelf.total) }
+    local user = Shelf.user or {}
+    parts[#parts + 1] = tostring(user.name) .. "|" .. tostring(user.avatar)
+        .. "|" .. tostring(user.deep_v_title) .. "|" .. tostring(user.medal_level)
+    local last = Settings.first_page_books()
+    for i = 1, last do
+        local book = Shelf.books[i]
+        parts[#parts + 1] = type(book) == "table" and tostring(book.bookId) or "-"
+    end
+    return table.concat(parts, ",")
 end
 
 -- Refresh the WeRead web session without requiring the shelf UI to be opened.
@@ -544,9 +632,17 @@ function Shelf.ensure_range(first, last, on_done)
         idx = idx,
         total = Shelf.total,
     })
+    local generation = Shelf.generation
     Shelf.fetch_api_page(idx, function(page, status, err)
         if not page then
             on_done(Shelf.books, status, err)
+            return
+        end
+        if generation ~= Shelf.generation then
+            -- The list was replaced while this page was on its way, so its
+            -- positions no longer match; ask again for the current list.
+            Log.dbg("shelf", "ensure_range_stale", { idx = idx })
+            Shelf.ensure_range(first, last, on_done)
             return
         end
         if tonumber(page.total) and page.total > 0 then

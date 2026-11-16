@@ -234,7 +234,14 @@ function ShelfView:init()
         Hold = { GestureRange:new{ ges = "hold", range = self.dimen } },
         Swipe = { GestureRange:new{ ges = "swipe", range = self.dimen } },
     }
-    self:_set_body(self:_status_widget("正在加载书架…"))
+    if Shelf.cache_usable() then
+        -- Back from a book: show the shelf already held right away; _load_first
+        -- then checks with the server in the background.
+        self._from_cache = true
+        self:_paint()
+    else
+        self:_set_body(self:_status_widget("正在加载书架…"))
+    end
 end
 
 function ShelfView:start_load()
@@ -669,7 +676,68 @@ function ShelfView:_expire()
     end
 end
 
+-- Delay before asking the server, so the first paint and the covers go first.
+local REVALIDATE_DELAY = 1
+
+-- The shelf on screen came from memory.  Ask the server whether anything changed
+-- and update the screen only if it did; a failed check (offline, server error)
+-- leaves the shelf as it is.
+function ShelfView:_revalidate()
+    local before = Shelf.signature()
+    Shelf.ensure_user(function(user, status, err)
+        if self._closed then
+            return
+        end
+        if not user then
+            if status == "auth_expired" or tostring(err or ""):find("userInfo missing", 1, true) then
+                self:_expire()
+            else
+                Log.dbg("shelf", "revalidate_failed", { status = status, err = err })
+            end
+            return
+        end
+        Shelf.ensure_books(Shelf.books_needed(1), function(_, book_status)
+            if self._closed then
+                return
+            end
+            if book_status and book_status ~= "ok" and not Shelf.has_books() then
+                return
+            end
+            if Shelf.signature() == before then
+                Log.dbg("shelf", "revalidate_same")
+                return
+            end
+            Log.info("shelf", "revalidate_changed")
+            if self:_is_search() then
+                return
+            end
+            if (self.page or 1) > 1 then
+                -- The pages behind the first one were replaced; load this one again.
+                self:_goto(self.page)
+            else
+                self:_paint()
+                self:_prefetch_covers()
+            end
+        end)
+    end)
+end
+
 function ShelfView:_load_first()
+    if self._from_cache then
+        self._from_cache = false
+        self:_prefetch_covers()
+        self:_start_clock()
+        if Shelf.cache_fresh() then
+            Log.dbg("shelf", "revalidate_skip", { age = Shelf.cache_age() })
+        else
+            UIManager:scheduleIn(REVALIDATE_DELAY, function()
+                if not self._closed then
+                    self:_revalidate()
+                end
+            end)
+        end
+        return
+    end
     Shelf.ensure_user(function(user, status, err)
         if self._closed then
             return
