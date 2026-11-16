@@ -35,6 +35,17 @@ local Http = {
     DNS_WAIT_DELAY = 2,
 }
 
+-- Requests are noticed as finished by polling.  Most are short (an API call, a
+-- chapter page), so look early and back off for long downloads: with a flat
+-- POLL every request would wait up to a whole POLL after it was already done,
+-- and opening a book chains several of them.
+local POLL_STEPS = { 0.03, 0.05, 0.08, 0.12, 0.2 }
+
+function Http.poll_delay(job)
+    job.polls = (job.polls or 0) + 1
+    return POLL_STEPS[job.polls] or Http.POLL
+end
+
 local ffiUtil
 local buffer_mod
 local job_seq = 0
@@ -540,7 +551,7 @@ end
 
 arm_subprocess = function(job)
     local util = get_ffiutil()
-    UIManager:scheduleIn(Http.POLL, function()
+    UIManager:scheduleIn(Http.poll_delay(job), function()
         if job.cancelled or job.done then
             if job.cancelled then
                 collect_subprocess(job)
@@ -824,7 +835,7 @@ local function finish_curl(job)
 end
 
 local function arm_curl(job)
-    UIManager:scheduleIn(Http.POLL, function()
+    UIManager:scheduleIn(Http.poll_delay(job), function()
         if job.cancelled then
             kill_job(job)
             active_jobs[job] = nil

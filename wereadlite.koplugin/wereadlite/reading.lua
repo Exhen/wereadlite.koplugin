@@ -220,8 +220,26 @@ function Reading.apply_document_toc(ui)
     end
 end
 
+-- The full table of contents is not needed to show the first page, so it is
+-- fetched in the background after the book is open instead of delaying the open.
+local function catalog_done(state)
+    local total = tonumber(state.chapter_count) or 0
+    if total > 0 and #Reading.chapters >= total then
+        return true
+    end
+    return total <= 0 and #(state.chapters or {}) > 0
+end
+
+function Reading.cancel_catalog()
+    local job = Reading._catalog_job
+    Reading._catalog_job = nil
+    if job and type(job.cancel) == "function" then
+        pcall(job.cancel, job)
+    end
+end
+
 local function ensure_catalog(state)
-    if Reading.catalog_complete or not state then
+    if Reading.catalog_complete or not state or Reading._catalog_job then
         return
     end
     local total = tonumber(state.chapter_count) or 0
@@ -229,18 +247,30 @@ local function ensure_catalog(state)
         Reading.catalog_complete = true
         return
     end
-    local ok, chapters = pcall(Reader.expand_catalog, state)
-    if ok and type(chapters) == "table" and #chapters > 0 then
-        state.chapters = chapters
-        merge_chapters(state)
-    elseif not ok then
-        Log.warn("reading", "catalog", { err = chapters })
-    end
-    if total > 0 and #Reading.chapters >= total then
-        Reading.catalog_complete = true
-    elseif total <= 0 and #(state.chapters or {}) > 0 then
-        Reading.catalog_complete = true
-    end
+    local job
+    job = Reader.expand_catalog(state, function(chapters)
+        if Reading._catalog_job == job then
+            Reading._catalog_job = nil
+        end
+        if type(chapters) == "table" and #chapters > 0 then
+            state.chapters = chapters
+            merge_chapters(state)
+        end
+        if catalog_done(state) then
+            Reading.catalog_complete = true
+        end
+        -- Chapters opened since then keep working from the merged list, and a
+        -- table of contents already built from the partial list is rebuilt.
+        if Reading.state then
+            Reading.state.chapters = Reading.chapters
+        end
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and Reading.is_ours(ui.document and ui.document.file) then
+            Reading.apply_document_toc(ui)
+        end
+    end)
+    Reading._catalog_job = job
 end
 
 function Reading.is_ours(file)
@@ -496,7 +526,10 @@ local function resume_before_first_paint(reader, resume, path, state)
     return jumped
 end
 
-local function open_document(path, resume, state)
+-- hooks.before_show runs while the new reader is being built, before KOReader
+-- puts it on screen.
+local function open_document(path, resume, state, hooks)
+    hooks = hooks or {}
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
     Reader.clear_sidecars(path)
@@ -506,6 +539,18 @@ local function open_document(path, resume, state)
     -- KOReader calls this as reader:after_open_callback(), with the new ReaderUI.
     local function after_open(reader)
         Reading._preserve_html = nil
+        if hooks.before_show then
+            -- The load box is modal, and KOReader never stacks a normal window
+            -- above a modal one: once the reader is shown the box would still be
+            -- painted over the book, and closing it then repaints the page.
+            -- Dropping it now, before anything is shown, means the first paint
+            -- is just the book.  Nothing is drawn in between: this runs inside
+            -- the same UI tick that shows the reader.
+            local ok_hook, hook_err = pcall(hooks.before_show)
+            if not ok_hook then
+                Log.warn("reading", "before_show", { err = hook_err })
+            end
+        end
         Reading.ensure_reader_font_size(reader)
         Reading.snapshot_reader_font_size(reader)
         -- This runs before the new reader is shown. A shelf left underneath
@@ -611,11 +656,12 @@ function Reading.open_url(url, book, opts)
     local bar, bar_timer
     -- Shown only when a network load is actually needed (not on a prefetch
     -- hit), so the user can still force-cancel large chapters.
-    local function show_bar()
+    local function show_bar(stage)
         if bar then
             return
         end
         local ok_bar, opened = pcall(LoadProgress.open, {
+            stage = stage,
             on_cancel = function()
                 Reading.cancel_load()
             end,
@@ -658,18 +704,53 @@ function Reading.open_url(url, book, opts)
             end
         end
     end
-    local function close_bar()
+    -- Safety net: if the reader never comes up, do not leave the box on screen.
+    local OPEN_TIMEOUT = 30
+    local bar_watchdog
+    local function close_bar(quiet)
         if bar_timer then
             UIManager:unschedule(bar_timer)
             bar_timer = nil
+        end
+        if bar_watchdog then
+            UIManager:unschedule(bar_watchdog)
+            bar_watchdog = nil
         end
         if Reading._load_bar == bar then
             Reading._load_bar = nil
         end
         if bar then
-            pcall(bar.close, bar)
+            pcall(bar.close, bar, quiet)
             bar = nil
         end
+    end
+    -- Downloading is finished but the reader still has to load and lay out the
+    -- text, which is the slow part of opening a book.  Keep the box up for it
+    -- (showing it now when the download was too quick to have needed one) so the
+    -- screen never sits idle between the box and the book.
+    local function show_opening()
+        if bar_timer then
+            UIManager:unschedule(bar_timer)
+            bar_timer = nil
+        end
+        if not bar and opts.resume ~= true then
+            return
+        end
+        if bar then
+            if Settings.show_chapter_load_progress() then
+                pcall(bar.update, bar, "open", 1, 1)
+            end
+        else
+            show_bar("open")
+        end
+        if not bar then
+            return
+        end
+        bar_watchdog = function()
+            bar_watchdog = nil
+            close_bar()
+        end
+        UIManager:scheduleIn(OPEN_TIMEOUT, bar_watchdog)
     end
 
     local function complete(state, status, err)
@@ -682,8 +763,8 @@ function Reading.open_url(url, book, opts)
             return
         end
         Reading._load_task = nil
-        close_bar()
         if not state then
+            close_bar()
             -- User cancelled: do not toast a failure.
             if status == "cancelled" or tostring(err or ""):find("cancel", 1, true) then
                 Log.info("reading", "open_cancelled")
@@ -697,7 +778,6 @@ function Reading.open_url(url, book, opts)
             Reading.book = book
         end
         merge_chapters(state)
-        ensure_catalog(state)
         Reading.state = state
         -- A background prefetch runs the same pipeline as an open, so review
         -- metadata must be activated only when its chapter is actually shown.
@@ -707,13 +787,25 @@ function Reading.open_url(url, book, opts)
         if opts.resume == true then
             resume = { percent = state.resume_percent, anchor = state.resume_anchor }
         end
-        local opened, open_err = pcall(open_document, state.html_path, resume, state)
+        show_opening()
+        local opened, open_err = pcall(open_document, state.html_path, resume, state, {
+            before_show = function()
+                close_bar(true)
+            end,
+        })
         if not opened then
+            close_bar()
             Reader.remove_chapter(state.html_path)
             show_error("打开章节失败")
             Log.warn("reading", "open_document", { err = open_err })
             return
         end
+        -- Not needed to show the page; load it once the reader is up.
+        UIManager:scheduleIn(0.5, function()
+            if Reading.state == state then
+                ensure_catalog(state)
+            end
+        end)
         pcall(BookDb.save_last_read, Reading.book, {
             book_info = state.book_info,
             chapter_title = state.chapter_title or (state.cur and state.cur.title),
@@ -837,6 +929,7 @@ function Reading.open_book(book)
         return
     end
     Reading.cancel_load()
+    Reading.cancel_catalog()
     Reading.book = book
     Reading.chapters = {}
     Reading.state = nil
@@ -848,6 +941,7 @@ function Reading.open_book(book)
     UIManager:nextTick(function()
         local ok, status, err = Reading.open_url(url, book, { resume = true })
         if ok then
+            UIManager:nextTick(Reader.warm_up)
             return
         end
         if status == "auth_expired" then
@@ -902,6 +996,7 @@ function Reading.show_wechat_shelf()
     end
     Reading._returning = true
     Reading.cancel_load()
+    Reading.cancel_catalog()
     Heartbeat.stop(false)
     Reader.cleanup_reading()
     local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")

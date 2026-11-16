@@ -188,6 +188,14 @@ local function strip_footnote_markup(html)
     return html
 end
 
+-- The original-text copy of the chapter is written in the background after the
+-- chapter opens; make sure it is there before it is read.
+local function ensure_enc(state)
+    if type(state) == "table" and type(state.ensure_enc) == "function" then
+        pcall(state.ensure_enc)
+    end
+end
+
 local function chapter_plain(path, should_decode)
     local html = strip_footnote_markup(chapter_html(path))
     local text = normalize(plain_text(html))
@@ -312,6 +320,7 @@ end
 
 function Bookmark.build_payload(item, state)
     state = state or {}
+    ensure_enc(state)
     item = item or {}
     local book_id = tostring(state.book_id or "")
     local cur = state.cur or {}

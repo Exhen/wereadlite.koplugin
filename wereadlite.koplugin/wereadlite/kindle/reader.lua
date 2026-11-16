@@ -20,6 +20,12 @@ Reader._prefetch_job = nil
 Reader._prefetch_url = nil
 Reader._prefetched = {}
 
+-- Builds the font-decoding tables now, while the first request is still in
+-- flight, instead of in the middle of decoding the first chapter.
+function Reader.warm_up()
+    pcall(Codec.has_map)
+end
+
 function Reader.take_prefetched(url)
     url = tostring(url or "")
     local state = Reader._prefetched[url]
@@ -666,7 +672,9 @@ local function chapters_from_catalog(infos, url_rows)
     return chapters
 end
 
-function Reader.fetch_catalog_page(book_id, typ, range_start, range_end)
+-- Asks for one page of the table of contents; callback(chapters, status, err).
+-- Returns the HTTP handle so the caller can cancel it.
+local function fetch_catalog_page_async(book_id, typ, range_start, range_end, callback)
     local url = string.format(
         "%s?type=%s&bookId=%s&rangeStart=%s&rangeEnd=%s&platform=desktop",
         Config.CATALOG_MORE_URL,
@@ -682,41 +690,57 @@ function Reader.fetch_catalog_page(book_id, typ, range_start, range_end)
         range_end = range_end,
         url = url,
     })
-    local body, status, err = Client.request({
+    return AsyncHttp.request({
         url = url,
+        timeout = 20,
         accept = "application/json, */*;q=0.8",
         referer = Config.READER_URL,
-        timeout = 20,
-    })
-    if not body then
-        return nil, status or "http_error", err
-    end
-    local data, decode_err = Json.decode(body)
-    if not data then
-        return nil, "http_error", decode_err
-    end
-    local err_status, err_msg = catalog_api_error(data)
-    if err_status then
-        return nil, err_status, err_msg
-    end
-    local infos = data.chapterInfos or data.chapterInfo or {}
-    local urls = data.readerUrlParmas or data.readerUrlParams or {}
-    return chapters_from_catalog(infos, urls)
+    }, function(res)
+        if not res or not res.ok or not res.body or #res.body == 0 then
+            callback(nil, res and res.status or "http_error", res and res.err)
+            return
+        end
+        local data, decode_err = Json.decode(res.body)
+        if not data then
+            callback(nil, "http_error", decode_err)
+            return
+        end
+        local err_status, err_msg = catalog_api_error(data)
+        if err_status then
+            callback(nil, err_status, err_msg)
+            return
+        end
+        local infos = data.chapterInfos or data.chapterInfo or {}
+        local urls = data.readerUrlParmas or data.readerUrlParams or {}
+        callback(chapters_from_catalog(infos, urls))
+    end)
 end
 
-function Reader.expand_catalog(state)
-    if not state then
-        return {}
+-- Loads the rest of the book's table of contents without blocking the UI.
+-- on_done(chapters) gets the merged list (the chapters already known when the
+-- catalog cannot be fetched).  Returns a job with cancel(); on_done is not
+-- called after a cancel.
+function Reader.expand_catalog(state, on_done)
+    local job = { cancelled = false }
+    function job:cancel()
+        self.cancelled = true
+        if self.handle then
+            pcall(AsyncHttp.cancel, self.handle)
+            self.handle = nil
+        end
     end
-    local existing = state.chapters or {}
-    local book_id = as_text(state.book_id)
-    local total = as_number(state.chapter_count)
-    if book_id == "" or book_id == "nil" then
-        return existing
+    local existing = state and state.chapters or {}
+    local book_id = as_text(state and state.book_id)
+    local total = as_number(state and state.chapter_count)
+    if book_id == "" or book_id == "nil" or (total > 0 and #existing >= total) then
+        UIManager:nextTick(function()
+            if not job.cancelled then
+                on_done(existing)
+            end
+        end)
+        return job
     end
-    if total > 0 and #existing >= total then
-        return existing
-    end
+
     local by_uid = {}
     local function absorb(list)
         for _, chapter in ipairs(list or {}) do
@@ -743,15 +767,6 @@ function Reader.expand_catalog(state)
             end
         end
     end
-    absorb(existing)
-    local first, status, err = Reader.fetch_catalog_page(book_id, 3, 0, #existing)
-    if not first then
-        Log.warn("reader", "catalog_first", { status = status, err = err })
-        return existing
-    end
-    absorb(first)
-    local range_start, range_end = 0, #first
-    local guard = 0
     local function count()
         local n = 0
         for _ in pairs(by_uid) do
@@ -759,31 +774,71 @@ function Reader.expand_catalog(state)
         end
         return n
     end
-    while guard < 40 and (total <= 0 or count() < total) do
-        guard = guard + 1
-        local more, more_status, more_err = Reader.fetch_catalog_page(book_id, 2, range_start, range_end)
-        if not more or #more == 0 then
-            if more_status then
-                Log.warn("reader", "catalog_more", { status = more_status, err = more_err })
+    local function finish(partial)
+        job.handle = nil
+        if job.cancelled then
+            return
+        end
+        if partial then
+            on_done(existing)
+            return
+        end
+        local list = {}
+        for _, chapter in pairs(by_uid) do
+            list[#list + 1] = chapter
+        end
+        table.sort(list, function(a, b)
+            return (a.idx or 0) < (b.idx or 0)
+        end)
+        Log.info("reader", "catalog_ready", { book_id = book_id, chapters = #list, total = total })
+        on_done(list)
+    end
+
+    absorb(existing)
+    job.handle = fetch_catalog_page_async(book_id, 3, 0, #existing, function(first, status, err)
+        job.handle = nil
+        if job.cancelled then
+            return
+        end
+        if not first then
+            Log.warn("reader", "catalog_first", { status = status, err = err })
+            finish(true)
+            return
+        end
+        absorb(first)
+        local range_start, range_end = 0, #first
+        local guard = 0
+        local function next_page()
+            if guard >= 40 or (total > 0 and count() >= total) then
+                finish()
+                return
             end
-            break
+            guard = guard + 1
+            job.handle = fetch_catalog_page_async(book_id, 2, range_start, range_end, function(more, more_status, more_err)
+                job.handle = nil
+                if job.cancelled then
+                    return
+                end
+                if not more or #more == 0 then
+                    if more_status then
+                        Log.warn("reader", "catalog_more", { status = more_status, err = more_err })
+                    end
+                    finish()
+                    return
+                end
+                local before = count()
+                absorb(more)
+                if count() <= before then
+                    finish()
+                    return
+                end
+                range_end = range_end + #more
+                next_page()
+            end)
         end
-        local before = count()
-        absorb(more)
-        if count() <= before then
-            break
-        end
-        range_end = range_end + #more
-    end
-    local list = {}
-    for _, chapter in pairs(by_uid) do
-        list[#list + 1] = chapter
-    end
-    table.sort(list, function(a, b)
-        return (a.idx or 0) < (b.idx or 0)
+        next_page()
     end)
-    Log.info("reader", "catalog_ready", { book_id = book_id, chapters = #list, total = total })
-    return list
+    return job
 end
 
 function Reader.fetch(url)
@@ -1591,6 +1646,57 @@ local function download_sections_background(state, url, html, report, job, on_pa
     end)
 end
 
+-- The "encrypted" copy of a chapter (the original, still font-encoded text) is
+-- only read by heartbeat and bookmark sync, never to show the page, so it is
+-- built after the chapter is ready instead of before.  ensure() builds it right
+-- now for anything that needs it earlier; start() builds it in the background.
+local function deferred_build(compute, write, is_cancelled)
+    local self = { built = false }
+    local function finish(ok, result)
+        self.built = true
+        if not ok then
+            Log.warn("reader", "encrypted_copy_fail", { err = tostring(result) })
+            return
+        end
+        write(result)
+    end
+    function self.ensure()
+        if self.built then
+            return
+        end
+        self.built = true
+        local ok, result = pcall(compute)
+        if ok then
+            write(result)
+        else
+            Log.warn("reader", "encrypted_copy_fail", { err = tostring(result) })
+        end
+    end
+    function self.start()
+        Slice.run(compute, function(ok, result)
+            if self.built then
+                return
+            end
+            if not ok then
+                -- Never lose the copy over a slicing problem: redo it in one go.
+                Log.warn("reader", "slice_fallback", { err = tostring(result) })
+                local redone, again = pcall(compute)
+                finish(redone, again)
+                return
+            end
+            finish(true, result)
+        end, {
+            cancelled = function()
+                return self.built or (is_cancelled and is_cancelled())
+            end,
+            fast = function()
+                return false
+            end,
+        })
+    end
+    return self
+end
+
 local function assemble_chapter(state, pages, url, book, on_progress, on_ready, opts, job)
     opts = type(opts) == "table" and opts or {}
     local background = load_background_mode(opts)
@@ -1666,7 +1772,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         })
     end
 
-    local encrypted, decrypted, source_css = {}, {}, ""
+    local decrypted, source_css = {}, ""
     -- Smallest wco and total visible characters of the decoded pages so far.
     local first_wco, loaded_chars = nil, 0
     local cur_sect = math.max(0, tonumber(state.section) or 0)
@@ -1675,16 +1781,15 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         section_count = 1
     end
 
-    -- CPU-heavy part of one page: decoded and original markup, plus what
-    -- after_decode needs to know about it.  Pure, so it can be sliced.
+    -- CPU-heavy part of one page: decoded markup, plus what after_decode needs
+    -- to know about it.  Pure, so it can be sliced.
     local function decode_page(page, need_css)
         local css = need_css and Codec.reader_styles(page) or ""
         local dec_part = collect_content(page, true)
         if not dec_part then
             return css
         end
-        local enc_part = collect_content(page, false) or ""
-        return css, dec_part, enc_part, min_wco_of(dec_part), text_length(dec_part)
+        return css, dec_part, min_wco_of(dec_part), text_length(dec_part)
     end
 
     local function add_page_summary(page_wco, page_chars)
@@ -1743,8 +1848,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
         })
 
-        local encrypted_body = table.concat(encrypted, "\n")
-
         local function wrap_body(body_html, is_enc)
             return Codec.wrap_html({
                 title = chapter_title,
@@ -1755,14 +1858,39 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             })
         end
 
-        local function finish_write(decrypted_html, encrypted_html)
+        -- Pages 1..decoded_pages are the ones that made it into the chapter.
+        local decoded_pages = #decrypted
+        local encrypted_pages = pages
+        local function encrypted_compute()
+            local parts = {}
+            for i = 1, decoded_pages do
+                parts[i] = collect_content(encrypted_pages[i], false) or ""
+                Slice.point()
+            end
+            local source = wrap_body(strip_wco_spans(table.concat(parts, "\n")), true)
+            return Images.localize(source, dir, nil, { fetch = false })
+        end
+        local encrypted_copy = deferred_build(encrypted_compute, function(encrypted_html)
+            encrypted_pages = nil
+            -- The chapter may have been replaced or removed in the meantime.
+            local chapter = io.open(path, "rb")
+            if not chapter then
+                return
+            end
+            chapter:close()
+            write_html(enc_path, encrypted_html)
+        end, function()
+            return job and job.cancelled
+        end)
+        state.ensure_enc = encrypted_copy.ensure
+
+        local function finish_write(decrypted_html)
             if job and job.cancelled then
                 return
             end
             if not write_html(path, decrypted_html) then
                 return fail("http_error", "write chapter html failed")
             end
-            write_html(enc_path, encrypted_html)
             state.url = url
             state.html_path = path
             state.html_enc_path = enc_path
@@ -1781,8 +1909,15 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                 chapter_offset = offset,
                 background = background,
             })
+            -- Without a job nobody gets a callback to carry on from, so finish now.
+            if not job then
+                encrypted_copy.ensure()
+            end
             if type(ready_cb()) == "function" then
                 invoke_ready(state)
+            end
+            if job then
+                encrypted_copy.start()
             end
             return state
         end
@@ -1796,16 +1931,13 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             local function render()
                 local wrap_started = Log.now_ms()
                 local decrypted_source = wrap_body(strip_wco_spans(body), false)
-                local encrypted_source = wrap_body(strip_wco_spans(encrypted_body), true)
                 Log.dbg("reader", "wrap", {
                     css_bytes = #source_css,
                     decrypted_bytes = #decrypted_source,
                     elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
                 })
                 -- Image binaries were fetched in the images stage; only remap URLs here.
-                local decrypted_html = Images.localize(decrypted_source, dir, nil, { fetch = false })
-                local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
-                return decrypted_html, encrypted_html
+                return Images.localize(decrypted_source, dir, nil, { fetch = false })
             end
             if background then
                 return sliced(render, finish_write)
@@ -1925,7 +2057,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             local need_css = source_css == ""
             sliced(function()
                 return decode_page(page, need_css)
-            end, function(css, dec_part, enc_part, page_wco, page_chars)
+            end, function(css, dec_part, page_wco, page_chars)
                 if need_css then
                     source_css = css
                 end
@@ -1938,7 +2070,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                     return
                 end
                 decrypted[#decrypted + 1] = dec_part
-                encrypted[#encrypted + 1] = enc_part
                 add_page_summary(page_wco, page_chars)
                 Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
                 index = index + 1
@@ -1951,7 +2082,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
 
     for i, page in ipairs(pages) do
         local need_css = source_css == ""
-        local css, dec_part, enc_part, page_wco, page_chars = decode_page(page, need_css)
+        local css, dec_part, page_wco, page_chars = decode_page(page, need_css)
         if need_css then
             source_css = css
         end
@@ -1962,7 +2093,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             break
         end
         decrypted[#decrypted + 1] = dec_part
-        encrypted[#encrypted + 1] = enc_part
         add_page_summary(page_wco, page_chars)
         Log.dbg("reader", "decode", { page = i, pages = #pages, bytes = #dec_part })
     end

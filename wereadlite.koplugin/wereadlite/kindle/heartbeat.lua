@@ -92,6 +92,10 @@ local function plain_text(html)
 end
 
 local function enc_text(state)
+    -- Written in the background after the chapter opens; build it now if not yet.
+    if type(state) == "table" and type(state.ensure_enc) == "function" then
+        pcall(state.ensure_enc)
+    end
     local path = state and state.html_enc_path
     if not path or path == "" then
         return ""
