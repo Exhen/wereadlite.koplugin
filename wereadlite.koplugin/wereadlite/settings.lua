@@ -20,6 +20,8 @@ local Settings = {
     GRID_FONT_MIN = 12,
     GRID_FONT_MAX = 28,
     GRID_FONT_DEFAULT = 18,
+    READER_FONT_MIN = 12,
+    READER_FONT_MAX = 255,
     IMAGE_CONCURRENCY_MIN = 1,
     IMAGE_CONCURRENCY_MAX = 8,
     IMAGE_CONCURRENCY_DEFAULT = 4,
@@ -975,6 +977,48 @@ function Settings.set_grid_font_size(value)
     data:saveSetting("grid_font_size", value)
     data:flush()
     Log.info("settings", "grid_font_size", { value = value })
+    return value
+end
+
+-- Reader typography lives here, not in KOReader's per-document sidecar: every
+-- WeRead chapter is a new HTML file whose sidecar is cleared on open, so a size
+-- stored there would be lost at the next chapter or on re-entering the book.
+-- Each book keeps its own size; nil means the book was never adjusted and
+-- KOReader's default applies.
+function Settings.reader_font_size(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil
+    end
+    local data = Settings.load()
+    local sizes = data:readSetting("reader_font_sizes")
+    local value = type(sizes) == "table" and tonumber(sizes[book_id]) or nil
+    if not value then
+        return nil
+    end
+    return math.max(Settings.READER_FONT_MIN, math.min(Settings.READER_FONT_MAX, value))
+end
+
+function Settings.set_reader_font_size(book_id, value)
+    book_id = tostring(book_id or "")
+    value = tonumber(value)
+    if book_id == "" or not value then
+        return nil
+    end
+    -- Keep halves: the fine-tune control steps by 0.5.
+    value = math.max(Settings.READER_FONT_MIN, math.min(Settings.READER_FONT_MAX, value))
+    local data = Settings.load()
+    local sizes = data:readSetting("reader_font_sizes")
+    if type(sizes) ~= "table" then
+        sizes = {}
+    end
+    if tonumber(sizes[book_id]) == value then
+        return value
+    end
+    sizes[book_id] = value
+    data:saveSetting("reader_font_sizes", sizes)
+    data:flush()
+    Log.info("settings", "reader_font_size", { book_id = book_id, value = value })
     return value
 end
 

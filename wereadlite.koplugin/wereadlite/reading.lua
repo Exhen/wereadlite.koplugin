@@ -251,6 +251,18 @@ function Reading.is_ours(file)
             or file:find("微信阅读", 1, true) ~= nil)
 end
 
+-- Chapters live in <plugin>/data/reading/<book_id>/<chapter>.html, so the
+-- directory name is the book the font-size setting belongs to.  Parse it from
+-- the path itself: KOReader may hand us the file in a different form (relative,
+-- doubled slashes) than the plugin root string, so a prefix match is unreliable.
+function Reading.book_id_from_path(file)
+    file = tostring(file or "")
+    if not Reading.is_ours(file) then
+        return nil
+    end
+    return file:match("/data/reading/([^/]+)/[^/]+$")
+end
+
 local function history_item_path(item)
     if type(item) == "table" then
         return item.file or item.path or item.filename
@@ -494,6 +506,8 @@ local function open_document(path, resume, state)
     -- KOReader calls this as reader:after_open_callback(), with the new ReaderUI.
     local function after_open(reader)
         Reading._preserve_html = nil
+        Reading.ensure_reader_font_size(reader)
+        Reading.snapshot_reader_font_size(reader)
         -- This runs before the new reader is shown. A shelf left underneath
         -- the reader would be repainted as soon as the next chapter switch
         -- closes the current document, so drop it now.
@@ -1120,6 +1134,91 @@ function Reading.is_active()
     return Reading.is_ours(file)
 end
 
+function Reading.save_reader_font_size(ui)
+    local document = ui and ui.document
+    local book_id = document and Reading.book_id_from_path(document.file)
+    local configurable = document and document.configurable
+    local size = configurable and tonumber(configurable.font_size)
+    if not book_id or not size then
+        Log.dbg("reading", "font_size_save_skip", {
+            file = document and document.file,
+            book_id = book_id,
+            size = size,
+        })
+        return
+    end
+    local ok, err = pcall(Settings.set_reader_font_size, book_id, size)
+    if not ok then
+        Log.warn("reading", "save_font_size", { book_id = book_id, err = err })
+    end
+end
+
+-- Called by KOReader's DocSettingsLoad event, after plugins are loaded and
+-- before ReaderConfig/ReaderFont read the document settings, so the chapter is
+-- laid out at the saved size from the start.  ReaderConfig reads CRE options
+-- from the document settings with the "copt_" prefix (CreOptions.prefix).
+function Reading.inject_reader_font_size(doc_settings, file)
+    local book_id = Reading.book_id_from_path(file)
+    if not book_id or not doc_settings then
+        return false
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size then
+        return false
+    end
+    doc_settings:saveSetting("copt_font_size", size)
+    Log.dbg("reading", "font_size_inject", { book_id = book_id, size = size })
+    return true
+end
+
+-- Safety net run once the new chapter is open: if the saved size did not make
+-- it into the layout for any reason, apply it directly.
+function Reading.ensure_reader_font_size(ui)
+    local document = ui and ui.document
+    local book_id = document and Reading.book_id_from_path(document.file)
+    local configurable = document and document.configurable
+    if not book_id or not configurable then
+        return
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size or tonumber(configurable.font_size) == size then
+        return
+    end
+    Log.warn("reading", "font_size_fallback", {
+        book_id = book_id,
+        have = configurable.font_size,
+        want = size,
+    })
+    local applied, err = pcall(function()
+        local Screen = Device.screen
+        configurable.font_size = size
+        document:setFontSize(Screen:scaleBySize(size))
+        ui:handleEvent(require("ui/event"):new("UpdatePos"))
+    end)
+    if not applied then
+        Log.warn("reading", "font_size_fallback_fail", { err = err })
+    end
+end
+
+-- Take the size the chapter opened with, so the close-time fallback can tell
+-- whether the user actually changed it and avoid pinning the default onto
+-- books that were only ever read as-is.
+function Reading.snapshot_reader_font_size(ui)
+    local configurable = ui and ui.document and ui.document.configurable
+    if configurable then
+        ui._wereadlite_font_size_opened = tonumber(configurable.font_size)
+    end
+end
+
+function Reading.save_reader_font_size_if_changed(ui)
+    local configurable = ui and ui.document and ui.document.configurable
+    local current = configurable and tonumber(configurable.font_size)
+    local opened = ui and tonumber(ui._wereadlite_font_size_opened)
+    if current and opened and current ~= opened then
+        Reading.save_reader_font_size(ui)
+    end
+end
+
 local function ours_from_toc(toc)
     local file = toc and toc.ui and toc.ui.document and toc.ui.document.file
     return Reading.is_ours(file)
@@ -1155,6 +1254,7 @@ local function install_close_hook()
         local file = self.document and self.document.file
         local ours = Reading.is_ours(file)
         if ours then
+            Reading.save_reader_font_size_if_changed(self)
             Heartbeat.stop(false)
         end
         local result
@@ -1480,6 +1580,28 @@ local function install_highlight_hook()
     Log.dbg("reading", "hook", { name = "highlight" })
 end
 
+local function install_font_size_hook()
+    -- Remember every font size the user picks in the reading menu for the book
+    -- being read, so its next chapter (and the next session) opens with it.
+    local ok_font, ReaderFont = pcall(require, "apps/reader/modules/readerfont")
+    if ok_font and ReaderFont and not ReaderFont._wereadlite_font_hooked then
+        ReaderFont._wereadlite_font_hooked = true
+        local original_set = ReaderFont.onSetFontSize
+        if type(original_set) == "function" then
+            function ReaderFont:onSetFontSize(size)
+                local result = original_set(self, size)
+                local file = self.ui and self.ui.document and self.ui.document.file
+                if Reading.is_ours(file) then
+                    Reading.save_reader_font_size(self.ui)
+                end
+                return result
+            end
+        end
+    end
+
+    Log.dbg("reading", "hook", { name = "reader_font_size" })
+end
+
 function Reading.install_hook()
     install_history_filter()
     install_end_of_book_hook()
@@ -1488,6 +1610,7 @@ function Reading.install_hook()
     install_toc_hook()
     install_review_link_hook()
     install_highlight_hook()
+    install_font_size_hook()
 end
 
 return Reading
