@@ -773,10 +773,30 @@ local function chapter_file_ok(path)
     return true
 end
 
+-- Put the load box on screen now.  UIManager:show() only queues a refresh, so
+-- anything slow that runs before the next paint tick (chapter teardown, decode
+-- tables, the first request) would delay the box by that much; painting it here
+-- keeps the tap responsive.
+function Reading.show_load_bar(stage)
+    local ok, widget = pcall(LoadProgress.open, {
+        stage = stage,
+        on_cancel = function()
+            Reading.cancel_load()
+        end,
+    })
+    if not ok then
+        Log.warn("reading", "progress_ui", { err = widget })
+        return nil
+    end
+    Reading._load_bar = widget
+    pcall(UIManager.forceRePaint, UIManager)
+    return widget
+end
+
 function Reading.open_url(url, book, opts)
     opts = opts or {}
     url = tostring(url or "")
-    Reading.cancel_load()
+    Reading.cancel_load(opts.bar)
     if opts.continue_sections then
         Reading._continuing_sections = true
     end
@@ -785,25 +805,25 @@ function Reading.open_url(url, book, opts)
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
     local bar, bar_timer
+    if opts.bar then
+        if Reading._load_bar ~= opts.bar then
+            -- Its cancel button was tapped while the open was being set up.
+            Log.info("reading", "open_cancelled_before_load")
+            return nil, "cancelled", "cancelled"
+        end
+        bar = opts.bar
+    elseif opts.resume == true then
+        -- Opening a whole book always takes a while (the reader still has to
+        -- load and lay out the text), so there is nothing to spare by waiting.
+        bar = Reading.show_load_bar("open")
+    end
     -- Shown only when a network load is actually needed (not on a prefetch
     -- hit), so the user can still force-cancel large chapters.
     local function show_bar(stage)
         if bar then
             return
         end
-        local ok_bar, opened = pcall(LoadProgress.open, {
-            stage = stage,
-            on_cancel = function()
-                Reading.cancel_load()
-            end,
-        })
-        if not ok_bar then
-            Log.warn("reading", "progress_ui", { err = opened })
-            bar = nil
-        else
-            bar = opened
-        end
-        Reading._load_bar = bar
+        bar = Reading.show_load_bar(stage)
     end
     -- A quick load finishes before this fires, so the screen is not flashed
     -- twice by a dialog that is gone a moment later.
@@ -1036,7 +1056,8 @@ function Reading.open_url(url, book, opts)
     return state
 end
 
-function Reading.cancel_load()
+-- keep_bar: the box is handed over to the load that is starting, so it stays up.
+function Reading.cancel_load(keep_bar)
     Reading._load_generation = (Reading._load_generation or 0) + 1
     Reading._continuing_sections = false
     local task = Reading._load_task
@@ -1045,8 +1066,8 @@ function Reading.cancel_load()
         pcall(task.cancel, task)
     end
     local bar = Reading._load_bar
-    Reading._load_bar = nil
-    if bar then
+    if bar and bar ~= keep_bar then
+        Reading._load_bar = nil
         pcall(bar.close, bar)
     end
     Log.info("reading", "load_cancelled")
@@ -1084,13 +1105,20 @@ function Reading.open_book(book)
     Reading.state = nil
     Reading.catalog_complete = false
     Heartbeat.stop(false)
+    -- Show the box on the tap: the prefetch teardown, the chapter cleanup and
+    -- the first request all keep the UI thread busy, so a box scheduled for
+    -- later would only appear seconds after the tap.
+    local bar = Reading.show_load_bar("open")
     Reader.cancel_prefetch()
     Reader.clear_prefetched()
     Reader.cleanup_reading()
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, book, { resume = true })
+        local ok, status, err = Reading.open_url(url, book, { resume = true, bar = bar })
         if ok then
             UIManager:nextTick(Reader.warm_up)
+            return
+        end
+        if status == "cancelled" then
             return
         end
         if status == "auth_expired" then
