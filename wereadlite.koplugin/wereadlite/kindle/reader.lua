@@ -20,14 +20,186 @@ Reader._prefetch_job = nil
 Reader._prefetch_url = nil
 Reader._prefetched = {}
 
+-- Builds the font-decoding tables now, while the first request is still in
+-- flight, instead of in the middle of decoding the first chapter.
+function Reader.warm_up()
+    pcall(Codec.has_map)
+end
+
+local function file_readable(path)
+    local file = path and io.open(path, "rb")
+    if not file then
+        return false
+    end
+    file:close()
+    return true
+end
+
 function Reader.take_prefetched(url)
     url = tostring(url or "")
     local state = Reader._prefetched[url]
-    if state then
-        Reader._prefetched[url] = nil
-        Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
+    if not state then
+        return nil
     end
+    Reader._prefetched[url] = nil
+    -- An evicted chapter (or one from another book) may already be deleted;
+    -- handing KOReader a missing path makes it fail out of the open and tear the
+    -- UI down.
+    if not file_readable(state.html_path) then
+        Log.warn("reader", "prefetch_ready_stale", { url = url, html = state.html_path })
+        return nil
+    end
+    Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
     return state
+end
+
+-- Chapters recently shown or prefetched, newest last.  Their html (and doc
+-- sidecar) stays in the book directory, so turning back into one of them skips
+-- the fetch, the parse and the image rewriting: only crengine loads the text.
+-- Without this, every back/forward turn re-ran the whole pipeline even though the
+-- page itself was already cached.
+local CHAPTER_CACHE_KEEP = 4
+local chapter_cache_order = {}
+local current_chapter_url = nil
+-- The same chapter is requested under different URLs: opening the book uses the
+-- book entry parameter, turning pages uses the chapter's own parameter.  Keep a
+-- second index by (book, chapter) so those two spellings share one entry.
+local chapter_by_uid = {}
+
+local function uid_key(book_id, uid)
+    book_id = tostring(book_id or "")
+    uid = tostring(uid or "")
+    if book_id == "" or uid == "" then
+        return nil
+    end
+    return book_id .. "|" .. uid
+end
+
+local function state_uid(state)
+    if type(state) ~= "table" then
+        return ""
+    end
+    if state.cur and state.cur.uid then
+        return tostring(state.cur.uid)
+    end
+    if state.cur_param and state.cur_param.uid then
+        return tostring(state.cur_param.uid)
+    end
+    return ""
+end
+
+local function html_still_cached(path)
+    if not path then
+        return false
+    end
+    for _, url in ipairs(chapter_cache_order) do
+        local cached = Reader._prefetched[url]
+        if cached and cached.html_path == path then
+            return true
+        end
+    end
+    return false
+end
+
+-- Two cache entries can share a chapter file (same chapter, different URL), so
+-- only drop it once nothing points at it any more.
+local function drop_chapter_file(path)
+    if path and path ~= "" and not html_still_cached(path) then
+        Reader.remove_chapter(path)
+    end
+end
+
+function Reader.remember_chapter(url, state, is_current)
+    url = tostring(url or "")
+    if url == "" or type(state) ~= "table" then
+        return
+    end
+    if is_current then
+        current_chapter_url = url
+    end
+    local previous = Reader._prefetched[url]
+    Reader._prefetched[url] = state
+    local key = uid_key(state.book_id, state_uid(state))
+    if key then
+        chapter_by_uid[key] = state
+    end
+    for i = #chapter_cache_order, 1, -1 do
+        if chapter_cache_order[i] == url then
+            table.remove(chapter_cache_order, i)
+        end
+    end
+    chapter_cache_order[#chapter_cache_order + 1] = url
+    if previous and previous.html_path ~= state.html_path then
+        drop_chapter_file(previous.html_path)
+    end
+    while #chapter_cache_order > CHAPTER_CACHE_KEEP do
+        -- Never drop the chapter on screen: prefetches are registered after it.
+        local victim
+        for i, cached_url in ipairs(chapter_cache_order) do
+            if cached_url ~= current_chapter_url then
+                victim = i
+                break
+            end
+        end
+        if not victim then
+            break
+        end
+        local victim_url = table.remove(chapter_cache_order, victim)
+        local cached = Reader._prefetched[victim_url]
+        Reader._prefetched[victim_url] = nil
+        if cached then
+            local key = uid_key(cached.book_id, state_uid(cached))
+            if key and chapter_by_uid[key] == cached then
+                chapter_by_uid[key] = nil
+            end
+            drop_chapter_file(cached.html_path)
+        end
+    end
+end
+
+-- A chapter cached under another URL (book entry vs chapter parameter) is still
+-- the same chapter: hand it back so a back/forward turn needs no rebuilding.
+function Reader.take_cached_chapter(book_id, uid)
+    local key = uid_key(book_id, uid)
+    local cached = key and chapter_by_uid[key]
+    if not cached then
+        return nil
+    end
+    -- A section window that does not start at the chapter head could land the
+    -- reader in the wrong place; those are rebuilt instead.
+    if (tonumber(cached.section_start) or 0) > 0 then
+        return nil
+    end
+    if not file_readable(cached.html_path) then
+        chapter_by_uid[key] = nil
+        Log.warn("reader", "chapter_cache_stale", { uid = tostring(uid), html = cached.html_path })
+        return nil
+    end
+    Log.info("reader", "chapter_cache_hit", {
+        book_id = tostring(book_id),
+        uid = tostring(uid),
+        html = cached.html_path,
+    })
+    return cached
+end
+
+-- Drop a chapter file, unless the chapter cache still needs it (a chapter switch
+-- closes the old document, which must not throw away the page just read).
+function Reader.forget_chapter(path)
+    drop_chapter_file(path)
+end
+
+-- Chapter files that Reader.cleanup_reading() must keep: without them a cached
+-- chapter would have to go back to the network to be reopened.
+function Reader.kept_chapter_paths()
+    local paths = {}
+    for _, url in ipairs(chapter_cache_order) do
+        local cached = Reader._prefetched[url]
+        if cached and cached.html_path then
+            paths[cached.html_path] = true
+        end
+    end
+    return paths
 end
 
 local function prefetch_key(url)
@@ -38,33 +210,130 @@ local function prefetch_key(url)
     return string.format("%08x", h)
 end
 
-local function prefetch_path(url)
-    local dir = Paths.cache_dir() .. "/chapter_prefetch"
-    Paths.ensure(dir)
-    return dir .. "/" .. prefetch_key(url) .. ".html"
+local function lfs_mod()
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok then
+        return lfs
+    end
 end
 
-local function read_prefetch(url)
-    local path = prefetch_path(url)
+-- A chapter page is ~350KB and does not change once published, so keep what was
+-- downloaded for a week: jumping back to a chapter, or reopening the book, then
+-- costs no network at all (the render pipeline still runs, but the fetch is
+-- free).  The file name is a hash of the URL, and the URL carries the book code,
+-- so entries cannot collide across books.  A section of a long chapter has its
+-- own URL and its own entry.
+local PAGE_TTL = 7 * 24 * 3600
+local PAGE_CACHE_MAX = 30 * 1024 * 1024
+local PRUNE_INTERVAL = 3600
+local last_prune = 0
+
+local function page_cache_dir()
+    local dir = Paths.cache_dir() .. "/pages"
+    Paths.ensure(dir)
+    return dir
+end
+
+local function page_cache_path(url)
+    return page_cache_dir() .. "/" .. prefetch_key(url) .. ".html"
+end
+
+local function file_age(path)
+    local lfs = lfs_mod()
+    local mtime = lfs and lfs.attributes(path, "modification")
+    if not mtime then
+        return nil
+    end
+    return os.time() - mtime
+end
+
+-- Drop expired entries, then the oldest ones until the cache fits its budget.
+local function prune_page_cache()
+    local now = os.time()
+    if now - last_prune < PRUNE_INTERVAL then
+        return
+    end
+    last_prune = now
+    local lfs = lfs_mod()
+    if not lfs then
+        return
+    end
+    local dir = page_cache_dir()
+    local entries, total = {}, 0
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+            local path = dir .. "/" .. name
+            local mtime = lfs.attributes(path, "modification")
+            if mtime then
+                if now - mtime > PAGE_TTL then
+                    os.remove(path)
+                else
+                    local size = lfs.attributes(path, "size") or 0
+                    entries[#entries + 1] = { path = path, mtime = mtime, size = size }
+                    total = total + size
+                end
+            end
+        end
+    end
+    if total <= PAGE_CACHE_MAX then
+        return
+    end
+    table.sort(entries, function(a, b) return a.mtime < b.mtime end)
+    for _, entry in ipairs(entries) do
+        if total <= PAGE_CACHE_MAX then
+            break
+        end
+        os.remove(entry.path)
+        total = total - entry.size
+    end
+    Log.info("reader", "page_cache_pruned", { left_bytes = total })
+end
+
+local function read_page_cache(url)
+    local path = page_cache_path(url)
+    local age = file_age(path)
+    if not age then
+        return nil
+    end
+    if age > PAGE_TTL then
+        os.remove(path)
+        Log.info("reader", "page_cache_expired", { url = url, age = age })
+        return nil
+    end
     local file = io.open(path, "rb")
-    if not file then return nil end
+    if not file then
+        return nil
+    end
     local body = file:read("*a")
     file:close()
-    if body and #body > 0 then
+    if not body or body == "" then
         os.remove(path)
-        Log.info("reader", "prefetch_hit", { url = url, bytes = #body })
-        return body
+        return nil
     end
-    os.remove(path)
+    Log.info("reader", "page_cache_hit", { url = url, bytes = #body, age = age })
+    return body
 end
 
-local function has_prefetch(url)
-    local file = io.open(prefetch_path(url), "rb")
-    if not file then return false end
-    local size = file:seek("end") or 0
+local function write_page_cache(url, body)
+    if type(body) ~= "string" or #body == 0 then
+        return
+    end
+    local path = page_cache_path(url)
+    local tmp = path .. ".tmp"
+    local file = io.open(tmp, "wb")
+    if not file then
+        return
+    end
+    file:write(body)
     file:close()
-    return size > 0
+    os.remove(path)
+    if not os.rename(tmp, path) then
+        os.remove(tmp)
+        return
+    end
+    prune_page_cache()
 end
+
 Reader.review_data = {}
 Reader.review_marks = {}
 
@@ -130,13 +399,6 @@ function Reader.url_for(param, extra)
         url = url .. "&prev=1"
     end
     return url
-end
-
-local function lfs_mod()
-    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-    if ok then
-        return lfs
-    end
 end
 
 local function remove_tree(path)
@@ -258,6 +520,36 @@ end
 
 function Reader.cleanup_reading(keep_html)
     keep_html = tostring(keep_html or "")
+    -- Chapters remembered for instant back/forward turns stay on disk; leaving
+    -- the book (keep_html == "") still wipes everything.
+    local cached_html = {}
+    if keep_html == "" then
+        -- Everything goes: the remembered chapters go with it.
+        chapter_cache_order = {}
+        current_chapter_url = nil
+        chapter_by_uid = {}
+        Reader._prefetched = {}
+    else
+        for path in pairs(Reader.kept_chapter_paths()) do
+            local enc, dec = html_pair(path)
+            cached_html[enc] = true
+            cached_html[dec] = true
+        end
+    end
+    local function keep_file(full)
+        return cached_html[full] == true or is_kept_html(full, keep_html)
+    end
+    local function keep_book_dir(book_dir)
+        if keep_html == book_dir or keep_html:sub(1, #book_dir + 1) == book_dir .. "/" then
+            return true
+        end
+        for path in pairs(cached_html) do
+            if path:sub(1, #book_dir + 1) == book_dir .. "/" then
+                return true
+            end
+        end
+        return false
+    end
     local root = Reader.reading_root()
     local lfs = lfs_mod()
     if not lfs or lfs.attributes(root, "mode") ~= "directory" then
@@ -270,23 +562,22 @@ function Reader.cleanup_reading(keep_html)
         if book ~= "." and book ~= ".." then
             local book_dir = root .. "/" .. book
             if lfs.attributes(book_dir, "mode") == "directory" then
-                local keep_here = keep_html == book_dir
-                    or keep_html:sub(1, #book_dir + 1) == book_dir .. "/"
+                local keep_here = keep_book_dir(book_dir)
                 for name in lfs.dir(book_dir) do
                     if name ~= "." and name ~= ".." then
                         local full = book_dir .. "/" .. name
                         if name:find("%.html$") then
-                            if not is_kept_html(full, keep_html) then
+                            if not keep_file(full) then
                                 Reader.remove_chapter(full)
                             end
                         elseif name == "img" and keep_here then
                             -- keep cached chapter images for the open book
                         elseif name:find("%.sdr$") then
                             local html = book_dir .. "/" .. name:gsub("%.sdr$", ".html")
-                            if not is_kept_html(html, keep_html) then
+                            if not keep_file(html) then
                                 remove_tree(full)
                             end
-                        elseif not is_kept_html(full, keep_html) then
+                        elseif not keep_file(full) then
                             remove_tree(full)
                         end
                     end
@@ -568,6 +859,36 @@ function Reader.next_url(state)
     end
 end
 
+-- Mirror of next_url for turning backwards: the chapter before this one.
+function Reader.prev_url(state)
+    if not state then
+        return nil
+    end
+    local param = state.prev_param and state.prev_param.param
+    if is_bc(param) then
+        return Reader.url_for(param)
+    end
+    local uid = state.prev_param and tostring(state.prev_param.uid or "")
+    if uid ~= "" and is_bc(state.params and state.params[uid]) then
+        return Reader.url_for(state.params[uid])
+    end
+    local cur_idx = state.cur and tonumber(state.cur.idx)
+    if cur_idx then
+        -- The chapter list is not guaranteed to be ordered, so take the highest
+        -- index below the current one.
+        local best_idx, best_param
+        for _, chapter in ipairs(state.chapters or {}) do
+            local idx = tonumber(chapter.idx) or 0
+            if idx < cur_idx and is_bc(chapter.param) and (not best_idx or idx > best_idx) then
+                best_idx, best_param = idx, chapter.param
+            end
+        end
+        if best_param then
+            return Reader.url_for(best_param)
+        end
+    end
+end
+
 function Reader.is_last(state)
     if not state then
         return true
@@ -666,7 +987,9 @@ local function chapters_from_catalog(infos, url_rows)
     return chapters
 end
 
-function Reader.fetch_catalog_page(book_id, typ, range_start, range_end)
+-- Asks for one page of the table of contents; callback(chapters, status, err).
+-- Returns the HTTP handle so the caller can cancel it.
+local function fetch_catalog_page_async(book_id, typ, range_start, range_end, callback)
     local url = string.format(
         "%s?type=%s&bookId=%s&rangeStart=%s&rangeEnd=%s&platform=desktop",
         Config.CATALOG_MORE_URL,
@@ -682,41 +1005,57 @@ function Reader.fetch_catalog_page(book_id, typ, range_start, range_end)
         range_end = range_end,
         url = url,
     })
-    local body, status, err = Client.request({
+    return AsyncHttp.request({
         url = url,
+        timeout = 20,
         accept = "application/json, */*;q=0.8",
         referer = Config.READER_URL,
-        timeout = 20,
-    })
-    if not body then
-        return nil, status or "http_error", err
-    end
-    local data, decode_err = Json.decode(body)
-    if not data then
-        return nil, "http_error", decode_err
-    end
-    local err_status, err_msg = catalog_api_error(data)
-    if err_status then
-        return nil, err_status, err_msg
-    end
-    local infos = data.chapterInfos or data.chapterInfo or {}
-    local urls = data.readerUrlParmas or data.readerUrlParams or {}
-    return chapters_from_catalog(infos, urls)
+    }, function(res)
+        if not res or not res.ok or not res.body or #res.body == 0 then
+            callback(nil, res and res.status or "http_error", res and res.err)
+            return
+        end
+        local data, decode_err = Json.decode(res.body)
+        if not data then
+            callback(nil, "http_error", decode_err)
+            return
+        end
+        local err_status, err_msg = catalog_api_error(data)
+        if err_status then
+            callback(nil, err_status, err_msg)
+            return
+        end
+        local infos = data.chapterInfos or data.chapterInfo or {}
+        local urls = data.readerUrlParmas or data.readerUrlParams or {}
+        callback(chapters_from_catalog(infos, urls))
+    end)
 end
 
-function Reader.expand_catalog(state)
-    if not state then
-        return {}
+-- Loads the rest of the book's table of contents without blocking the UI.
+-- on_done(chapters) gets the merged list (the chapters already known when the
+-- catalog cannot be fetched).  Returns a job with cancel(); on_done is not
+-- called after a cancel.
+function Reader.expand_catalog(state, on_done)
+    local job = { cancelled = false }
+    function job:cancel()
+        self.cancelled = true
+        if self.handle then
+            pcall(AsyncHttp.cancel, self.handle)
+            self.handle = nil
+        end
     end
-    local existing = state.chapters or {}
-    local book_id = as_text(state.book_id)
-    local total = as_number(state.chapter_count)
-    if book_id == "" or book_id == "nil" then
-        return existing
+    local existing = state and state.chapters or {}
+    local book_id = as_text(state and state.book_id)
+    local total = as_number(state and state.chapter_count)
+    if book_id == "" or book_id == "nil" or (total > 0 and #existing >= total) then
+        UIManager:nextTick(function()
+            if not job.cancelled then
+                on_done(existing)
+            end
+        end)
+        return job
     end
-    if total > 0 and #existing >= total then
-        return existing
-    end
+
     local by_uid = {}
     local function absorb(list)
         for _, chapter in ipairs(list or {}) do
@@ -743,15 +1082,6 @@ function Reader.expand_catalog(state)
             end
         end
     end
-    absorb(existing)
-    local first, status, err = Reader.fetch_catalog_page(book_id, 3, 0, #existing)
-    if not first then
-        Log.warn("reader", "catalog_first", { status = status, err = err })
-        return existing
-    end
-    absorb(first)
-    local range_start, range_end = 0, #first
-    local guard = 0
     local function count()
         local n = 0
         for _ in pairs(by_uid) do
@@ -759,35 +1089,75 @@ function Reader.expand_catalog(state)
         end
         return n
     end
-    while guard < 40 and (total <= 0 or count() < total) do
-        guard = guard + 1
-        local more, more_status, more_err = Reader.fetch_catalog_page(book_id, 2, range_start, range_end)
-        if not more or #more == 0 then
-            if more_status then
-                Log.warn("reader", "catalog_more", { status = more_status, err = more_err })
+    local function finish(partial)
+        job.handle = nil
+        if job.cancelled then
+            return
+        end
+        if partial then
+            on_done(existing)
+            return
+        end
+        local list = {}
+        for _, chapter in pairs(by_uid) do
+            list[#list + 1] = chapter
+        end
+        table.sort(list, function(a, b)
+            return (a.idx or 0) < (b.idx or 0)
+        end)
+        Log.info("reader", "catalog_ready", { book_id = book_id, chapters = #list, total = total })
+        on_done(list)
+    end
+
+    absorb(existing)
+    job.handle = fetch_catalog_page_async(book_id, 3, 0, #existing, function(first, status, err)
+        job.handle = nil
+        if job.cancelled then
+            return
+        end
+        if not first then
+            Log.warn("reader", "catalog_first", { status = status, err = err })
+            finish(true)
+            return
+        end
+        absorb(first)
+        local range_start, range_end = 0, #first
+        local guard = 0
+        local function next_page()
+            if guard >= 40 or (total > 0 and count() >= total) then
+                finish()
+                return
             end
-            break
+            guard = guard + 1
+            job.handle = fetch_catalog_page_async(book_id, 2, range_start, range_end, function(more, more_status, more_err)
+                job.handle = nil
+                if job.cancelled then
+                    return
+                end
+                if not more or #more == 0 then
+                    if more_status then
+                        Log.warn("reader", "catalog_more", { status = more_status, err = more_err })
+                    end
+                    finish()
+                    return
+                end
+                local before = count()
+                absorb(more)
+                if count() <= before then
+                    finish()
+                    return
+                end
+                range_end = range_end + #more
+                next_page()
+            end)
         end
-        local before = count()
-        absorb(more)
-        if count() <= before then
-            break
-        end
-        range_end = range_end + #more
-    end
-    local list = {}
-    for _, chapter in pairs(by_uid) do
-        list[#list + 1] = chapter
-    end
-    table.sort(list, function(a, b)
-        return (a.idx or 0) < (b.idx or 0)
+        next_page()
     end)
-    Log.info("reader", "catalog_ready", { book_id = book_id, chapters = #list, total = total })
-    return list
+    return job
 end
 
 function Reader.fetch(url)
-    local cached = read_prefetch(url)
+    local cached = read_page_cache(url)
     if cached then return cached end
     Log.dbg("reader", "fetch", { url = url })
     local body, status, err = Client.request({
@@ -808,6 +1178,7 @@ function Reader.fetch(url)
         Log.warn("reader", "fetch_login_page", { url = url, bytes = #body })
         return nil, "auth_expired"
     end
+    write_page_cache(url, body)
     Log.dbg("reader", "fetch_ok", { url = url, bytes = #body })
     return body
 end
@@ -850,11 +1221,21 @@ function Reader.prefetch_next(state, book)
     if not url then
         return
     end
-    if Reader._prefetched[url] then
-        Log.info("reader", "prefetch_already_cached", { url = url })
-        return
+    local cached = Reader._prefetched[url]
+    if cached then
+        if file_readable(cached.html_path) then
+            Log.info("reader", "prefetch_already_cached", { url = url })
+            return
+        end
+        -- The file was cleaned up after a chapter switch; prefetch it again.
+        Reader._prefetched[url] = nil
+        Log.warn("reader", "prefetch_cache_dropped", { url = url, html = cached.html_path })
     end
     local next_uid = state.next_param and tostring(state.next_param.uid or "") or ""
+    if next_uid ~= "" and Reader.take_cached_chapter(state.book_id, next_uid) then
+        Log.info("reader", "prefetch_already_cached", { uid = next_uid, url = url })
+        return
+    end
     if next_uid ~= "" then
         local existing = io.open(Reader.html_path(state.book_id, next_uid), "rb")
         if existing then
@@ -881,7 +1262,7 @@ function Reader.prefetch_next(state, book)
             Reader._prefetch_job = nil
         end
         if prefetched then
-            Reader._prefetched[url] = prefetched
+            Reader.remember_chapter(url, prefetched)
             Log.info("reader", "prefetch_done", { url = url, html = prefetched.html_path, mode = "background" })
         else
             Log.warn("reader", "prefetch_fail", { url = url, status = ready_status, err = ready_err })
@@ -905,7 +1286,7 @@ function Reader.prefetch_next(state, book)
     Reader._prefetch_job = nil
     Reader._prefetch_url = nil
     if result then
-        Reader._prefetched[url] = result
+        Reader.remember_chapter(url, result)
         Log.info("reader", "prefetch_done", { url = url, html = result.html_path, mode = "background" })
     end
 end
@@ -923,6 +1304,9 @@ end
 
 function Reader.clear_prefetched()
     Reader._prefetched = {}
+    chapter_by_uid = {}
+    chapter_cache_order = {}
+    current_chapter_url = nil
 end
 
 -- WeRead encodes per-character offsets on <span wco="N">; API range matches those coords.
@@ -1043,10 +1427,14 @@ local function wco_lower_bound(by_wco, start0)
 end
 
 -- Once underlines are injected the per-character <span wco="N"> wrappers are dead
--- weight: crengine builds a DOM node for each, which dominates open time and memory.
--- Bookmarks and heartbeat only read the text, so unwrap the leaf spans.  (Spans that
--- carry an underline link contain a tag and are left alone.)
-local WCO_LEAF_SPAN = '<span%s+wco%s*=%s*"%d+"%s*>([^<]*)</span>'
+-- weight: crengine builds a DOM node for each, which dominates open time and memory
+-- (one chapter had 7500 of them, 75% of the file).  Bookmarks and heartbeat only
+-- read the text, so unwrap the leaf spans.  WeRead writes extra attributes before
+-- wco (e.g. <span wid="0" wco="853" wl="1">), so match the whole tag and unwrap
+-- only the spans that really carry a wco; spans holding an underline link have a
+-- child tag and are left alone.
+local LEAF_SPAN = "<span(%s[^>]*)>([^<]*)</span>"
+local HAS_WCO = 'wco%s*=%s*"%d+"'
 
 local function strip_wco_spans(html)
     html = tostring(html or "")
@@ -1055,7 +1443,11 @@ local function strip_wco_spans(html)
         -- Cut right after a </span>, so a wrapper never straddles two chunks.
         local _, stop = html:find("</span>", pos + 16384, true)
         stop = stop or n
-        out[#out + 1] = html:sub(pos, stop):gsub(WCO_LEAF_SPAN, "%1")
+        out[#out + 1] = html:sub(pos, stop):gsub(LEAF_SPAN, function(attrs, text)
+            if attrs:find(HAS_WCO) then
+                return text
+            end
+        end)
         pos = stop + 1
         Slice.point()
     end
@@ -1309,7 +1701,7 @@ local function fetch_async(url, job, callback)
     if job and job.cancelled then
         return
     end
-    local cached = read_prefetch(url)
+    local cached = read_page_cache(url)
     if cached then
         UIManager:nextTick(function()
             if not job or not job.cancelled then
@@ -1347,6 +1739,9 @@ local function fetch_async(url, job, callback)
                 return
             end
             local body, status, err = validate_fetch_body(res.body)
+            if body then
+                write_page_cache(url, body)
+            end
             callback(body, status, err)
         end)
     end)
@@ -1591,6 +1986,57 @@ local function download_sections_background(state, url, html, report, job, on_pa
     end)
 end
 
+-- The "encrypted" copy of a chapter (the original, still font-encoded text) is
+-- only read by heartbeat and bookmark sync, never to show the page, so it is
+-- built after the chapter is ready instead of before.  ensure() builds it right
+-- now for anything that needs it earlier; start() builds it in the background.
+local function deferred_build(compute, write, is_cancelled)
+    local self = { built = false }
+    local function finish(ok, result)
+        self.built = true
+        if not ok then
+            Log.warn("reader", "encrypted_copy_fail", { err = tostring(result) })
+            return
+        end
+        write(result)
+    end
+    function self.ensure()
+        if self.built then
+            return
+        end
+        self.built = true
+        local ok, result = pcall(compute)
+        if ok then
+            write(result)
+        else
+            Log.warn("reader", "encrypted_copy_fail", { err = tostring(result) })
+        end
+    end
+    function self.start()
+        Slice.run(compute, function(ok, result)
+            if self.built then
+                return
+            end
+            if not ok then
+                -- Never lose the copy over a slicing problem: redo it in one go.
+                Log.warn("reader", "slice_fallback", { err = tostring(result) })
+                local redone, again = pcall(compute)
+                finish(redone, again)
+                return
+            end
+            finish(true, result)
+        end, {
+            cancelled = function()
+                return self.built or (is_cancelled and is_cancelled())
+            end,
+            fast = function()
+                return false
+            end,
+        })
+    end
+    return self
+end
+
 local function assemble_chapter(state, pages, url, book, on_progress, on_ready, opts, job)
     opts = type(opts) == "table" and opts or {}
     local background = load_background_mode(opts)
@@ -1666,7 +2112,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         })
     end
 
-    local encrypted, decrypted, source_css = {}, {}, ""
+    local decrypted, source_css = {}, ""
     -- Smallest wco and total visible characters of the decoded pages so far.
     local first_wco, loaded_chars = nil, 0
     local cur_sect = math.max(0, tonumber(state.section) or 0)
@@ -1675,16 +2121,15 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
         section_count = 1
     end
 
-    -- CPU-heavy part of one page: decoded and original markup, plus what
-    -- after_decode needs to know about it.  Pure, so it can be sliced.
+    -- CPU-heavy part of one page: decoded markup, plus what after_decode needs
+    -- to know about it.  Pure, so it can be sliced.
     local function decode_page(page, need_css)
         local css = need_css and Codec.reader_styles(page) or ""
         local dec_part = collect_content(page, true)
         if not dec_part then
             return css
         end
-        local enc_part = collect_content(page, false) or ""
-        return css, dec_part, enc_part, min_wco_of(dec_part), text_length(dec_part)
+        return css, dec_part, min_wco_of(dec_part), text_length(dec_part)
     end
 
     local function add_page_summary(page_wco, page_chars)
@@ -1743,8 +2188,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             elapsed_ms = math.floor((Log.now_ms() - postprocess_started) + 0.5),
         })
 
-        local encrypted_body = table.concat(encrypted, "\n")
-
         local function wrap_body(body_html, is_enc)
             return Codec.wrap_html({
                 title = chapter_title,
@@ -1755,14 +2198,39 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             })
         end
 
-        local function finish_write(decrypted_html, encrypted_html)
+        -- Pages 1..decoded_pages are the ones that made it into the chapter.
+        local decoded_pages = #decrypted
+        local encrypted_pages = pages
+        local function encrypted_compute()
+            local parts = {}
+            for i = 1, decoded_pages do
+                parts[i] = collect_content(encrypted_pages[i], false) or ""
+                Slice.point()
+            end
+            local source = wrap_body(strip_wco_spans(table.concat(parts, "\n")), true)
+            return Images.localize(source, dir, nil, { fetch = false })
+        end
+        local encrypted_copy = deferred_build(encrypted_compute, function(encrypted_html)
+            encrypted_pages = nil
+            -- The chapter may have been replaced or removed in the meantime.
+            local chapter = io.open(path, "rb")
+            if not chapter then
+                return
+            end
+            chapter:close()
+            write_html(enc_path, encrypted_html)
+        end, function()
+            return job and job.cancelled
+        end)
+        state.ensure_enc = encrypted_copy.ensure
+
+        local function finish_write(decrypted_html)
             if job and job.cancelled then
                 return
             end
             if not write_html(path, decrypted_html) then
                 return fail("http_error", "write chapter html failed")
             end
-            write_html(enc_path, encrypted_html)
             state.url = url
             state.html_path = path
             state.html_enc_path = enc_path
@@ -1781,8 +2249,15 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                 chapter_offset = offset,
                 background = background,
             })
+            -- Without a job nobody gets a callback to carry on from, so finish now.
+            if not job then
+                encrypted_copy.ensure()
+            end
             if type(ready_cb()) == "function" then
                 invoke_ready(state)
+            end
+            if job then
+                encrypted_copy.start()
             end
             return state
         end
@@ -1796,16 +2271,21 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             local function render()
                 local wrap_started = Log.now_ms()
                 local decrypted_source = wrap_body(strip_wco_spans(body), false)
-                local encrypted_source = wrap_body(strip_wco_spans(encrypted_body), true)
                 Log.dbg("reader", "wrap", {
                     css_bytes = #source_css,
                     decrypted_bytes = #decrypted_source,
                     elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
                 })
                 -- Image binaries were fetched in the images stage; only remap URLs here.
-                local decrypted_html = Images.localize(decrypted_source, dir, nil, { fetch = false })
-                local encrypted_html = Images.localize(encrypted_source, dir, nil, { fetch = false })
-                return decrypted_html, encrypted_html
+                local localized = Images.localize(decrypted_source, dir, nil, { fetch = false })
+                -- Rare characters WeRead renders as inline images must not tower
+                -- over the line they sit in.
+                return Codec.mark_glyph_images(localized, function(src)
+                    if src == "" or src:find("^https?://") then
+                        return nil
+                    end
+                    return Images.pixel_size(dir .. "/" .. src)
+                end)
             end
             if background then
                 return sliced(render, finish_write)
@@ -1925,7 +2405,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             local need_css = source_css == ""
             sliced(function()
                 return decode_page(page, need_css)
-            end, function(css, dec_part, enc_part, page_wco, page_chars)
+            end, function(css, dec_part, page_wco, page_chars)
                 if need_css then
                     source_css = css
                 end
@@ -1938,7 +2418,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                     return
                 end
                 decrypted[#decrypted + 1] = dec_part
-                encrypted[#encrypted + 1] = enc_part
                 add_page_summary(page_wco, page_chars)
                 Log.dbg("reader", "decode", { page = index, pages = #pages, bytes = #dec_part, background = true })
                 index = index + 1
@@ -1951,7 +2430,7 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
 
     for i, page in ipairs(pages) do
         local need_css = source_css == ""
-        local css, dec_part, enc_part, page_wco, page_chars = decode_page(page, need_css)
+        local css, dec_part, page_wco, page_chars = decode_page(page, need_css)
         if need_css then
             source_css = css
         end
@@ -1962,7 +2441,6 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
             break
         end
         decrypted[#decrypted + 1] = dec_part
-        encrypted[#encrypted + 1] = enc_part
         add_page_summary(page_wco, page_chars)
         Log.dbg("reader", "decode", { page = i, pages = #pages, bytes = #dec_part })
     end

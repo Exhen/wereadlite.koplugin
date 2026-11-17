@@ -763,6 +763,202 @@ function Codec.reader_content(html, decode)
     return strip_inline_typography(inner)
 end
 
+-- WeRead draws a rare character that the book's font lacks as an inline image.
+-- At its natural size the image is much taller than the surrounding text and
+-- reads like a huge character, while the WeRead app shows the same character at
+-- the normal size in another typeface.  Such images are marked so the stylesheet
+-- can cap them to the line; illustrations are left alone.
+
+-- Roles that are never a single character.
+local NON_GLYPH_CLASS = {
+    "footernote", "footnote", "qqreader", "fullimg", "cover",
+}
+
+-- Illustration class family.  WeRead may use it for character images too, so it
+-- only means "needs size evidence" rather than "not a glyph".
+local ILLUSTRATION_CLASS = { "readerimage" }
+
+local function has_class(class, words)
+    local lower = tostring(class or ""):lower()
+    for _, word in ipairs(words) do
+        if lower:find(word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- One UTF-8 character in the alt text is the strongest sign of a glyph image:
+-- WeRead keeps the character there so it can be copied.
+local function single_char(text)
+    text = tostring(text or "")
+    local first = text:byte(1)
+    if not first or #text > 4 then
+        return false
+    end
+    if first < 0x80 then
+        return #text == 1
+    end
+    if first < 0xC0 or first > 0xF4 then
+        return false
+    end
+    for i = 2, #text do
+        local b = text:byte(i)
+        if b < 0x80 or b > 0xBF then
+            return false
+        end
+    end
+    return true
+end
+
+local function small_and_square(w, h)
+    w, h = tonumber(w), tonumber(h)
+    if not w or not h or w <= 0 or h <= 0 then
+        return false
+    end
+    -- A glyph fits in about one em; book illustrations are far bigger.
+    if w > 200 or h > 200 then
+        return false
+    end
+    local ratio = w / h
+    return ratio >= 0.5 and ratio <= 2
+end
+
+local function add_class(attrs, name)
+    local double = attrs:match('class%s*=%s*"([^"]*)"')
+    if double then
+        return (attrs:gsub('class%s*=%s*"([^"]*)"', function(value)
+            return 'class="' .. value .. " " .. name .. '"'
+        end, 1))
+    end
+    local single = attrs:match("class%s*=%s*'([^']*)'")
+    if single then
+        return (attrs:gsub("class%s*=%s*'([^']*)'", function(value)
+            return "class='" .. value .. " " .. name .. "'"
+        end, 1))
+    end
+    return attrs .. ' class="' .. name .. '"'
+end
+
+-- Add declarations to the element's style attribute.  They are appended so they
+-- come after WeRead's own sizing in the same declaration block (where the last
+-- value wins); an inline style is applied after the stylesheet, so this is what
+-- decides the size on screen.
+local function add_style(attrs, declarations)
+    local double = attrs:match('style%s*=%s*"([^"]*)"')
+    if double then
+        return (attrs:gsub('style%s*=%s*"([^"]*)"', function(value)
+            return 'style="' .. value .. "; " .. declarations .. '"'
+        end, 1))
+    end
+    local single = attrs:match("style%s*=%s*'([^']*)'")
+    if single then
+        return (attrs:gsub("style%s*=%s*'([^']*)'", function(value)
+            return "style='" .. value .. "; " .. declarations .. "'"
+        end, 1))
+    end
+    return attrs .. ' style="' .. declarations .. '"'
+end
+
+-- size_of(src) -> width, height in pixels for a local image, or nil.
+function Codec.mark_glyph_images(html, size_of)
+    html = tostring(html or "")
+    if not html:lower():find("<img", 1, true) then
+        return html
+    end
+    local total, marked = 0, 0
+    local detail, tags, rewritten = {}, {}, {}
+    html = html:gsub("<([iI][mM][gG])([^>]*)>", function(tag, attrs)
+        -- WeRead writes images as "<img ... />".  The slash has to stay last:
+        -- anything appended after it is dropped by the parser, which is how an
+        -- earlier attempt at this lost both its class and its style.
+        local original = "<" .. tag .. attrs .. ">"
+        local tail = ""
+        if attrs:match("/%s*$") then
+            attrs = attrs:gsub("/%s*$", "")
+            tail = " /"
+        end
+        attrs = attrs:gsub("%s+$", "")
+        local class = tag_attr(attrs, "class")
+        if has_class(class, NON_GLYPH_CLASS) then
+            return "<" .. tag .. attrs .. tail .. ">"
+        end
+        total = total + 1
+        local src, measured
+        if type(size_of) == "function" then
+            src = tag_attr(attrs, "src") or tag_attr(attrs, "data-src") or ""
+            local ok, w, h = pcall(size_of, src)
+            if ok then
+                measured = { w, h }
+            end
+        end
+        local small = small_and_square(tag_attr(attrs, "width"), tag_attr(attrs, "height"))
+            or small_and_square(measured and measured[1], measured and measured[2])
+        local glyph
+        if has_class(class, ILLUSTRATION_CLASS) then
+            glyph = small
+        elseif single_char(tag_attr(attrs, "alt")) then
+            glyph = true
+            if measured then
+                -- One character is roughly square; a clearly elongated image is
+                -- an illustration that merely carries a short alt text.
+                local w, h = tonumber(measured[1]), tonumber(measured[2])
+                if w and h and h > 0 and (w > 2.5 * h or h > 2.5 * w) then
+                    glyph = false
+                end
+            end
+        else
+            glyph = small
+        end
+        local name = "inline"
+        if src and src ~= "" then
+            name = src:match("([^/]+)$") or src
+        end
+        if #detail < 6 then
+            detail[#detail + 1] = string.format("%s:%sx%s%s", name,
+                tostring(measured and measured[1] or "?"),
+                tostring(measured and measured[2] or "?"),
+                glyph and "*" or "")
+        end
+        if #tags < 2 then
+            local raw = original:gsub("%s+", " ")
+            tags[#tags + 1] = #raw > 180 and (raw:sub(1, 180) .. "...") or raw
+        end
+        if not glyph then
+            return "<" .. tag .. attrs .. tail .. ">"
+        end
+        marked = marked + 1
+        -- An explicit height keeps the character at text size even when the
+        -- stylesheet rule loses the cascade; crengine derives the width from the
+        -- image's own aspect ratio, so nothing is distorted.
+        local out = add_style(add_class(attrs, "wereadlite-glyph"),
+            "height: 1em; width: auto")
+        if #rewritten < 2 then
+            local text = ("<" .. tag .. out .. tail .. ">"):gsub("%s+", " ")
+            rewritten[#rewritten + 1] = #text > 200 and (text:sub(1, 200) .. "...") or text
+        end
+        return "<" .. tag .. out .. tail .. ">"
+    end)
+    if total > 0 then
+        if total > #detail then
+            detail[#detail + 1] = string.format("+%d", total - #detail)
+        end
+        -- Info level so a normal crash.log shows what the images looked like
+        -- ("name:WxH*" was capped, "?" means the size could not be read).
+        Log.info("codec", "glyph_images", {
+            images = total,
+            glyph = marked,
+            detail = table.concat(detail, ","),
+        })
+        -- The raw markup shows what WeRead actually emitted (inline sizes, wrappers).
+        Log.info("codec", "glyph_tags", { tags = table.concat(tags, " | ") })
+        if #rewritten > 0 then
+            Log.info("codec", "glyph_out", { tags = table.concat(rewritten, " | ") })
+        end
+    end
+    return html
+end
+
 function Codec.reader_styles(html)
     local function rewrite_bleed(value)
         value = tostring(value or ""):lower()
@@ -878,6 +1074,10 @@ function Codec.wrap_html(opts)
         'h1, h2, .firstTitle { text-align: center; page-break-before: avoid !important; break-before: avoid !important; }\n',
         'body h1:first-child, body h2:first-child, body .firstTitle:first-child { margin-top: 0 !important; padding-top: 0 !important; }\n',
         '.frontCover:first-child, .qqreader-fullimg:first-child { page-break-before: avoid !important; }\n',
+        -- Rare characters WeRead draws as images: keep them within the line.
+        -- Only max-height is capped so cur_styles keeps the aspect ratio: with a
+        -- width limit as well crengine would clamp the derived width on its own.
+        'img.wereadlite-glyph { max-height: 1em !important; width: auto !important; }\n',
         '.fn-ref { font-size: 0.75em; vertical-align: super; line-height: 0; }\n',
         '.fn-ref a { text-decoration: none; }\n',
         'aside.footnote { -cr-hint: footnote-inpage; margin: 0.4em 0; font-size: 0.85em; text-indent: 0; }\n',

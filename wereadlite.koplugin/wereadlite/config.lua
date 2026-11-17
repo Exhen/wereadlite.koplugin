@@ -1,6 +1,6 @@
 local C = {
     NAME = "微信读书",
-    VERSION = "0.2.5",
+    VERSION = "0.2.7",
     PLUGIN_DIR = "wereadlite.koplugin",
     SETTINGS_FILE = "wereadlite.lua",
     ENTRY_FILENAME = "微信读书.epub",
@@ -28,7 +28,7 @@ local C = {
     SKILL_PAGE = "https://weread.qq.com/r/weread-skills",
     SKILL_APIKEY_URL = "https://weread.qq.com/api/skills/apikeyGet",
     SKILL_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway",
-    SKILL_VERSION = "1.0.4",
+    SKILL_VERSION = "1.0.5",
     WEB_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
     API_PAGE_SIZE = 20,
     GRID_ROWS = 4,

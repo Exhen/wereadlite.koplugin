@@ -20,6 +20,8 @@ local Settings = {
     GRID_FONT_MIN = 12,
     GRID_FONT_MAX = 28,
     GRID_FONT_DEFAULT = 18,
+    READER_FONT_MIN = 12,
+    READER_FONT_MAX = 255,
     IMAGE_CONCURRENCY_MIN = 1,
     IMAGE_CONCURRENCY_MAX = 8,
     IMAGE_CONCURRENCY_DEFAULT = 4,
@@ -976,6 +978,89 @@ function Settings.set_grid_font_size(value)
     data:flush()
     Log.info("settings", "grid_font_size", { value = value })
     return value
+end
+
+-- Reader typography lives here, not in KOReader's per-document sidecar: every
+-- WeRead chapter is a new HTML file whose sidecar is cleared on open, so a size
+-- stored there would be lost at the next chapter or on re-entering the book.
+-- Each book keeps its own size; nil means the book was never adjusted and
+-- KOReader's default applies.
+function Settings.reader_font_size(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil
+    end
+    local data = Settings.load()
+    local sizes = data:readSetting("reader_font_sizes")
+    local value = type(sizes) == "table" and tonumber(sizes[book_id]) or nil
+    if not value then
+        return nil
+    end
+    return math.max(Settings.READER_FONT_MIN, math.min(Settings.READER_FONT_MAX, value))
+end
+
+function Settings.set_reader_font_size(book_id, value)
+    book_id = tostring(book_id or "")
+    value = tonumber(value)
+    if book_id == "" or not value then
+        return nil
+    end
+    -- Keep halves: the fine-tune control steps by 0.5.
+    value = math.max(Settings.READER_FONT_MIN, math.min(Settings.READER_FONT_MAX, value))
+    local data = Settings.load()
+    local sizes = data:readSetting("reader_font_sizes")
+    if type(sizes) ~= "table" then
+        sizes = {}
+    end
+    if tonumber(sizes[book_id]) == value then
+        return value
+    end
+    sizes[book_id] = value
+    data:saveSetting("reader_font_sizes", sizes)
+    data:flush()
+    Log.info("settings", "reader_font_size", { book_id = book_id, value = value })
+    return value
+end
+
+-- Where the reader stood inside a chapter is only known locally: the chapter page
+-- WeRead returns carries its own `chapterOffset`, which only catches up when the
+-- reading progress syncs, so a couple of page turns are lost when reopening a
+-- book.  Keep the CRE xpointer of the last page shown, per book.
+function Settings.reader_position(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil
+    end
+    local data = Settings.load()
+    local positions = data:readSetting("reader_positions")
+    local entry = type(positions) == "table" and positions[book_id] or nil
+    if type(entry) ~= "table" or type(entry.xpointer) ~= "string" or entry.xpointer == "" then
+        return nil
+    end
+    return { uid = tostring(entry.uid or ""), xpointer = entry.xpointer }
+end
+
+function Settings.set_reader_position(book_id, uid, xpointer)
+    book_id = tostring(book_id or "")
+    uid = tostring(uid or "")
+    xpointer = tostring(xpointer or "")
+    if book_id == "" or xpointer == "" then
+        return false
+    end
+    local data = Settings.load()
+    local positions = data:readSetting("reader_positions")
+    if type(positions) ~= "table" then
+        positions = {}
+    end
+    local previous = positions[book_id]
+    if type(previous) == "table" and previous.uid == uid and previous.xpointer == xpointer then
+        return false
+    end
+    positions[book_id] = { uid = uid, xpointer = xpointer }
+    data:saveSetting("reader_positions", positions)
+    data:flush()
+    Log.dbg("settings", "reader_position", { book_id = book_id, uid = uid })
+    return true
 end
 
 -- kind: "meta" | "body" | "title"

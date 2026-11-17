@@ -111,7 +111,12 @@ function Gate.refresh()
         local Shelf = require("wereadlite.kindle.shelf")
         local ShelfView = require("wereadlite.shelf_view")
         Shelf.cancel_session_refresh()
-        Shelf.reset()
+        -- Coming back from a book: keep the shelf already in memory so it can be
+        -- shown at once; anything else (first open, another account, too old)
+        -- starts from scratch.
+        if not Shelf.cache_usable() then
+            Shelf.reset()
+        end
         Gate.widget = ShelfView:new{
             on_close = opts.on_close,
             on_auth_expired = function()

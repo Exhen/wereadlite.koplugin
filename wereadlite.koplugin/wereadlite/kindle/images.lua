@@ -1,5 +1,6 @@
 local Config = require("wereadlite.config")
 local Log = require("wereadlite.log")
+local Paths = require("wereadlite.paths")
 local Settings = require("wereadlite.settings")
 local Slice = require("wereadlite.slice")
 local UIManager = require("ui/uimanager")
@@ -86,6 +87,46 @@ local function stem_for(cache_dir, url)
     return cache_dir .. "/" .. hex:sub(1, 12) .. "_" .. base
 end
 
+-- A chapter directory is wiped when the book is left, so an image downloaded
+-- for one chapter had to be fetched again on the next open.  Keep a copy under
+-- cache/images/: the file name carries a hash of the URL, so entries never
+-- collide.  A URL that answered "not found" is remembered too, because WeRead
+-- emits background-image rules for files that are simply absent from the CDN
+-- and each of those costs a round trip per chapter.
+local MISS_TTL = 7 * 24 * 3600
+local store_path_cache
+
+local function store_dir()
+    if not store_path_cache then
+        store_path_cache = Paths.cache_dir() .. "/images"
+        mkdir(store_path_cache)
+    end
+    return store_path_cache
+end
+
+local function base_name(stem)
+    return tostring(stem or ""):match("([^/]+)$") or stem
+end
+
+local function copy_file(from, to)
+    local src = io.open(from, "rb")
+    if not src then
+        return false
+    end
+    local body = src:read("*a")
+    src:close()
+    if not body then
+        return false
+    end
+    local dst = io.open(to, "wb")
+    if not dst then
+        return false
+    end
+    dst:write(body)
+    dst:close()
+    return true
+end
+
 local function cached_path(stem)
     for _, ext in ipairs(IMAGE_EXTS) do
         local path = stem .. "." .. ext
@@ -93,6 +134,86 @@ local function cached_path(stem)
             return path
         end
     end
+    local name = base_name(stem)
+    for _, ext in ipairs(IMAGE_EXTS) do
+        local stored = store_dir() .. "/" .. name .. "." .. ext
+        if valid_file(stored) then
+            -- Copy back so the chapter's relative "img/<name>" reference works.
+            local path = stem .. "." .. ext
+            if copy_file(stored, path) then
+                return path
+            end
+        end
+    end
+end
+
+-- The store survives restarts, so keep its growth in check: once an hour, drop
+-- the oldest entries until it fits the budget.
+local STORE_MAX = 40 * 1024 * 1024
+local PRUNE_INTERVAL = 3600
+local last_prune = 0
+
+local function prune_store()
+    local now = os.time()
+    if now - last_prune < PRUNE_INTERVAL then
+        return
+    end
+    last_prune = now
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs then
+        return
+    end
+    local dir = store_dir()
+    local entries, total = {}, 0
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+            local path = dir .. "/" .. name
+            local mtime = lfs.attributes(path, "modification")
+            local size = lfs.attributes(path, "size") or 0
+            if mtime then
+                entries[#entries + 1] = { path = path, mtime = mtime, size = size }
+                total = total + size
+            end
+        end
+    end
+    if total <= STORE_MAX then
+        return
+    end
+    table.sort(entries, function(a, b) return a.mtime < b.mtime end)
+    for _, entry in ipairs(entries) do
+        if total <= STORE_MAX then
+            break
+        end
+        os.remove(entry.path)
+        total = total - entry.size
+    end
+    Log.info("images", "store_pruned", { left_bytes = total })
+end
+
+local function recent_miss(stem)
+    local file = io.open(store_dir() .. "/" .. base_name(stem) .. ".miss", "r")
+    if not file then
+        return false
+    end
+    local stamp = tonumber(file:read("*l") or "")
+    file:close()
+    return stamp ~= nil and os.time() - stamp < MISS_TTL
+end
+
+local function mark_miss(stem)
+    local file = io.open(store_dir() .. "/" .. base_name(stem) .. ".miss", "w")
+    if not file then
+        return
+    end
+    file:write(tostring(os.time()))
+    file:close()
+end
+
+-- Only a definitive answer is worth remembering; a timeout or DNS hiccup must
+-- not keep an image away for a week.
+local function gone_for_good(res)
+    local code = tonumber(res and res.code) or 0
+    return code == 404 or code == 403 or code == 410
 end
 
 local function collect_urls(html)
@@ -157,6 +278,8 @@ local function save_image_body(stem, body)
         os.remove(tmp)
         return nil, "rename failed"
     end
+    copy_file(path, store_dir() .. "/" .. base_name(stem) .. "." .. ext)
+    prune_store()
     return path
 end
 
@@ -223,6 +346,10 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
         if path then
             html = apply_local(html, item, path)
             state.done = state.done + 1
+        elseif recent_miss(item.stem) then
+            -- Known 404: no request, the URL stays as it is in the document.
+            state.done = state.done + 1
+            Log.dbg("images", "skip_miss", { url = item.url })
         else
             pending[#pending + 1] = item
         end
@@ -235,7 +362,9 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
         return state
     end
 
-    local concurrency = math.min(2, math.max(1, tonumber(Settings.image_concurrency()) or 1))
+    -- Images are small and independent; the settings default (4) parses faster
+    -- than the old cap of 2 allowed.
+    local concurrency = math.min(4, math.max(1, tonumber(Settings.image_concurrency()) or 1))
     local pump
     local function complete_item(item, res)
         if state.cancelled or state.finished then
@@ -257,6 +386,9 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
                 url = item.url,
                 kind = item.kind,
             })
+            if gone_for_good(res) then
+                mark_miss(item.stem)
+            end
         end
         state.done = state.done + 1
         report()
@@ -319,6 +451,134 @@ replace_all = function(html, from, to)
         i = at + n
     end
     return table.concat(out)
+end
+
+-- Pixel size of an image file, for telling a one-character glyph image from a
+-- real illustration.  Reads only the header.  Returns nil when unknown
+-- (unsupported format, unreadable file, or remote URL left in place).
+local function u16be(s, i)
+    local a, b = s:byte(i, i + 1)
+    if not a or not b then
+        return nil
+    end
+    return a * 256 + b
+end
+
+local function u16le(s, i)
+    local a, b = s:byte(i, i + 1)
+    if not a or not b then
+        return nil
+    end
+    return b * 256 + a
+end
+
+local function u32be(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    if not a or not b or not c or not d then
+        return nil
+    end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+local function u32le(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    if not a or not b or not c or not d then
+        return nil
+    end
+    return ((d * 256 + c) * 256 + b) * 256 + a
+end
+
+local SOF_MARKERS = {
+    [0xC0] = true, [0xC1] = true, [0xC2] = true, [0xC3] = true,
+    [0xC5] = true, [0xC6] = true, [0xC7] = true,
+    [0xC9] = true, [0xCA] = true, [0xCB] = true,
+    [0xCD] = true, [0xCE] = true, [0xCF] = true,
+}
+
+local function jpeg_size(data)
+    local i, n = 3, #data
+    while i + 1 <= n do
+        if data:byte(i) ~= 0xFF then
+            i = i + 1
+        else
+            local marker = data:byte(i + 1)
+            if marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7) then
+                i = i + 2
+            elseif marker == 0xDA then
+                return nil
+            else
+                local len = u16be(data, i + 2)
+                if not len or len < 2 then
+                    return nil
+                end
+                if SOF_MARKERS[marker] then
+                    return u16be(data, i + 7), u16be(data, i + 5)
+                end
+                i = i + 2 + len
+            end
+        end
+    end
+end
+
+local function u24le(s, i)
+    local a, b, c = s:byte(i, i + 2)
+    if not a or not b or not c then
+        return nil
+    end
+    return a + b * 256 + c * 65536
+end
+
+local function webp_size(data)
+    local chunk = data:sub(13, 16)
+    if chunk == "VP8X" then
+        -- Canvas width/height are stored minus one, 24-bit little endian each.
+        local w, h = u24le(data, 25), u24le(data, 28)
+        if not w or not h then
+            return nil
+        end
+        return w + 1, h + 1
+    elseif chunk == "VP8L" and data:byte(21) == 0x2F then
+        local b1, b2, b3, b4 = data:byte(22, 25)
+        if not b1 or not b4 then
+            return nil
+        end
+        -- 14 bits of width-1 then 14 bits of height-1, little endian bit order.
+        local value = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        return value % 16384 + 1, math.floor(value / 16384) % 16384 + 1
+    elseif chunk == "VP8 " and data:byte(24) == 0x9D and data:byte(25) == 0x01 then
+        local w, h = u16le(data, 27), u16le(data, 29)
+        if not w or not h then
+            return nil
+        end
+        return w % 16384, h % 16384
+    end
+end
+
+function Images.pixel_size(path)
+    path = tostring(path or "")
+    if path == "" or path:find("^https?://") then
+        return nil
+    end
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local data = file:read(65536) or ""
+    file:close()
+    -- A GIF header is the shortest of the formats handled here; each reader
+    -- below rejects a header that is too short on its own.
+    if #data < 13 then
+        return nil
+    end
+    if data:byte(1) == 0x89 and data:sub(2, 4) == "PNG" then
+        return u32be(data, 17), u32be(data, 21)
+    elseif data:sub(1, 3) == "GIF" then
+        return u16le(data, 7), u16le(data, 9)
+    elseif data:byte(1) == 0xFF and data:byte(2) == 0xD8 then
+        return jpeg_size(data)
+    elseif data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
+        return webp_size(data)
+    end
 end
 
 function Images.dir(book_dir)
@@ -633,7 +893,7 @@ function Images.localize(html, book_dir, on_progress, opts)
                 Log.warn("images", "apply_fail", { index = i, err = new_html })
             end
             done = done + 1
-        elseif fetch then
+        elseif fetch and not recent_miss(item.stem) then
             jobs[#jobs + 1] = item
         else
             fail_count = fail_count + 1

@@ -17,6 +17,11 @@ end
 
 function Session.clear_auth()
     Log.info("session", "clear_auth")
+    -- The cached shelf belongs to the account that is being signed out.
+    local ok, Shelf = pcall(require, "wereadlite.kindle.shelf")
+    if ok and Shelf and type(Shelf.reset) == "function" then
+        Shelf.reset()
+    end
     return CookieStore.clear()
 end
 

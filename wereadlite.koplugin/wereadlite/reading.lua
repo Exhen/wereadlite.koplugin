@@ -170,6 +170,65 @@ local function merge_chapters(state)
     state.chapters = list
 end
 
+-- The chapter a chapter file belongs to ("<uid>_<start>-<end>.html").  Taken
+-- from the file rather than Reading.state: while a chapter switch is opening,
+-- the state already describes the new chapter but the document on screen is
+-- still the old one.
+local function uid_from_html_path(path)
+    return tostring(path or ""):match("/([^/_]+)_%d+%-%d+%.html$")
+end
+
+-- Remember the exact page on screen.  WeRead's own progress only catches up when
+-- the reading progress syncs, so a couple of page turns are otherwise lost when
+-- the book is closed and reopened.
+function Reading.save_reader_position(ui)
+    if not ui then
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        ui = ok and ReaderUI and ReaderUI.instance
+    end
+    local document = ui and ui.document
+    local file = document and document.file
+    local book_id = file and Reading.book_id_from_path(file)
+    local uid = uid_from_html_path(file)
+    if not book_id or not uid then
+        return false
+    end
+    -- CreDocument:getXPointer() reports the page actually on screen; the rolling
+    -- widget's record is the fallback.
+    local xpointer
+    if type(document.getXPointer) == "function" then
+        pcall(function()
+            xpointer = document:getXPointer()
+        end)
+    end
+    if (not xpointer or xpointer == "") and ui.rolling
+        and type(ui.rolling.getLastProgress) == "function" then
+        pcall(function()
+            xpointer = ui.rolling:getLastProgress()
+        end)
+    end
+    if not xpointer or xpointer == "" then
+        return false
+    end
+    return Settings.set_reader_position(book_id, uid, xpointer)
+end
+
+-- The saved page is only meaningful for the chapter it was taken from.
+local function saved_resume(state)
+    if not state then
+        return nil
+    end
+    local ok, saved = pcall(Settings.reader_position, state.book_id)
+    if not ok or not saved then
+        return nil
+    end
+    local uid = state.cur and tostring(state.cur.uid or "") or ""
+    if uid == "" or saved.uid ~= uid then
+        return nil
+    end
+    return { xpointer = saved.xpointer }
+end
+
 local function current_uid()
     local state = Reading.state
     if not state then
@@ -220,8 +279,26 @@ function Reading.apply_document_toc(ui)
     end
 end
 
+-- The full table of contents is not needed to show the first page, so it is
+-- fetched in the background after the book is open instead of delaying the open.
+local function catalog_done(state)
+    local total = tonumber(state.chapter_count) or 0
+    if total > 0 and #Reading.chapters >= total then
+        return true
+    end
+    return total <= 0 and #(state.chapters or {}) > 0
+end
+
+function Reading.cancel_catalog()
+    local job = Reading._catalog_job
+    Reading._catalog_job = nil
+    if job and type(job.cancel) == "function" then
+        pcall(job.cancel, job)
+    end
+end
+
 local function ensure_catalog(state)
-    if Reading.catalog_complete or not state then
+    if Reading.catalog_complete or not state or Reading._catalog_job then
         return
     end
     local total = tonumber(state.chapter_count) or 0
@@ -229,18 +306,30 @@ local function ensure_catalog(state)
         Reading.catalog_complete = true
         return
     end
-    local ok, chapters = pcall(Reader.expand_catalog, state)
-    if ok and type(chapters) == "table" and #chapters > 0 then
-        state.chapters = chapters
-        merge_chapters(state)
-    elseif not ok then
-        Log.warn("reading", "catalog", { err = chapters })
-    end
-    if total > 0 and #Reading.chapters >= total then
-        Reading.catalog_complete = true
-    elseif total <= 0 and #(state.chapters or {}) > 0 then
-        Reading.catalog_complete = true
-    end
+    local job
+    job = Reader.expand_catalog(state, function(chapters)
+        if Reading._catalog_job == job then
+            Reading._catalog_job = nil
+        end
+        if type(chapters) == "table" and #chapters > 0 then
+            state.chapters = chapters
+            merge_chapters(state)
+        end
+        if catalog_done(state) then
+            Reading.catalog_complete = true
+        end
+        -- Chapters opened since then keep working from the merged list, and a
+        -- table of contents already built from the partial list is rebuilt.
+        if Reading.state then
+            Reading.state.chapters = Reading.chapters
+        end
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and Reading.is_ours(ui.document and ui.document.file) then
+            Reading.apply_document_toc(ui)
+        end
+    end)
+    Reading._catalog_job = job
 end
 
 function Reading.is_ours(file)
@@ -249,6 +338,18 @@ function Reading.is_ours(file)
         and (file:find("wereadlite", 1, true) ~= nil
             or file:find("微信读书", 1, true) ~= nil
             or file:find("微信阅读", 1, true) ~= nil)
+end
+
+-- Chapters live in <plugin>/data/reading/<book_id>/<chapter>.html, so the
+-- directory name is the book the font-size setting belongs to.  Parse it from
+-- the path itself: KOReader may hand us the file in a different form (relative,
+-- doubled slashes) than the plugin root string, so a prefix match is unreliable.
+function Reading.book_id_from_path(file)
+    file = tostring(file or "")
+    if not Reading.is_ours(file) then
+        return nil
+    end
+    return file:match("/data/reading/([^/]+)/[^/]+$")
 end
 
 local function history_item_path(item)
@@ -435,7 +536,8 @@ local RESUME_DELAYS = { 0.35, 0.9, 1.6 }
 local function has_resume_target(resume)
     return type(resume) == "table"
         and ((tonumber(resume.percent) or 0) > 0
-            or (resume.anchor ~= nil and resume.anchor ~= ""))
+            or (resume.anchor ~= nil and resume.anchor ~= "")
+            or (type(resume.xpointer) == "string" and resume.xpointer ~= ""))
 end
 
 -- Fallback when the jump could not be made while the reader was opening.
@@ -484,16 +586,63 @@ local function resume_before_first_paint(reader, resume, path, state)
     return jumped
 end
 
-local function open_document(path, resume, state)
+-- KOReader fills the CRE options from the sidecar while ReaderUI is built, and
+-- on a fresh open the DocSettingsLoad handler runs after the reader already has
+-- its document: the chapter was laid out at the global size and then again at
+-- the saved one (a re-layout right after opening, which also costs time).
+-- Writing the sidecar before the reader exists makes the first layout use the
+-- saved size.
+function Reading.prime_reader_font_size(path)
+    local book_id = Reading.book_id_from_path(path)
+    if not book_id then
+        return false
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size then
+        return false
+    end
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not ok_ds or type(DocSettings) ~= "table" or type(DocSettings.open) ~= "function" then
+        return false
+    end
+    local opened, doc_settings = pcall(DocSettings.open, DocSettings, path)
+    if not opened or not doc_settings then
+        return false
+    end
+    pcall(doc_settings.saveSetting, doc_settings, "copt_font_size", size)
+    pcall(doc_settings.flush, doc_settings)
+    Log.dbg("reading", "font_size_prime", { book_id = book_id, size = size })
+    return true
+end
+
+-- hooks.before_show runs while the new reader is being built, before KOReader
+-- puts it on screen.
+local function open_document(path, resume, state, hooks)
+    hooks = hooks or {}
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
     Reader.clear_sidecars(path)
+    Reading.prime_reader_font_size(path)
     -- switchDocument closes the current doc first; our onClose hook must not
     -- delete the target file when reopening/replacing a WeRead chapter.
     Reading._preserve_html = path
     -- KOReader calls this as reader:after_open_callback(), with the new ReaderUI.
     local function after_open(reader)
         Reading._preserve_html = nil
+        if hooks.before_show then
+            -- The load box is modal, and KOReader never stacks a normal window
+            -- above a modal one: once the reader is shown the box would still be
+            -- painted over the book, and closing it then repaints the page.
+            -- Dropping it now, before anything is shown, means the first paint
+            -- is just the book.  Nothing is drawn in between: this runs inside
+            -- the same UI tick that shows the reader.
+            local ok_hook, hook_err = pcall(hooks.before_show)
+            if not ok_hook then
+                Log.warn("reading", "before_show", { err = hook_err })
+            end
+        end
+        Reading.ensure_reader_font_size(reader)
+        Reading.snapshot_reader_font_size(reader)
         -- This runs before the new reader is shown. A shelf left underneath
         -- the reader would be repainted as soon as the next chapter switch
         -- closes the current document, so drop it now.
@@ -550,6 +699,38 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
         })
         return false
     end
+    local xpointer = type(resume.xpointer) == "string" and resume.xpointer or ""
+    if xpointer ~= "" and ui.document then
+        local valid = false
+        if type(ui.document.isXPointerInDocument) == "function" then
+            pcall(function()
+                valid = ui.document:isXPointerInDocument(xpointer)
+            end)
+        end
+        if valid then
+            -- Our books are reflowable, so the rolling widget owns pagination in
+            -- both modes and is the one that knows how to land on an xpointer.
+            local jumped = false
+            if ui.rolling and type(ui.rolling.onGotoXPointer) == "function" then
+                jumped = pcall(function()
+                    ui.rolling:onGotoXPointer(xpointer)
+                end)
+            else
+                local Event = require("ui/event")
+                jumped = pcall(function()
+                    ui:handleEvent(Event:new("GotoXPointer", xpointer))
+                end)
+            end
+            if jumped then
+                Log.dbg("reading", "resume_xpointer")
+                return true
+            end
+        else
+            -- The chapter markup changed (another plugin version, a different
+            -- section window): fall back to the percentages below.
+            Log.info("reading", "resume_xpointer_stale")
+        end
+    end
     local percent = tonumber(resume.percent) or 0
     local anchor = resume.anchor
     -- Use the CRE section anchor only when no precise offset was available.
@@ -572,7 +753,7 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
             end
         end
     end
-    if percent > 0 and percent < 100 then
+    if percent > 0 and percent <= 100 then
         Log.dbg("reading", "resume_percent", { percent = percent })
         local Event = require("ui/event")
         local jumped = pcall(function()
@@ -583,10 +764,39 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
     return false
 end
 
+local function chapter_file_ok(path)
+    local file = path and io.open(path, "rb")
+    if not file then
+        return false
+    end
+    file:close()
+    return true
+end
+
+-- Put the load box on screen now.  UIManager:show() only queues a refresh, so
+-- anything slow that runs before the next paint tick (chapter teardown, decode
+-- tables, the first request) would delay the box by that much; painting it here
+-- keeps the tap responsive.
+function Reading.show_load_bar(stage)
+    local ok, widget = pcall(LoadProgress.open, {
+        stage = stage,
+        on_cancel = function()
+            Reading.cancel_load()
+        end,
+    })
+    if not ok then
+        Log.warn("reading", "progress_ui", { err = widget })
+        return nil
+    end
+    Reading._load_bar = widget
+    pcall(UIManager.forceRePaint, UIManager)
+    return widget
+end
+
 function Reading.open_url(url, book, opts)
     opts = opts or {}
     url = tostring(url or "")
-    Reading.cancel_load()
+    Reading.cancel_load(opts.bar)
     if opts.continue_sections then
         Reading._continuing_sections = true
     end
@@ -594,41 +804,32 @@ function Reading.open_url(url, book, opts)
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
-    local bar, bar_timer
+    local bar
+    if opts.bar then
+        if Reading._load_bar ~= opts.bar then
+            -- Its cancel button was tapped while the open was being set up.
+            Log.info("reading", "open_cancelled_before_load")
+            return nil, "cancelled", "cancelled"
+        end
+        bar = opts.bar
+    elseif opts.resume == true then
+        -- Opening a whole book always takes a while (the reader still has to
+        -- load and lay out the text), so there is nothing to spare by waiting.
+        bar = Reading.show_load_bar("open")
+    end
     -- Shown only when a network load is actually needed (not on a prefetch
     -- hit), so the user can still force-cancel large chapters.
-    local function show_bar()
+    local function show_bar(stage)
         if bar then
             return
         end
-        local ok_bar, opened = pcall(LoadProgress.open, {
-            on_cancel = function()
-                Reading.cancel_load()
-            end,
-        })
-        if not ok_bar then
-            Log.warn("reading", "progress_ui", { err = opened })
-            bar = nil
-        else
-            bar = opened
-        end
-        Reading._load_bar = bar
+        bar = Reading.show_load_bar(stage)
     end
-    -- A quick load finishes before this fires, so the screen is not flashed
-    -- twice by a dialog that is gone a moment later.
-    local BAR_DELAY = 0.8
-    local function show_bar_later()
-        if bar or bar_timer then
-            return
-        end
-        bar_timer = function()
-            bar_timer = nil
-            if my_generation == Reading._load_generation then
-                show_bar()
-            end
-        end
-        UIManager:scheduleIn(BAR_DELAY, bar_timer)
-    end
+    -- Any load that gets this far still has to parse and lay the chapter out,
+    -- which takes seconds, and the fetching/parsing itself keeps the UI loop busy
+    -- long enough that a delayed box would only appear after the wait.  Cached
+    -- chapters never reach this point: they are served before the box is asked
+    -- for, so there is nothing to flash.
     local function report(stage, done, total)
         if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
@@ -644,18 +845,45 @@ function Reading.open_url(url, book, opts)
             end
         end
     end
-    local function close_bar()
-        if bar_timer then
-            UIManager:unschedule(bar_timer)
-            bar_timer = nil
+    -- Safety net: if the reader never comes up, do not leave the box on screen.
+    local OPEN_TIMEOUT = 30
+    local bar_watchdog
+    local function close_bar(quiet)
+        if bar_watchdog then
+            UIManager:unschedule(bar_watchdog)
+            bar_watchdog = nil
         end
         if Reading._load_bar == bar then
             Reading._load_bar = nil
         end
         if bar then
-            pcall(bar.close, bar)
+            pcall(bar.close, bar, quiet)
             bar = nil
         end
+    end
+    -- Downloading is finished but the reader still has to load and lay out the
+    -- text, which is the slow part of opening a book.  Keep the box up for it
+    -- (showing it now when the download was too quick to have needed one) so the
+    -- screen never sits idle between the box and the book.
+    local function show_opening()
+        if not bar and opts.resume ~= true then
+            return
+        end
+        if bar then
+            if Settings.show_chapter_load_progress() then
+                pcall(bar.update, bar, "open", 1, 1)
+            end
+        else
+            show_bar("open")
+        end
+        if not bar then
+            return
+        end
+        bar_watchdog = function()
+            bar_watchdog = nil
+            close_bar()
+        end
+        UIManager:scheduleIn(OPEN_TIMEOUT, bar_watchdog)
     end
 
     local function complete(state, status, err)
@@ -668,8 +896,8 @@ function Reading.open_url(url, book, opts)
             return
         end
         Reading._load_task = nil
-        close_bar()
         if not state then
+            close_bar()
             -- User cancelled: do not toast a failure.
             if status == "cancelled" or tostring(err or ""):find("cancel", 1, true) then
                 Log.info("reading", "open_cancelled")
@@ -683,23 +911,59 @@ function Reading.open_url(url, book, opts)
             Reading.book = book
         end
         merge_chapters(state)
-        ensure_catalog(state)
         Reading.state = state
         -- A background prefetch runs the same pipeline as an open, so review
         -- metadata must be activated only when its chapter is actually shown.
         Reader.review_data = state.review_data or {}
         Reader.review_marks = state.review_marks or {}
+        if not chapter_file_ok(state.html_path) then
+            -- A chapter that was prefetched earlier can be deleted by a later
+            -- open (only the chapter on screen is kept).  Fetch it again rather
+            -- than handing KOReader a missing path, which aborts the open and
+            -- tears the UI down.
+            Log.warn("reading", "open_chapter_missing", { html = state.html_path })
+            close_bar()
+            if not opts.retried then
+                Reading.open_url(url, book, {
+                    resume = opts.resume,
+                    retried = true,
+                    chapter_uid = opts.chapter_uid,
+                })
+            else
+                show_error("打开章节失败")
+            end
+            return
+        end
         local resume
         if opts.resume == true then
-            resume = { percent = state.resume_percent, anchor = state.resume_anchor }
+            resume = saved_resume(state)
+                or { percent = state.resume_percent, anchor = state.resume_anchor }
+        elseif opts.at_end then
+            -- Turning back into the previous chapter shows its last page.
+            resume = { percent = 100 }
         end
-        local opened, open_err = pcall(open_document, state.html_path, resume, state)
+        -- Keep this chapter (html + sidecar) so coming back to it needs no
+        -- fetch, parse or image rewriting; cleanup_reading() preserves it.
+        Reader.remember_chapter(url, state, true)
+        show_opening()
+        local opened, open_err = pcall(open_document, state.html_path, resume, state, {
+            before_show = function()
+                close_bar(true)
+            end,
+        })
         if not opened then
+            close_bar()
             Reader.remove_chapter(state.html_path)
             show_error("打开章节失败")
             Log.warn("reading", "open_document", { err = open_err })
             return
         end
+        -- Not needed to show the page; load it once the reader is up.
+        UIManager:scheduleIn(0.5, function()
+            if Reading.state == state then
+                ensure_catalog(state)
+            end
+        end)
         pcall(BookDb.save_last_read, Reading.book, {
             book_info = state.book_info,
             chapter_title = state.chapter_title or (state.cur and state.cur.title),
@@ -737,6 +1001,15 @@ function Reading.open_url(url, book, opts)
     end
 
     local prefetched = Reader.take_prefetched(url)
+    if not prefetched and opts.chapter_uid then
+        -- The same chapter can be requested under the book entry URL and under
+        -- its own chapter URL; the second index catches that spelling.
+        local cache_book = book or Reading.book or {}
+        local cache_book_id = cache_book.bookId
+            or (Reading.state and Reading.state.book_id)
+            or ""
+        prefetched = Reader.take_cached_chapter(cache_book_id, opts.chapter_uid)
+    end
     if prefetched then
         complete(prefetched)
         return true, "prefetched"
@@ -744,7 +1017,7 @@ function Reading.open_url(url, book, opts)
 
     -- Same chapter already loading in background: adopt that job (no second fetch).
     if Reader.is_prefetching(url) then
-        show_bar_later()
+        show_bar()
         local adopted, job = Reader.adopt_prefetch(url, report, complete)
         if adopted then
             Reading._load_task = job
@@ -763,7 +1036,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
-    show_bar_later()
+    show_bar()
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
@@ -781,7 +1054,8 @@ function Reading.open_url(url, book, opts)
     return state
 end
 
-function Reading.cancel_load()
+-- keep_bar: the box is handed over to the load that is starting, so it stays up.
+function Reading.cancel_load(keep_bar)
     Reading._load_generation = (Reading._load_generation or 0) + 1
     Reading._continuing_sections = false
     local task = Reading._load_task
@@ -790,8 +1064,8 @@ function Reading.cancel_load()
         pcall(task.cancel, task)
     end
     local bar = Reading._load_bar
-    Reading._load_bar = nil
-    if bar then
+    if bar and bar ~= keep_bar then
+        Reading._load_bar = nil
         pcall(bar.close, bar)
     end
     Log.info("reading", "load_cancelled")
@@ -823,17 +1097,26 @@ function Reading.open_book(book)
         return
     end
     Reading.cancel_load()
+    Reading.cancel_catalog()
     Reading.book = book
     Reading.chapters = {}
     Reading.state = nil
     Reading.catalog_complete = false
     Heartbeat.stop(false)
+    -- Show the box on the tap: the prefetch teardown, the chapter cleanup and
+    -- the first request all keep the UI thread busy, so a box scheduled for
+    -- later would only appear seconds after the tap.
+    local bar = Reading.show_load_bar("open")
     Reader.cancel_prefetch()
     Reader.clear_prefetched()
     Reader.cleanup_reading()
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, book, { resume = true })
+        local ok, status, err = Reading.open_url(url, book, { resume = true, bar = bar })
         if ok then
+            UIManager:nextTick(Reader.warm_up)
+            return
+        end
+        if status == "cancelled" then
             return
         end
         if status == "auth_expired" then
@@ -866,7 +1149,10 @@ function Reading.open_next()
         if Reading.state ~= from_state then
             return
         end
-        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            chapter_uid = from_state and from_state.next_param and from_state.next_param.uid,
+        })
         if ok then
             return
         end
@@ -882,12 +1168,81 @@ function Reading.open_next()
     return true
 end
 
+-- Turning past the last page (or back from the first one) makes KOReader re-draw
+-- the very same page (page-update footer/view refresh).  We are about to replace
+-- the document, so drop that queued repaint instead of letting the old page flash
+-- once before the new chapter shows.
+local function discard_pending_paint()
+    pcall(function()
+        UIManager._refresh_stack = {}
+        UIManager._refresh_func_stack = {}
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and UIManager._dirty then
+            UIManager._dirty[ui.dialog or ui] = nil
+        end
+    end)
+end
+
+-- Turning back from the first page of a chapter.  A long chapter is loaded as a
+-- window of sections; inside a later window the previous data is simply not on
+-- disk, so stay put instead of jumping over a whole chapter.
+function Reading.open_prev()
+    local state = Reading.state
+    if state and (tonumber(state.section_start) or 0) > 0 then
+        Log.info("reading", "prev_section_window", {
+            section_start = state.section_start,
+            uid = current_uid(),
+        })
+        return false
+    end
+    local url = Reader.prev_url(state)
+    if not url then
+        Log.info("reading", "prev_missing", {
+            book_id = state and state.book_id,
+            uid = current_uid(),
+            chapters = #(Reading.chapters or {}),
+        })
+        show_error("已经是第一章")
+        return false
+    end
+    discard_pending_paint()
+    local from_state = state
+    UIManager:nextTick(function()
+        -- A repeated page-turn at the chapter start must not skip a chapter.
+        if Reading.state ~= from_state then
+            return
+        end
+        -- Land on the last page: the reader is moving backwards into this chapter.
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            at_end = true,
+            chapter_uid = from_state and from_state.prev_param and from_state.prev_param.uid,
+        })
+        if ok then
+            return
+        end
+        Log.warn("reading", "prev_chapter", { status = status, err = err })
+        if status == "auth_expired" then
+            show_error("登录已过期，请重新登录")
+        elseif status == "need_pay" then
+            show_error("上一章需要购买")
+        elseif status == "offline" then
+            show_error("网络不可用")
+        else
+            show_error("打开上一章失败")
+        end
+    end)
+    return true
+end
+
 function Reading.show_wechat_shelf()
     if Reading._returning then
         return
     end
     Reading._returning = true
     Reading.cancel_load()
+    Reading.cancel_catalog()
     Heartbeat.stop(false)
     Reader.cleanup_reading()
     local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
@@ -997,21 +1352,6 @@ function Reading.return_to_shelf()
     end)
 end
 
--- Turning past the last page makes KOReader re-draw the very same page (page-update
--- footer/view refresh).  We are about to replace the document, so drop that queued
--- repaint instead of letting the old page flash once before the next chapter shows.
-local function discard_pending_paint()
-    pcall(function()
-        UIManager._refresh_stack = {}
-        UIManager._refresh_func_stack = {}
-        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
-        local ui = ok and ReaderUI and ReaderUI.instance
-        if ui and UIManager._dirty then
-            UIManager._dirty[ui.dialog or ui] = nil
-        end
-    end)
-end
-
 function Reading.handle_end_of_book(status_widget)
     local file = status_widget and status_widget.ui and status_widget.ui.document and status_widget.ui.document.file
     if not Reading.is_ours(file) then
@@ -1087,7 +1427,10 @@ function Reading.open_toc_item(item)
         return
     end
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            chapter_uid = uid ~= "" and uid or nil,
+        })
         if ok then
             return
         end
@@ -1120,6 +1463,121 @@ function Reading.is_active()
     return Reading.is_ours(file)
 end
 
+function Reading.save_reader_font_size(ui)
+    local document = ui and ui.document
+    local book_id = document and Reading.book_id_from_path(document.file)
+    local configurable = document and document.configurable
+    local size = configurable and tonumber(configurable.font_size)
+    if not book_id or not size then
+        Log.dbg("reading", "font_size_save_skip", {
+            file = document and document.file,
+            book_id = book_id,
+            size = size,
+        })
+        return
+    end
+    local ok, err = pcall(Settings.set_reader_font_size, book_id, size)
+    if not ok then
+        Log.warn("reading", "save_font_size", { book_id = book_id, err = err })
+    end
+end
+
+-- Called by KOReader's DocSettingsLoad event, after plugins are loaded and
+-- before ReaderConfig/ReaderFont read the document settings, so the chapter is
+-- laid out at the saved size from the start.  ReaderConfig reads CRE options
+-- from the document settings with the "copt_" prefix (CreOptions.prefix).
+function Reading.inject_reader_font_size(doc_settings, file)
+    local book_id = Reading.book_id_from_path(file)
+    if not book_id or not doc_settings then
+        return false
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size then
+        return false
+    end
+    doc_settings:saveSetting("copt_font_size", size)
+    Log.dbg("reading", "font_size_inject", { book_id = book_id, size = size })
+    return true
+end
+
+-- crengine can scale each fallback font so its x-height matches the main font
+-- (KOReader: "Adjust fallback font sizes"): it re-sizes the fallback font by
+-- main x-height / fallback x-height, so a font with a smaller x-height is drawn
+-- bigger.  Han characters have no x-height, yet a rare character the main font
+-- lacks comes from a fallback font, so it ends up drawn at a size unrelated to
+-- the rest of the line.  WeRead draws those characters at the normal size, so
+-- turn the adjustment off for its chapters.
+--
+-- The flag lives on crengine's font manager, not on the document, but KOReader
+-- re-applies the user's own setting in setupDefaultView() before DocSettingsLoad
+-- on every open, so a normal book opened afterwards gets their preference back.
+-- The saved setting is never modified.
+function Reading.disable_fallback_size_adjustment(document)
+    if not document or not Reading.is_ours(document.file) then
+        return false
+    end
+    if type(document.setAdjustedFallbackFontSizes) ~= "function" then
+        -- Older KOReader without the property; the glyph images cap still applies.
+        Log.warn("reading", "fallback_size_unavailable")
+        return false
+    end
+    local ok, err = pcall(document.setAdjustedFallbackFontSizes, document, false)
+    if not ok then
+        Log.warn("reading", "fallback_size_adjust", { err = err })
+        return false
+    end
+    Log.info("reading", "fallback_size_off")
+    return true
+end
+
+-- Safety net run once the new chapter is open: if the saved size did not make
+-- it into the layout for any reason, apply it directly.
+function Reading.ensure_reader_font_size(ui)
+    local document = ui and ui.document
+    local book_id = document and Reading.book_id_from_path(document.file)
+    local configurable = document and document.configurable
+    if not book_id or not configurable then
+        return
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size or tonumber(configurable.font_size) == size then
+        return
+    end
+    Log.warn("reading", "font_size_fallback", {
+        book_id = book_id,
+        have = configurable.font_size,
+        want = size,
+    })
+    local applied, err = pcall(function()
+        local Screen = Device.screen
+        configurable.font_size = size
+        document:setFontSize(Screen:scaleBySize(size))
+        ui:handleEvent(require("ui/event"):new("UpdatePos"))
+    end)
+    if not applied then
+        Log.warn("reading", "font_size_fallback_fail", { err = err })
+    end
+end
+
+-- Take the size the chapter opened with, so the close-time fallback can tell
+-- whether the user actually changed it and avoid pinning the default onto
+-- books that were only ever read as-is.
+function Reading.snapshot_reader_font_size(ui)
+    local configurable = ui and ui.document and ui.document.configurable
+    if configurable then
+        ui._wereadlite_font_size_opened = tonumber(configurable.font_size)
+    end
+end
+
+function Reading.save_reader_font_size_if_changed(ui)
+    local configurable = ui and ui.document and ui.document.configurable
+    local current = configurable and tonumber(configurable.font_size)
+    local opened = ui and tonumber(ui._wereadlite_font_size_opened)
+    if current and opened and current ~= opened then
+        Reading.save_reader_font_size(ui)
+    end
+end
+
 local function ours_from_toc(toc)
     local file = toc and toc.ui and toc.ui.document and toc.ui.document.file
     return Reading.is_ours(file)
@@ -1144,6 +1602,76 @@ local function install_end_of_book_hook()
     Log.dbg("reading", "hook", { name = "end_of_book" })
 end
 
+-- KOReader reports "reached the end of the document" (EndOfBook) but has no
+-- counterpart for the first page, so catch the backward turn here.
+local function install_page_back_hook()
+    local ok, ReaderPaging = pcall(require, "apps/reader/modules/readerpaging")
+    if not ok or not ReaderPaging or ReaderPaging._wereadlite_back_hooked then
+        return
+    end
+    ReaderPaging._wereadlite_back_hooked = true
+    local original = ReaderPaging.onGotoPageRel
+    function ReaderPaging:onGotoPageRel(diff, no_page_turn)
+        if not no_page_turn and diff < 0
+            and Reading.is_ours(self.document and self.document.file)
+        then
+            if self.current_page == 1 then
+                Log.info("reading", "back_at_start", {
+                    mode = "paging",
+                    page = self.current_page,
+                    zoom = tostring(self.zoom_mode),
+                    scroll = self.view and self.view.page_scroll and true or false,
+                })
+                if self.zoom_mode ~= "free" and not Reading._load_task and Reading.open_prev() then
+                    return true
+                end
+            end
+        end
+        if original then
+            return original(self, diff, no_page_turn)
+        end
+    end
+    Log.info("reading", "hook", { name = "page_back" })
+end
+
+-- Scroll mode (and paged mode inside ReaderRolling) keeps its own position, so
+-- the first-page check above never sees it; hook the same turn there.
+local function install_rolling_back_hook()
+    local ok, ReaderRolling = pcall(require, "apps/reader/modules/readerrolling")
+    if not ok or not ReaderRolling or ReaderRolling._wereadlite_back_hooked then
+        return
+    end
+    ReaderRolling._wereadlite_back_hooked = true
+    local original = ReaderRolling.onGotoViewRel
+    function ReaderRolling:onGotoViewRel(diff)
+        if type(diff) == "number" and diff < 0
+            and Reading.is_ours(self.ui and self.ui.document and self.ui.document.file)
+        then
+            local scrolling = self.view and self.view.view_mode == "scroll"
+            local at_start
+            if scrolling then
+                at_start = (tonumber(self.current_pos) or 0) <= 0
+            else
+                at_start = self.current_page == 1
+            end
+            if at_start then
+                Log.info("reading", "back_at_start", {
+                    mode = scrolling and "scroll" or "rolling_page",
+                    pos = self.current_pos,
+                    page = self.current_page,
+                })
+                if not Reading._load_task and Reading.open_prev() then
+                    return true
+                end
+            end
+        end
+        if original then
+            return original(self, diff)
+        end
+    end
+    Log.info("reading", "hook", { name = "rolling_back" })
+end
+
 local function install_close_hook()
     local ok, ReaderUI = pcall(require, "apps/reader/readerui")
     if not ok or not ReaderUI or ReaderUI._wereadlite_close_hooked then
@@ -1155,6 +1683,8 @@ local function install_close_hook()
         local file = self.document and self.document.file
         local ours = Reading.is_ours(file)
         if ours then
+            Reading.save_reader_position(self)
+            Reading.save_reader_font_size_if_changed(self)
             Heartbeat.stop(false)
         end
         local result
@@ -1167,10 +1697,24 @@ local function install_close_hook()
             if preserve ~= "" and tostring(file or "") == preserve then
                 Log.dbg("reading", "close_preserve_html", { file = file })
             else
-                Reader.remove_chapter(file)
+                -- A chapter switch closes the old document too: forget_chapter()
+                -- keeps the file when the chapter cache still points at it, so
+                -- turning back into it does not rebuild the whole chapter.
+                Reader.forget_chapter(file)
             end
         end
         return result
+    end
+    -- Suspend and explicit "save settings" flushes go through this, and the
+    -- document is still alive: keep the page for a resume after a power-off.
+    local original_flush = ReaderUI.onFlushSettings
+    function ReaderUI:onFlushSettings(show_notification)
+        if self.document and Reading.is_ours(self.document.file) then
+            Reading.save_reader_position(self)
+        end
+        if original_flush then
+            return original_flush(self, show_notification)
+        end
     end
     Log.dbg("reading", "hook", { name = "reader_close" })
 end
@@ -1480,14 +2024,39 @@ local function install_highlight_hook()
     Log.dbg("reading", "hook", { name = "highlight" })
 end
 
+local function install_font_size_hook()
+    -- Remember every font size the user picks in the reading menu for the book
+    -- being read, so its next chapter (and the next session) opens with it.
+    local ok_font, ReaderFont = pcall(require, "apps/reader/modules/readerfont")
+    if ok_font and ReaderFont and not ReaderFont._wereadlite_font_hooked then
+        ReaderFont._wereadlite_font_hooked = true
+        local original_set = ReaderFont.onSetFontSize
+        if type(original_set) == "function" then
+            function ReaderFont:onSetFontSize(size)
+                local result = original_set(self, size)
+                local file = self.ui and self.ui.document and self.ui.document.file
+                if Reading.is_ours(file) then
+                    Reading.save_reader_font_size(self.ui)
+                end
+                return result
+            end
+        end
+    end
+
+    Log.dbg("reading", "hook", { name = "reader_font_size" })
+end
+
 function Reading.install_hook()
     install_history_filter()
     install_end_of_book_hook()
+    install_page_back_hook()
+    install_rolling_back_hook()
     install_close_hook()
     install_exit_hook()
     install_toc_hook()
     install_review_link_hook()
     install_highlight_hook()
+    install_font_size_hook()
 end
 
 return Reading

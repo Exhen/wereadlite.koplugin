@@ -11,7 +11,19 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
+local Log = require("wereadlite.log")
+
 local Screen = Device.screen
+
+local ok_socket, socket = pcall(require, "socket")
+local function clock()
+    return ok_socket and socket.gettime() or os.time()
+end
+
+-- Every repaint of the box is a screen refresh; progress ticks arrive in
+-- bursts (one per section, per image), so paint at most this often unless the
+-- stage changes.
+local PAINT_INTERVAL = 0.3
 
 -- Ordered stages with non-overlapping ranges so the bar only moves forward.
 local STAGES = {
@@ -19,6 +31,8 @@ local STAGES = {
     segments = { order = 2, from = 0.12, to = 0.55, text = "下载分段" },
     images = { order = 3, from = 0.55, to = 0.82, text = "加载图片" },
     reviews = { order = 4, from = 0.82, to = 1, text = "获取划线内容" },
+    -- Everything is downloaded; the reader is now loading and laying out the text.
+    open = { order = 5, from = 1, to = 1, text = "正在打开书籍" },
 }
 
 local LoadProgress = InputContainer:extend{
@@ -80,24 +94,25 @@ function LoadProgress:init()
             self:request_cancel()
         end,
     }
+    self.frame = FrameContainer:new{
+        radius = Size.radius.window,
+        bordersize = Size.border.window,
+        padding = Size.padding.large,
+        background = Blitbuffer.COLOR_WHITE,
+        VerticalGroup:new{
+            align = "center",
+            self.title_widget,
+            VerticalSpan:new{ width = Size.padding.small },
+            self.subtitle_widget,
+            VerticalSpan:new{ width = Size.padding.small },
+            self.bar,
+            VerticalSpan:new{ width = Size.padding.large },
+            self.cancel_button,
+        },
+    }
     self[1] = CenterContainer:new{
         dimen = self.dimen,
-        FrameContainer:new{
-            radius = Size.radius.window,
-            bordersize = Size.border.window,
-            padding = Size.padding.large,
-            background = Blitbuffer.COLOR_WHITE,
-            VerticalGroup:new{
-                align = "center",
-                self.title_widget,
-                VerticalSpan:new{ width = Size.padding.small },
-                self.subtitle_widget,
-                VerticalSpan:new{ width = Size.padding.small },
-                self.bar,
-                VerticalSpan:new{ width = Size.padding.large },
-                self.cancel_button,
-            },
-        },
+        self.frame,
     }
     if Device:hasKeys() then
         self.key_events = {
@@ -126,19 +141,21 @@ end
 
 function LoadProgress:paint()
     UIManager:setDirty(self, function()
-        return "fast", self.dimen
+        -- Only the box changes; refreshing the whole screen is much slower on e-ink.
+        return "fast", self.frame and self.frame.dimen or self.dimen
     end)
     UIManager:forceRePaint()
 end
 
-function LoadProgress:update(stage, done, total)
+function LoadProgress:update(stage, done, total, no_paint)
     if self._cancelled then
         return
     end
     local spec = STAGES[stage] or STAGES.info
     local order = tonumber(spec.order) or 0
+    local previous_order = self._stage_order or 0
     -- Ignore stale callbacks from an earlier pipeline stage.
-    if order < (self._stage_order or 0) then
+    if order < previous_order then
         return
     end
     self._stage_order = order
@@ -159,6 +176,17 @@ function LoadProgress:update(stage, done, total)
     self.title_widget:setText(spec.text)
     self.subtitle_widget:setText(subtitle)
     self.bar:setPercentage(percent)
+    if no_paint then
+        -- The caller already queued a refresh for these widgets (see open()).
+        return
+    end
+    local now = clock()
+    if order == previous_order and percent < 1
+        and self._last_paint and now - self._last_paint < PAINT_INTERVAL then
+        -- The widgets are up to date; the next paint shows them.
+        return
+    end
+    self._last_paint = now
     self:paint()
 end
 
@@ -167,12 +195,29 @@ function LoadProgress.open(opts)
     local widget = LoadProgress:new{
         on_cancel = opts.on_cancel,
     }
-    UIManager:show(widget, "ui")
-    widget:update("info", 0, 0)
+    -- The box is opaque and only its own area changes, so refresh that area
+    -- instead of the whole screen: the full-screen refresh is what made the box
+    -- flash once when it appeared over the shelf.  The stage is filled in
+    -- without a second refresh, because show() has already queued the paint.
+    UIManager:show(widget, "ui", widget.frame and widget.frame.dimen or widget.dimen)
+    if opts.stage then
+        widget:update(opts.stage, 1, 1, true)
+    else
+        widget:update("info", 0, 0, true)
+    end
+    Log.info("load_progress", "open", { stage = opts.stage or "info" })
     return widget
 end
 
-function LoadProgress:close()
+-- quiet: drop the widget without drawing anything.  Used when the reader is
+-- about to be shown on top of the screen anyway, so a repaint here would only
+-- flash the old content for a moment.
+function LoadProgress:close(quiet)
+    Log.info("load_progress", "close", { quiet = quiet and true or false })
+    if quiet then
+        UIManager:close(self)
+        return
+    end
     UIManager:close(self, "ui")
     UIManager:forceRePaint()
 end
