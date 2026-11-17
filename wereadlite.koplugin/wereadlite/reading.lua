@@ -1266,6 +1266,36 @@ function Reading.inject_reader_font_size(doc_settings, file)
     return true
 end
 
+-- crengine can scale each fallback font so its x-height matches the main font
+-- (KOReader: "Adjust fallback font sizes"): it re-sizes the fallback font by
+-- main x-height / fallback x-height, so a font with a smaller x-height is drawn
+-- bigger.  Han characters have no x-height, yet a rare character the main font
+-- lacks comes from a fallback font, so it ends up drawn at a size unrelated to
+-- the rest of the line.  WeRead draws those characters at the normal size, so
+-- turn the adjustment off for its chapters.
+--
+-- The flag lives on crengine's font manager, not on the document, but KOReader
+-- re-applies the user's own setting in setupDefaultView() before DocSettingsLoad
+-- on every open, so a normal book opened afterwards gets their preference back.
+-- The saved setting is never modified.
+function Reading.disable_fallback_size_adjustment(document)
+    if not document or not Reading.is_ours(document.file) then
+        return false
+    end
+    if type(document.setAdjustedFallbackFontSizes) ~= "function" then
+        -- Older KOReader without the property; the glyph images cap still applies.
+        Log.warn("reading", "fallback_size_unavailable")
+        return false
+    end
+    local ok, err = pcall(document.setAdjustedFallbackFontSizes, document, false)
+    if not ok then
+        Log.warn("reading", "fallback_size_adjust", { err = err })
+        return false
+    end
+    Log.info("reading", "fallback_size_off")
+    return true
+end
+
 -- Safety net run once the new chapter is open: if the saved size did not make
 -- it into the layout for any reason, apply it directly.
 function Reading.ensure_reader_font_size(ui)

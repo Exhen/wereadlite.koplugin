@@ -1937,7 +1937,15 @@ local function assemble_chapter(state, pages, url, book, on_progress, on_ready, 
                     elapsed_ms = math.floor((Log.now_ms() - wrap_started) + 0.5),
                 })
                 -- Image binaries were fetched in the images stage; only remap URLs here.
-                return Images.localize(decrypted_source, dir, nil, { fetch = false })
+                local localized = Images.localize(decrypted_source, dir, nil, { fetch = false })
+                -- Rare characters WeRead renders as inline images must not tower
+                -- over the line they sit in.
+                return Codec.mark_glyph_images(localized, function(src)
+                    if src == "" or src:find("^https?://") then
+                        return nil
+                    end
+                    return Images.pixel_size(dir .. "/" .. src)
+                end)
             end
             if background then
                 return sliced(render, finish_write)

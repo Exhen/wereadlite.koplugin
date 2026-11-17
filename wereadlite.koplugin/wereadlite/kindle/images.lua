@@ -321,6 +321,134 @@ replace_all = function(html, from, to)
     return table.concat(out)
 end
 
+-- Pixel size of an image file, for telling a one-character glyph image from a
+-- real illustration.  Reads only the header.  Returns nil when unknown
+-- (unsupported format, unreadable file, or remote URL left in place).
+local function u16be(s, i)
+    local a, b = s:byte(i, i + 1)
+    if not a or not b then
+        return nil
+    end
+    return a * 256 + b
+end
+
+local function u16le(s, i)
+    local a, b = s:byte(i, i + 1)
+    if not a or not b then
+        return nil
+    end
+    return b * 256 + a
+end
+
+local function u32be(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    if not a or not b or not c or not d then
+        return nil
+    end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+local function u32le(s, i)
+    local a, b, c, d = s:byte(i, i + 3)
+    if not a or not b or not c or not d then
+        return nil
+    end
+    return ((d * 256 + c) * 256 + b) * 256 + a
+end
+
+local SOF_MARKERS = {
+    [0xC0] = true, [0xC1] = true, [0xC2] = true, [0xC3] = true,
+    [0xC5] = true, [0xC6] = true, [0xC7] = true,
+    [0xC9] = true, [0xCA] = true, [0xCB] = true,
+    [0xCD] = true, [0xCE] = true, [0xCF] = true,
+}
+
+local function jpeg_size(data)
+    local i, n = 3, #data
+    while i + 1 <= n do
+        if data:byte(i) ~= 0xFF then
+            i = i + 1
+        else
+            local marker = data:byte(i + 1)
+            if marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7) then
+                i = i + 2
+            elseif marker == 0xDA then
+                return nil
+            else
+                local len = u16be(data, i + 2)
+                if not len or len < 2 then
+                    return nil
+                end
+                if SOF_MARKERS[marker] then
+                    return u16be(data, i + 7), u16be(data, i + 5)
+                end
+                i = i + 2 + len
+            end
+        end
+    end
+end
+
+local function u24le(s, i)
+    local a, b, c = s:byte(i, i + 2)
+    if not a or not b or not c then
+        return nil
+    end
+    return a + b * 256 + c * 65536
+end
+
+local function webp_size(data)
+    local chunk = data:sub(13, 16)
+    if chunk == "VP8X" then
+        -- Canvas width/height are stored minus one, 24-bit little endian each.
+        local w, h = u24le(data, 25), u24le(data, 28)
+        if not w or not h then
+            return nil
+        end
+        return w + 1, h + 1
+    elseif chunk == "VP8L" and data:byte(21) == 0x2F then
+        local b1, b2, b3, b4 = data:byte(22, 25)
+        if not b1 or not b4 then
+            return nil
+        end
+        -- 14 bits of width-1 then 14 bits of height-1, little endian bit order.
+        local value = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+        return value % 16384 + 1, math.floor(value / 16384) % 16384 + 1
+    elseif chunk == "VP8 " and data:byte(24) == 0x9D and data:byte(25) == 0x01 then
+        local w, h = u16le(data, 27), u16le(data, 29)
+        if not w or not h then
+            return nil
+        end
+        return w % 16384, h % 16384
+    end
+end
+
+function Images.pixel_size(path)
+    path = tostring(path or "")
+    if path == "" or path:find("^https?://") then
+        return nil
+    end
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local data = file:read(65536) or ""
+    file:close()
+    -- A GIF header is the shortest of the formats handled here; each reader
+    -- below rejects a header that is too short on its own.
+    if #data < 13 then
+        return nil
+    end
+    if data:byte(1) == 0x89 and data:sub(2, 4) == "PNG" then
+        return u32be(data, 17), u32be(data, 21)
+    elseif data:sub(1, 3) == "GIF" then
+        return u16le(data, 7), u16le(data, 9)
+    elseif data:byte(1) == 0xFF and data:byte(2) == 0xD8 then
+        return jpeg_size(data)
+    elseif data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
+        return webp_size(data)
+    end
+end
+
 function Images.dir(book_dir)
     local path = tostring(book_dir or "") .. "/img"
     mkdir(path)

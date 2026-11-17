@@ -102,9 +102,11 @@ function Plugin:addToMainMenu(menu_items)
 end
 
 -- Fired by ReaderUI after plugins load and before the document settings are
--- read, which is the point to hand the saved per-book font size to ReaderConfig.
+-- read and the document is rendered: the point to hand the saved per-book font
+-- size to ReaderConfig and to set per-document engine options.
 function Plugin:onDocSettingsLoad(doc_settings, document)
     Reading.inject_reader_font_size(doc_settings, document and document.file)
+    Reading.disable_fallback_size_adjustment(document)
 end
 
 function Plugin:onReaderReady()
