@@ -42,15 +42,164 @@ function Reader.take_prefetched(url)
         return nil
     end
     Reader._prefetched[url] = nil
-    -- cleanup_reading() keeps only the chapter on screen, so a prefetched chapter
-    -- from before a chapter switch may already be deleted; handing KOReader a
-    -- missing path makes it fail out of the open and tear the UI down.
+    -- An evicted chapter (or one from another book) may already be deleted;
+    -- handing KOReader a missing path makes it fail out of the open and tear the
+    -- UI down.
     if not file_readable(state.html_path) then
         Log.warn("reader", "prefetch_ready_stale", { url = url, html = state.html_path })
         return nil
     end
     Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
     return state
+end
+
+-- Chapters recently shown or prefetched, newest last.  Their html (and doc
+-- sidecar) stays in the book directory, so turning back into one of them skips
+-- the fetch, the parse and the image rewriting: only crengine loads the text.
+-- Without this, every back/forward turn re-ran the whole pipeline even though the
+-- page itself was already cached.
+local CHAPTER_CACHE_KEEP = 4
+local chapter_cache_order = {}
+local current_chapter_url = nil
+-- The same chapter is requested under different URLs: opening the book uses the
+-- book entry parameter, turning pages uses the chapter's own parameter.  Keep a
+-- second index by (book, chapter) so those two spellings share one entry.
+local chapter_by_uid = {}
+
+local function uid_key(book_id, uid)
+    book_id = tostring(book_id or "")
+    uid = tostring(uid or "")
+    if book_id == "" or uid == "" then
+        return nil
+    end
+    return book_id .. "|" .. uid
+end
+
+local function state_uid(state)
+    if type(state) ~= "table" then
+        return ""
+    end
+    if state.cur and state.cur.uid then
+        return tostring(state.cur.uid)
+    end
+    if state.cur_param and state.cur_param.uid then
+        return tostring(state.cur_param.uid)
+    end
+    return ""
+end
+
+local function html_still_cached(path)
+    if not path then
+        return false
+    end
+    for _, url in ipairs(chapter_cache_order) do
+        local cached = Reader._prefetched[url]
+        if cached and cached.html_path == path then
+            return true
+        end
+    end
+    return false
+end
+
+-- Two cache entries can share a chapter file (same chapter, different URL), so
+-- only drop it once nothing points at it any more.
+local function drop_chapter_file(path)
+    if path and path ~= "" and not html_still_cached(path) then
+        Reader.remove_chapter(path)
+    end
+end
+
+function Reader.remember_chapter(url, state, is_current)
+    url = tostring(url or "")
+    if url == "" or type(state) ~= "table" then
+        return
+    end
+    if is_current then
+        current_chapter_url = url
+    end
+    local previous = Reader._prefetched[url]
+    Reader._prefetched[url] = state
+    local key = uid_key(state.book_id, state_uid(state))
+    if key then
+        chapter_by_uid[key] = state
+    end
+    for i = #chapter_cache_order, 1, -1 do
+        if chapter_cache_order[i] == url then
+            table.remove(chapter_cache_order, i)
+        end
+    end
+    chapter_cache_order[#chapter_cache_order + 1] = url
+    if previous and previous.html_path ~= state.html_path then
+        drop_chapter_file(previous.html_path)
+    end
+    while #chapter_cache_order > CHAPTER_CACHE_KEEP do
+        -- Never drop the chapter on screen: prefetches are registered after it.
+        local victim
+        for i, cached_url in ipairs(chapter_cache_order) do
+            if cached_url ~= current_chapter_url then
+                victim = i
+                break
+            end
+        end
+        if not victim then
+            break
+        end
+        local victim_url = table.remove(chapter_cache_order, victim)
+        local cached = Reader._prefetched[victim_url]
+        Reader._prefetched[victim_url] = nil
+        if cached then
+            local key = uid_key(cached.book_id, state_uid(cached))
+            if key and chapter_by_uid[key] == cached then
+                chapter_by_uid[key] = nil
+            end
+            drop_chapter_file(cached.html_path)
+        end
+    end
+end
+
+-- A chapter cached under another URL (book entry vs chapter parameter) is still
+-- the same chapter: hand it back so a back/forward turn needs no rebuilding.
+function Reader.take_cached_chapter(book_id, uid)
+    local key = uid_key(book_id, uid)
+    local cached = key and chapter_by_uid[key]
+    if not cached then
+        return nil
+    end
+    -- A section window that does not start at the chapter head could land the
+    -- reader in the wrong place; those are rebuilt instead.
+    if (tonumber(cached.section_start) or 0) > 0 then
+        return nil
+    end
+    if not file_readable(cached.html_path) then
+        chapter_by_uid[key] = nil
+        Log.warn("reader", "chapter_cache_stale", { uid = tostring(uid), html = cached.html_path })
+        return nil
+    end
+    Log.info("reader", "chapter_cache_hit", {
+        book_id = tostring(book_id),
+        uid = tostring(uid),
+        html = cached.html_path,
+    })
+    return cached
+end
+
+-- Drop a chapter file, unless the chapter cache still needs it (a chapter switch
+-- closes the old document, which must not throw away the page just read).
+function Reader.forget_chapter(path)
+    drop_chapter_file(path)
+end
+
+-- Chapter files that Reader.cleanup_reading() must keep: without them a cached
+-- chapter would have to go back to the network to be reopened.
+function Reader.kept_chapter_paths()
+    local paths = {}
+    for _, url in ipairs(chapter_cache_order) do
+        local cached = Reader._prefetched[url]
+        if cached and cached.html_path then
+            paths[cached.html_path] = true
+        end
+    end
+    return paths
 end
 
 local function prefetch_key(url)
@@ -371,6 +520,36 @@ end
 
 function Reader.cleanup_reading(keep_html)
     keep_html = tostring(keep_html or "")
+    -- Chapters remembered for instant back/forward turns stay on disk; leaving
+    -- the book (keep_html == "") still wipes everything.
+    local cached_html = {}
+    if keep_html == "" then
+        -- Everything goes: the remembered chapters go with it.
+        chapter_cache_order = {}
+        current_chapter_url = nil
+        chapter_by_uid = {}
+        Reader._prefetched = {}
+    else
+        for path in pairs(Reader.kept_chapter_paths()) do
+            local enc, dec = html_pair(path)
+            cached_html[enc] = true
+            cached_html[dec] = true
+        end
+    end
+    local function keep_file(full)
+        return cached_html[full] == true or is_kept_html(full, keep_html)
+    end
+    local function keep_book_dir(book_dir)
+        if keep_html == book_dir or keep_html:sub(1, #book_dir + 1) == book_dir .. "/" then
+            return true
+        end
+        for path in pairs(cached_html) do
+            if path:sub(1, #book_dir + 1) == book_dir .. "/" then
+                return true
+            end
+        end
+        return false
+    end
     local root = Reader.reading_root()
     local lfs = lfs_mod()
     if not lfs or lfs.attributes(root, "mode") ~= "directory" then
@@ -383,23 +562,22 @@ function Reader.cleanup_reading(keep_html)
         if book ~= "." and book ~= ".." then
             local book_dir = root .. "/" .. book
             if lfs.attributes(book_dir, "mode") == "directory" then
-                local keep_here = keep_html == book_dir
-                    or keep_html:sub(1, #book_dir + 1) == book_dir .. "/"
+                local keep_here = keep_book_dir(book_dir)
                 for name in lfs.dir(book_dir) do
                     if name ~= "." and name ~= ".." then
                         local full = book_dir .. "/" .. name
                         if name:find("%.html$") then
-                            if not is_kept_html(full, keep_html) then
+                            if not keep_file(full) then
                                 Reader.remove_chapter(full)
                             end
                         elseif name == "img" and keep_here then
                             -- keep cached chapter images for the open book
                         elseif name:find("%.sdr$") then
                             local html = book_dir .. "/" .. name:gsub("%.sdr$", ".html")
-                            if not is_kept_html(html, keep_html) then
+                            if not keep_file(html) then
                                 remove_tree(full)
                             end
-                        elseif not is_kept_html(full, keep_html) then
+                        elseif not keep_file(full) then
                             remove_tree(full)
                         end
                     end
@@ -1054,6 +1232,10 @@ function Reader.prefetch_next(state, book)
         Log.warn("reader", "prefetch_cache_dropped", { url = url, html = cached.html_path })
     end
     local next_uid = state.next_param and tostring(state.next_param.uid or "") or ""
+    if next_uid ~= "" and Reader.take_cached_chapter(state.book_id, next_uid) then
+        Log.info("reader", "prefetch_already_cached", { uid = next_uid, url = url })
+        return
+    end
     if next_uid ~= "" then
         local existing = io.open(Reader.html_path(state.book_id, next_uid), "rb")
         if existing then
@@ -1080,7 +1262,7 @@ function Reader.prefetch_next(state, book)
             Reader._prefetch_job = nil
         end
         if prefetched then
-            Reader._prefetched[url] = prefetched
+            Reader.remember_chapter(url, prefetched)
             Log.info("reader", "prefetch_done", { url = url, html = prefetched.html_path, mode = "background" })
         else
             Log.warn("reader", "prefetch_fail", { url = url, status = ready_status, err = ready_err })
@@ -1104,7 +1286,7 @@ function Reader.prefetch_next(state, book)
     Reader._prefetch_job = nil
     Reader._prefetch_url = nil
     if result then
-        Reader._prefetched[url] = result
+        Reader.remember_chapter(url, result)
         Log.info("reader", "prefetch_done", { url = url, html = result.html_path, mode = "background" })
     end
 end
@@ -1122,6 +1304,9 @@ end
 
 function Reader.clear_prefetched()
     Reader._prefetched = {}
+    chapter_by_uid = {}
+    chapter_cache_order = {}
+    current_chapter_url = nil
 end
 
 -- WeRead encodes per-character offsets on <span wco="N">; API range matches those coords.

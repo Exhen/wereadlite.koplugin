@@ -804,7 +804,7 @@ function Reading.open_url(url, book, opts)
     Reading._load_generation = Reading._load_generation + 1
     local my_generation = Reading._load_generation
     Log.dbg("reading", "open_url", { url = url, book_id = book and book.bookId })
-    local bar, bar_timer
+    local bar
     if opts.bar then
         if Reading._load_bar ~= opts.bar then
             -- Its cancel button was tapped while the open was being set up.
@@ -825,21 +825,11 @@ function Reading.open_url(url, book, opts)
         end
         bar = Reading.show_load_bar(stage)
     end
-    -- A quick load finishes before this fires, so the screen is not flashed
-    -- twice by a dialog that is gone a moment later.
-    local BAR_DELAY = 0.8
-    local function show_bar_later()
-        if bar or bar_timer then
-            return
-        end
-        bar_timer = function()
-            bar_timer = nil
-            if my_generation == Reading._load_generation then
-                show_bar()
-            end
-        end
-        UIManager:scheduleIn(BAR_DELAY, bar_timer)
-    end
+    -- Any load that gets this far still has to parse and lay the chapter out,
+    -- which takes seconds, and the fetching/parsing itself keeps the UI loop busy
+    -- long enough that a delayed box would only appear after the wait.  Cached
+    -- chapters never reach this point: they are served before the box is asked
+    -- for, so there is nothing to flash.
     local function report(stage, done, total)
         if bar and Settings.show_chapter_load_progress() then
             pcall(bar.update, bar, stage, done, total)
@@ -859,10 +849,6 @@ function Reading.open_url(url, book, opts)
     local OPEN_TIMEOUT = 30
     local bar_watchdog
     local function close_bar(quiet)
-        if bar_timer then
-            UIManager:unschedule(bar_timer)
-            bar_timer = nil
-        end
         if bar_watchdog then
             UIManager:unschedule(bar_watchdog)
             bar_watchdog = nil
@@ -880,10 +866,6 @@ function Reading.open_url(url, book, opts)
     -- (showing it now when the download was too quick to have needed one) so the
     -- screen never sits idle between the box and the book.
     local function show_opening()
-        if bar_timer then
-            UIManager:unschedule(bar_timer)
-            bar_timer = nil
-        end
         if not bar and opts.resume ~= true then
             return
         end
@@ -942,7 +924,11 @@ function Reading.open_url(url, book, opts)
             Log.warn("reading", "open_chapter_missing", { html = state.html_path })
             close_bar()
             if not opts.retried then
-                Reading.open_url(url, book, { resume = opts.resume, retried = true })
+                Reading.open_url(url, book, {
+                    resume = opts.resume,
+                    retried = true,
+                    chapter_uid = opts.chapter_uid,
+                })
             else
                 show_error("打开章节失败")
             end
@@ -956,6 +942,9 @@ function Reading.open_url(url, book, opts)
             -- Turning back into the previous chapter shows its last page.
             resume = { percent = 100 }
         end
+        -- Keep this chapter (html + sidecar) so coming back to it needs no
+        -- fetch, parse or image rewriting; cleanup_reading() preserves it.
+        Reader.remember_chapter(url, state, true)
         show_opening()
         local opened, open_err = pcall(open_document, state.html_path, resume, state, {
             before_show = function()
@@ -1012,6 +1001,15 @@ function Reading.open_url(url, book, opts)
     end
 
     local prefetched = Reader.take_prefetched(url)
+    if not prefetched and opts.chapter_uid then
+        -- The same chapter can be requested under the book entry URL and under
+        -- its own chapter URL; the second index catches that spelling.
+        local cache_book = book or Reading.book or {}
+        local cache_book_id = cache_book.bookId
+            or (Reading.state and Reading.state.book_id)
+            or ""
+        prefetched = Reader.take_cached_chapter(cache_book_id, opts.chapter_uid)
+    end
     if prefetched then
         complete(prefetched)
         return true, "prefetched"
@@ -1019,7 +1017,7 @@ function Reading.open_url(url, book, opts)
 
     -- Same chapter already loading in background: adopt that job (no second fetch).
     if Reader.is_prefetching(url) then
-        show_bar_later()
+        show_bar()
         local adopted, job = Reader.adopt_prefetch(url, report, complete)
         if adopted then
             Reading._load_task = job
@@ -1038,7 +1036,7 @@ function Reading.open_url(url, book, opts)
         Reading.cancel_prefetch()
     end
 
-    show_bar_later()
+    show_bar()
     local called, state, status, err = pcall(Reader.load, url, book or Reading.book, report, complete, opts)
     if not called then
         close_bar()
@@ -1151,7 +1149,10 @@ function Reading.open_next()
         if Reading.state ~= from_state then
             return
         end
-        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            chapter_uid = from_state and from_state.next_param and from_state.next_param.uid,
+        })
         if ok then
             return
         end
@@ -1213,7 +1214,11 @@ function Reading.open_prev()
             return
         end
         -- Land on the last page: the reader is moving backwards into this chapter.
-        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false, at_end = true })
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            at_end = true,
+            chapter_uid = from_state and from_state.prev_param and from_state.prev_param.uid,
+        })
         if ok then
             return
         end
@@ -1422,7 +1427,10 @@ function Reading.open_toc_item(item)
         return
     end
     UIManager:nextTick(function()
-        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false })
+        local ok, status, err = Reading.open_url(url, Reading.book, {
+            resume = false,
+            chapter_uid = uid ~= "" and uid or nil,
+        })
         if ok then
             return
         end
@@ -1689,7 +1697,10 @@ local function install_close_hook()
             if preserve ~= "" and tostring(file or "") == preserve then
                 Log.dbg("reading", "close_preserve_html", { file = file })
             else
-                Reader.remove_chapter(file)
+                -- A chapter switch closes the old document too: forget_chapter()
+                -- keeps the file when the chapter cache still points at it, so
+                -- turning back into it does not rebuild the whole chapter.
+                Reader.forget_chapter(file)
             end
         end
         return result
