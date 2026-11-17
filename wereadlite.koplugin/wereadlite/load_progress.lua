@@ -11,6 +11,8 @@ local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
+local Log = require("wereadlite.log")
+
 local Screen = Device.screen
 
 local ok_socket, socket = pcall(require, "socket")
@@ -145,7 +147,7 @@ function LoadProgress:paint()
     UIManager:forceRePaint()
 end
 
-function LoadProgress:update(stage, done, total)
+function LoadProgress:update(stage, done, total, no_paint)
     if self._cancelled then
         return
     end
@@ -174,6 +176,10 @@ function LoadProgress:update(stage, done, total)
     self.title_widget:setText(spec.text)
     self.subtitle_widget:setText(subtitle)
     self.bar:setPercentage(percent)
+    if no_paint then
+        -- The caller already queued a refresh for these widgets (see open()).
+        return
+    end
     local now = clock()
     if order == previous_order and percent < 1
         and self._last_paint and now - self._last_paint < PAINT_INTERVAL then
@@ -189,12 +195,17 @@ function LoadProgress.open(opts)
     local widget = LoadProgress:new{
         on_cancel = opts.on_cancel,
     }
-    UIManager:show(widget, "ui")
+    -- The box is opaque and only its own area changes, so refresh that area
+    -- instead of the whole screen: the full-screen refresh is what made the box
+    -- flash once when it appeared over the shelf.  The stage is filled in
+    -- without a second refresh, because show() has already queued the paint.
+    UIManager:show(widget, "ui", widget.frame and widget.frame.dimen or widget.dimen)
     if opts.stage then
-        widget:update(opts.stage, 1, 1)
+        widget:update(opts.stage, 1, 1, true)
     else
-        widget:update("info", 0, 0)
+        widget:update("info", 0, 0, true)
     end
+    Log.info("load_progress", "open", { stage = opts.stage or "info" })
     return widget
 end
 
@@ -202,6 +213,7 @@ end
 -- about to be shown on top of the screen anyway, so a repaint here would only
 -- flash the old content for a moment.
 function LoadProgress:close(quiet)
+    Log.info("load_progress", "close", { quiet = quiet and true or false })
     if quiet then
         UIManager:close(self)
         return

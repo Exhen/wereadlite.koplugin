@@ -26,13 +26,30 @@ function Reader.warm_up()
     pcall(Codec.has_map)
 end
 
+local function file_readable(path)
+    local file = path and io.open(path, "rb")
+    if not file then
+        return false
+    end
+    file:close()
+    return true
+end
+
 function Reader.take_prefetched(url)
     url = tostring(url or "")
     local state = Reader._prefetched[url]
-    if state then
-        Reader._prefetched[url] = nil
-        Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
+    if not state then
+        return nil
     end
+    Reader._prefetched[url] = nil
+    -- cleanup_reading() keeps only the chapter on screen, so a prefetched chapter
+    -- from before a chapter switch may already be deleted; handing KOReader a
+    -- missing path makes it fail out of the open and tear the UI down.
+    if not file_readable(state.html_path) then
+        Log.warn("reader", "prefetch_ready_stale", { url = url, html = state.html_path })
+        return nil
+    end
+    Log.info("reader", "prefetch_ready_hit", { url = url, html = state.html_path })
     return state
 end
 
@@ -905,9 +922,15 @@ function Reader.prefetch_next(state, book)
     if not url then
         return
     end
-    if Reader._prefetched[url] then
-        Log.info("reader", "prefetch_already_cached", { url = url })
-        return
+    local cached = Reader._prefetched[url]
+    if cached then
+        if file_readable(cached.html_path) then
+            Log.info("reader", "prefetch_already_cached", { url = url })
+            return
+        end
+        -- The file was cleaned up after a chapter switch; prefetch it again.
+        Reader._prefetched[url] = nil
+        Log.warn("reader", "prefetch_cache_dropped", { url = url, html = cached.html_path })
     end
     local next_uid = state.next_param and tostring(state.next_param.uid or "") or ""
     if next_uid ~= "" then
@@ -1098,10 +1121,14 @@ local function wco_lower_bound(by_wco, start0)
 end
 
 -- Once underlines are injected the per-character <span wco="N"> wrappers are dead
--- weight: crengine builds a DOM node for each, which dominates open time and memory.
--- Bookmarks and heartbeat only read the text, so unwrap the leaf spans.  (Spans that
--- carry an underline link contain a tag and are left alone.)
-local WCO_LEAF_SPAN = '<span%s+wco%s*=%s*"%d+"%s*>([^<]*)</span>'
+-- weight: crengine builds a DOM node for each, which dominates open time and memory
+-- (one chapter had 7500 of them, 75% of the file).  Bookmarks and heartbeat only
+-- read the text, so unwrap the leaf spans.  WeRead writes extra attributes before
+-- wco (e.g. <span wid="0" wco="853" wl="1">), so match the whole tag and unwrap
+-- only the spans that really carry a wco; spans holding an underline link have a
+-- child tag and are left alone.
+local LEAF_SPAN = "<span(%s[^>]*)>([^<]*)</span>"
+local HAS_WCO = 'wco%s*=%s*"%d+"'
 
 local function strip_wco_spans(html)
     html = tostring(html or "")
@@ -1110,7 +1137,11 @@ local function strip_wco_spans(html)
         -- Cut right after a </span>, so a wrapper never straddles two chunks.
         local _, stop = html:find("</span>", pos + 16384, true)
         stop = stop or n
-        out[#out + 1] = html:sub(pos, stop):gsub(WCO_LEAF_SPAN, "%1")
+        out[#out + 1] = html:sub(pos, stop):gsub(LEAF_SPAN, function(attrs, text)
+            if attrs:find(HAS_WCO) then
+                return text
+            end
+        end)
         pos = stop + 1
         Slice.point()
     end

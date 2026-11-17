@@ -1,5 +1,6 @@
 local Config = require("wereadlite.config")
 local Log = require("wereadlite.log")
+local Paths = require("wereadlite.paths")
 local Settings = require("wereadlite.settings")
 local Slice = require("wereadlite.slice")
 local UIManager = require("ui/uimanager")
@@ -86,6 +87,46 @@ local function stem_for(cache_dir, url)
     return cache_dir .. "/" .. hex:sub(1, 12) .. "_" .. base
 end
 
+-- A chapter directory is wiped when the book is left, so an image downloaded
+-- for one chapter had to be fetched again on the next open.  Keep a copy under
+-- cache/images/: the file name carries a hash of the URL, so entries never
+-- collide.  A URL that answered "not found" is remembered too, because WeRead
+-- emits background-image rules for files that are simply absent from the CDN
+-- and each of those costs a round trip per chapter.
+local MISS_TTL = 7 * 24 * 3600
+local store_path_cache
+
+local function store_dir()
+    if not store_path_cache then
+        store_path_cache = Paths.cache_dir() .. "/images"
+        mkdir(store_path_cache)
+    end
+    return store_path_cache
+end
+
+local function base_name(stem)
+    return tostring(stem or ""):match("([^/]+)$") or stem
+end
+
+local function copy_file(from, to)
+    local src = io.open(from, "rb")
+    if not src then
+        return false
+    end
+    local body = src:read("*a")
+    src:close()
+    if not body then
+        return false
+    end
+    local dst = io.open(to, "wb")
+    if not dst then
+        return false
+    end
+    dst:write(body)
+    dst:close()
+    return true
+end
+
 local function cached_path(stem)
     for _, ext in ipairs(IMAGE_EXTS) do
         local path = stem .. "." .. ext
@@ -93,6 +134,43 @@ local function cached_path(stem)
             return path
         end
     end
+    local name = base_name(stem)
+    for _, ext in ipairs(IMAGE_EXTS) do
+        local stored = store_dir() .. "/" .. name .. "." .. ext
+        if valid_file(stored) then
+            -- Copy back so the chapter's relative "img/<name>" reference works.
+            local path = stem .. "." .. ext
+            if copy_file(stored, path) then
+                return path
+            end
+        end
+    end
+end
+
+local function recent_miss(stem)
+    local file = io.open(store_dir() .. "/" .. base_name(stem) .. ".miss", "r")
+    if not file then
+        return false
+    end
+    local stamp = tonumber(file:read("*l") or "")
+    file:close()
+    return stamp ~= nil and os.time() - stamp < MISS_TTL
+end
+
+local function mark_miss(stem)
+    local file = io.open(store_dir() .. "/" .. base_name(stem) .. ".miss", "w")
+    if not file then
+        return
+    end
+    file:write(tostring(os.time()))
+    file:close()
+end
+
+-- Only a definitive answer is worth remembering; a timeout or DNS hiccup must
+-- not keep an image away for a week.
+local function gone_for_good(res)
+    local code = tonumber(res and res.code) or 0
+    return code == 404 or code == 403 or code == 410
 end
 
 local function collect_urls(html)
@@ -157,6 +235,7 @@ local function save_image_body(stem, body)
         os.remove(tmp)
         return nil, "rename failed"
     end
+    copy_file(path, store_dir() .. "/" .. base_name(stem) .. "." .. ext)
     return path
 end
 
@@ -223,6 +302,10 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
         if path then
             html = apply_local(html, item, path)
             state.done = state.done + 1
+        elseif recent_miss(item.stem) then
+            -- Known 404: no request, the URL stays as it is in the document.
+            state.done = state.done + 1
+            Log.dbg("images", "skip_miss", { url = item.url })
         else
             pending[#pending + 1] = item
         end
@@ -235,7 +318,9 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
         return state
     end
 
-    local concurrency = math.min(2, math.max(1, tonumber(Settings.image_concurrency()) or 1))
+    -- Images are small and independent; the settings default (4) parses faster
+    -- than the old cap of 2 allowed.
+    local concurrency = math.min(4, math.max(1, tonumber(Settings.image_concurrency()) or 1))
     local pump
     local function complete_item(item, res)
         if state.cancelled or state.finished then
@@ -257,6 +342,9 @@ function Images.localize_async(html, book_dir, on_progress, on_done, opts)
                 url = item.url,
                 kind = item.kind,
             })
+            if gone_for_good(res) then
+                mark_miss(item.stem)
+            end
         end
         state.done = state.done + 1
         report()
@@ -761,7 +849,7 @@ function Images.localize(html, book_dir, on_progress, opts)
                 Log.warn("images", "apply_fail", { index = i, err = new_html })
             end
             done = done + 1
-        elseif fetch then
+        elseif fetch and not recent_miss(item.stem) then
             jobs[#jobs + 1] = item
         else
             fail_count = fail_count + 1

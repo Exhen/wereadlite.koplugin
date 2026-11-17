@@ -526,6 +526,35 @@ local function resume_before_first_paint(reader, resume, path, state)
     return jumped
 end
 
+-- KOReader fills the CRE options from the sidecar while ReaderUI is built, and
+-- on a fresh open the DocSettingsLoad handler runs after the reader already has
+-- its document: the chapter was laid out at the global size and then again at
+-- the saved one (a re-layout right after opening, which also costs time).
+-- Writing the sidecar before the reader exists makes the first layout use the
+-- saved size.
+function Reading.prime_reader_font_size(path)
+    local book_id = Reading.book_id_from_path(path)
+    if not book_id then
+        return false
+    end
+    local ok, size = pcall(Settings.reader_font_size, book_id)
+    if not ok or not size then
+        return false
+    end
+    local ok_ds, DocSettings = pcall(require, "docsettings")
+    if not ok_ds or type(DocSettings) ~= "table" or type(DocSettings.open) ~= "function" then
+        return false
+    end
+    local opened, doc_settings = pcall(DocSettings.open, DocSettings, path)
+    if not opened or not doc_settings then
+        return false
+    end
+    pcall(doc_settings.saveSetting, doc_settings, "copt_font_size", size)
+    pcall(doc_settings.flush, doc_settings)
+    Log.dbg("reading", "font_size_prime", { book_id = book_id, size = size })
+    return true
+end
+
 -- hooks.before_show runs while the new reader is being built, before KOReader
 -- puts it on screen.
 local function open_document(path, resume, state, hooks)
@@ -533,6 +562,7 @@ local function open_document(path, resume, state, hooks)
     -- These HTML files are regenerated from the remote chapter. A previous
     -- KOReader sidecar must not override the position selected below.
     Reader.clear_sidecars(path)
+    Reading.prime_reader_font_size(path)
     -- switchDocument closes the current doc first; our onClose hook must not
     -- delete the target file when reopening/replacing a WeRead chapter.
     Reading._preserve_html = path
@@ -640,6 +670,15 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
         return jumped
     end
     return false
+end
+
+local function chapter_file_ok(path)
+    local file = path and io.open(path, "rb")
+    if not file then
+        return false
+    end
+    file:close()
+    return true
 end
 
 function Reading.open_url(url, book, opts)
@@ -783,6 +822,20 @@ function Reading.open_url(url, book, opts)
         -- metadata must be activated only when its chapter is actually shown.
         Reader.review_data = state.review_data or {}
         Reader.review_marks = state.review_marks or {}
+        if not chapter_file_ok(state.html_path) then
+            -- A chapter that was prefetched earlier can be deleted by a later
+            -- open (only the chapter on screen is kept).  Fetch it again rather
+            -- than handing KOReader a missing path, which aborts the open and
+            -- tears the UI down.
+            Log.warn("reading", "open_chapter_missing", { html = state.html_path })
+            close_bar()
+            if not opts.retried then
+                Reading.open_url(url, book, { resume = opts.resume, retried = true })
+            else
+                show_error("打开章节失败")
+            end
+            return
+        end
         local resume
         if opts.resume == true then
             resume = { percent = state.resume_percent, anchor = state.resume_anchor }
