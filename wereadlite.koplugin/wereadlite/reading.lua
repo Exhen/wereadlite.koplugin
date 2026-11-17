@@ -661,7 +661,7 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
             end
         end
     end
-    if percent > 0 and percent < 100 then
+    if percent > 0 and percent <= 100 then
         Log.dbg("reading", "resume_percent", { percent = percent })
         local Event = require("ui/event")
         local jumped = pcall(function()
@@ -839,6 +839,9 @@ function Reading.open_url(url, book, opts)
         local resume
         if opts.resume == true then
             resume = { percent = state.resume_percent, anchor = state.resume_anchor }
+        elseif opts.at_end then
+            -- Turning back into the previous chapter shows its last page.
+            resume = { percent = 100 }
         end
         show_opening()
         local opened, open_err = pcall(open_document, state.html_path, resume, state, {
@@ -1043,6 +1046,70 @@ function Reading.open_next()
     return true
 end
 
+-- Turning past the last page (or back from the first one) makes KOReader re-draw
+-- the very same page (page-update footer/view refresh).  We are about to replace
+-- the document, so drop that queued repaint instead of letting the old page flash
+-- once before the new chapter shows.
+local function discard_pending_paint()
+    pcall(function()
+        UIManager._refresh_stack = {}
+        UIManager._refresh_func_stack = {}
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        local ui = ok and ReaderUI and ReaderUI.instance
+        if ui and UIManager._dirty then
+            UIManager._dirty[ui.dialog or ui] = nil
+        end
+    end)
+end
+
+-- Turning back from the first page of a chapter.  A long chapter is loaded as a
+-- window of sections; inside a later window the previous data is simply not on
+-- disk, so stay put instead of jumping over a whole chapter.
+function Reading.open_prev()
+    local state = Reading.state
+    if state and (tonumber(state.section_start) or 0) > 0 then
+        Log.info("reading", "prev_section_window", {
+            section_start = state.section_start,
+            uid = current_uid(),
+        })
+        return false
+    end
+    local url = Reader.prev_url(state)
+    if not url then
+        Log.info("reading", "prev_missing", {
+            book_id = state and state.book_id,
+            uid = current_uid(),
+            chapters = #(Reading.chapters or {}),
+        })
+        show_error("已经是第一章")
+        return false
+    end
+    discard_pending_paint()
+    local from_state = state
+    UIManager:nextTick(function()
+        -- A repeated page-turn at the chapter start must not skip a chapter.
+        if Reading.state ~= from_state then
+            return
+        end
+        -- Land on the last page: the reader is moving backwards into this chapter.
+        local ok, status, err = Reading.open_url(url, Reading.book, { resume = false, at_end = true })
+        if ok then
+            return
+        end
+        Log.warn("reading", "prev_chapter", { status = status, err = err })
+        if status == "auth_expired" then
+            show_error("登录已过期，请重新登录")
+        elseif status == "need_pay" then
+            show_error("上一章需要购买")
+        elseif status == "offline" then
+            show_error("网络不可用")
+        else
+            show_error("打开上一章失败")
+        end
+    end)
+    return true
+end
+
 function Reading.show_wechat_shelf()
     if Reading._returning then
         return
@@ -1156,21 +1223,6 @@ function Reading.return_to_shelf()
             end)
         end
         Reading.show_wechat_shelf()
-    end)
-end
-
--- Turning past the last page makes KOReader re-draw the very same page (page-update
--- footer/view refresh).  We are about to replace the document, so drop that queued
--- repaint instead of letting the old page flash once before the next chapter shows.
-local function discard_pending_paint()
-    pcall(function()
-        UIManager._refresh_stack = {}
-        UIManager._refresh_func_stack = {}
-        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
-        local ui = ok and ReaderUI and ReaderUI.instance
-        if ui and UIManager._dirty then
-            UIManager._dirty[ui.dialog or ui] = nil
-        end
     end)
 end
 
@@ -1419,6 +1471,76 @@ local function install_end_of_book_hook()
         end
     end
     Log.dbg("reading", "hook", { name = "end_of_book" })
+end
+
+-- KOReader reports "reached the end of the document" (EndOfBook) but has no
+-- counterpart for the first page, so catch the backward turn here.
+local function install_page_back_hook()
+    local ok, ReaderPaging = pcall(require, "apps/reader/modules/readerpaging")
+    if not ok or not ReaderPaging or ReaderPaging._wereadlite_back_hooked then
+        return
+    end
+    ReaderPaging._wereadlite_back_hooked = true
+    local original = ReaderPaging.onGotoPageRel
+    function ReaderPaging:onGotoPageRel(diff, no_page_turn)
+        if not no_page_turn and diff < 0
+            and Reading.is_ours(self.document and self.document.file)
+        then
+            if self.current_page == 1 then
+                Log.info("reading", "back_at_start", {
+                    mode = "paging",
+                    page = self.current_page,
+                    zoom = tostring(self.zoom_mode),
+                    scroll = self.view and self.view.page_scroll and true or false,
+                })
+                if self.zoom_mode ~= "free" and not Reading._load_task and Reading.open_prev() then
+                    return true
+                end
+            end
+        end
+        if original then
+            return original(self, diff, no_page_turn)
+        end
+    end
+    Log.info("reading", "hook", { name = "page_back" })
+end
+
+-- Scroll mode (and paged mode inside ReaderRolling) keeps its own position, so
+-- the first-page check above never sees it; hook the same turn there.
+local function install_rolling_back_hook()
+    local ok, ReaderRolling = pcall(require, "apps/reader/modules/readerrolling")
+    if not ok or not ReaderRolling or ReaderRolling._wereadlite_back_hooked then
+        return
+    end
+    ReaderRolling._wereadlite_back_hooked = true
+    local original = ReaderRolling.onGotoViewRel
+    function ReaderRolling:onGotoViewRel(diff)
+        if type(diff) == "number" and diff < 0
+            and Reading.is_ours(self.ui and self.ui.document and self.ui.document.file)
+        then
+            local scrolling = self.view and self.view.view_mode == "scroll"
+            local at_start
+            if scrolling then
+                at_start = (tonumber(self.current_pos) or 0) <= 0
+            else
+                at_start = self.current_page == 1
+            end
+            if at_start then
+                Log.info("reading", "back_at_start", {
+                    mode = scrolling and "scroll" or "rolling_page",
+                    pos = self.current_pos,
+                    page = self.current_page,
+                })
+                if not Reading._load_task and Reading.open_prev() then
+                    return true
+                end
+            end
+        end
+        if original then
+            return original(self, diff)
+        end
+    end
+    Log.info("reading", "hook", { name = "rolling_back" })
 end
 
 local function install_close_hook()
@@ -1783,6 +1905,8 @@ end
 function Reading.install_hook()
     install_history_filter()
     install_end_of_book_hook()
+    install_page_back_hook()
+    install_rolling_back_hook()
     install_close_hook()
     install_exit_hook()
     install_toc_hook()

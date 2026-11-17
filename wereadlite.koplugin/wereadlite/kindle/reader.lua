@@ -681,6 +681,36 @@ function Reader.next_url(state)
     end
 end
 
+-- Mirror of next_url for turning backwards: the chapter before this one.
+function Reader.prev_url(state)
+    if not state then
+        return nil
+    end
+    local param = state.prev_param and state.prev_param.param
+    if is_bc(param) then
+        return Reader.url_for(param)
+    end
+    local uid = state.prev_param and tostring(state.prev_param.uid or "")
+    if uid ~= "" and is_bc(state.params and state.params[uid]) then
+        return Reader.url_for(state.params[uid])
+    end
+    local cur_idx = state.cur and tonumber(state.cur.idx)
+    if cur_idx then
+        -- The chapter list is not guaranteed to be ordered, so take the highest
+        -- index below the current one.
+        local best_idx, best_param
+        for _, chapter in ipairs(state.chapters or {}) do
+            local idx = tonumber(chapter.idx) or 0
+            if idx < cur_idx and is_bc(chapter.param) and (not best_idx or idx > best_idx) then
+                best_idx, best_param = idx, chapter.param
+            end
+        end
+        if best_param then
+            return Reader.url_for(best_param)
+        end
+    end
+end
+
 function Reader.is_last(state)
     if not state then
         return true
