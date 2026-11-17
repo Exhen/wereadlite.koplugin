@@ -61,33 +61,130 @@ local function prefetch_key(url)
     return string.format("%08x", h)
 end
 
-local function prefetch_path(url)
-    local dir = Paths.cache_dir() .. "/chapter_prefetch"
-    Paths.ensure(dir)
-    return dir .. "/" .. prefetch_key(url) .. ".html"
+local function lfs_mod()
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok then
+        return lfs
+    end
 end
 
-local function read_prefetch(url)
-    local path = prefetch_path(url)
+-- A chapter page is ~350KB and does not change once published, so keep what was
+-- downloaded for a week: jumping back to a chapter, or reopening the book, then
+-- costs no network at all (the render pipeline still runs, but the fetch is
+-- free).  The file name is a hash of the URL, and the URL carries the book code,
+-- so entries cannot collide across books.  A section of a long chapter has its
+-- own URL and its own entry.
+local PAGE_TTL = 7 * 24 * 3600
+local PAGE_CACHE_MAX = 30 * 1024 * 1024
+local PRUNE_INTERVAL = 3600
+local last_prune = 0
+
+local function page_cache_dir()
+    local dir = Paths.cache_dir() .. "/pages"
+    Paths.ensure(dir)
+    return dir
+end
+
+local function page_cache_path(url)
+    return page_cache_dir() .. "/" .. prefetch_key(url) .. ".html"
+end
+
+local function file_age(path)
+    local lfs = lfs_mod()
+    local mtime = lfs and lfs.attributes(path, "modification")
+    if not mtime then
+        return nil
+    end
+    return os.time() - mtime
+end
+
+-- Drop expired entries, then the oldest ones until the cache fits its budget.
+local function prune_page_cache()
+    local now = os.time()
+    if now - last_prune < PRUNE_INTERVAL then
+        return
+    end
+    last_prune = now
+    local lfs = lfs_mod()
+    if not lfs then
+        return
+    end
+    local dir = page_cache_dir()
+    local entries, total = {}, 0
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+            local path = dir .. "/" .. name
+            local mtime = lfs.attributes(path, "modification")
+            if mtime then
+                if now - mtime > PAGE_TTL then
+                    os.remove(path)
+                else
+                    local size = lfs.attributes(path, "size") or 0
+                    entries[#entries + 1] = { path = path, mtime = mtime, size = size }
+                    total = total + size
+                end
+            end
+        end
+    end
+    if total <= PAGE_CACHE_MAX then
+        return
+    end
+    table.sort(entries, function(a, b) return a.mtime < b.mtime end)
+    for _, entry in ipairs(entries) do
+        if total <= PAGE_CACHE_MAX then
+            break
+        end
+        os.remove(entry.path)
+        total = total - entry.size
+    end
+    Log.info("reader", "page_cache_pruned", { left_bytes = total })
+end
+
+local function read_page_cache(url)
+    local path = page_cache_path(url)
+    local age = file_age(path)
+    if not age then
+        return nil
+    end
+    if age > PAGE_TTL then
+        os.remove(path)
+        Log.info("reader", "page_cache_expired", { url = url, age = age })
+        return nil
+    end
     local file = io.open(path, "rb")
-    if not file then return nil end
+    if not file then
+        return nil
+    end
     local body = file:read("*a")
     file:close()
-    if body and #body > 0 then
+    if not body or body == "" then
         os.remove(path)
-        Log.info("reader", "prefetch_hit", { url = url, bytes = #body })
-        return body
+        return nil
     end
-    os.remove(path)
+    Log.info("reader", "page_cache_hit", { url = url, bytes = #body, age = age })
+    return body
 end
 
-local function has_prefetch(url)
-    local file = io.open(prefetch_path(url), "rb")
-    if not file then return false end
-    local size = file:seek("end") or 0
+local function write_page_cache(url, body)
+    if type(body) ~= "string" or #body == 0 then
+        return
+    end
+    local path = page_cache_path(url)
+    local tmp = path .. ".tmp"
+    local file = io.open(tmp, "wb")
+    if not file then
+        return
+    end
+    file:write(body)
     file:close()
-    return size > 0
+    os.remove(path)
+    if not os.rename(tmp, path) then
+        os.remove(tmp)
+        return
+    end
+    prune_page_cache()
 end
+
 Reader.review_data = {}
 Reader.review_marks = {}
 
@@ -153,13 +250,6 @@ function Reader.url_for(param, extra)
         url = url .. "&prev=1"
     end
     return url
-end
-
-local function lfs_mod()
-    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-    if ok then
-        return lfs
-    end
 end
 
 local function remove_tree(path)
@@ -859,7 +949,7 @@ function Reader.expand_catalog(state, on_done)
 end
 
 function Reader.fetch(url)
-    local cached = read_prefetch(url)
+    local cached = read_page_cache(url)
     if cached then return cached end
     Log.dbg("reader", "fetch", { url = url })
     local body, status, err = Client.request({
@@ -880,6 +970,7 @@ function Reader.fetch(url)
         Log.warn("reader", "fetch_login_page", { url = url, bytes = #body })
         return nil, "auth_expired"
     end
+    write_page_cache(url, body)
     Log.dbg("reader", "fetch_ok", { url = url, bytes = #body })
     return body
 end
@@ -1395,7 +1486,7 @@ local function fetch_async(url, job, callback)
     if job and job.cancelled then
         return
     end
-    local cached = read_prefetch(url)
+    local cached = read_page_cache(url)
     if cached then
         UIManager:nextTick(function()
             if not job or not job.cancelled then
@@ -1433,6 +1524,9 @@ local function fetch_async(url, job, callback)
                 return
             end
             local body, status, err = validate_fetch_body(res.body)
+            if body then
+                write_page_cache(url, body)
+            end
             callback(body, status, err)
         end)
     end)

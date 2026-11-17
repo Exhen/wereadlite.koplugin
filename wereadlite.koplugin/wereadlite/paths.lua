@@ -100,10 +100,15 @@ function Paths.reading_dir()
     return dir
 end
 
+-- Only the transient request directories are cleared here.  Downloaded images
+-- (cache/images) and chapter pages (cache/pages) are meant to survive a restart;
+-- they prune themselves by age and size.
 function Paths.purge_cache()
     local cache = Paths.root() .. "/cache"
     local data = Paths.root() .. "/data"
-    Paths.remove_tree(cache)
+    for _, dir in ipairs({ "http", "login", "chapter_prefetch" }) do
+        Paths.remove_tree(cache .. "/" .. dir)
+    end
     Paths.remove_tree(data .. "/http")
     Paths.remove_tree(data .. "/login")
     Paths.ensure(Paths.cache_dir())

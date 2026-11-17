@@ -147,6 +147,49 @@ local function cached_path(stem)
     end
 end
 
+-- The store survives restarts, so keep its growth in check: once an hour, drop
+-- the oldest entries until it fits the budget.
+local STORE_MAX = 40 * 1024 * 1024
+local PRUNE_INTERVAL = 3600
+local last_prune = 0
+
+local function prune_store()
+    local now = os.time()
+    if now - last_prune < PRUNE_INTERVAL then
+        return
+    end
+    last_prune = now
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok or not lfs then
+        return
+    end
+    local dir = store_dir()
+    local entries, total = {}, 0
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+            local path = dir .. "/" .. name
+            local mtime = lfs.attributes(path, "modification")
+            local size = lfs.attributes(path, "size") or 0
+            if mtime then
+                entries[#entries + 1] = { path = path, mtime = mtime, size = size }
+                total = total + size
+            end
+        end
+    end
+    if total <= STORE_MAX then
+        return
+    end
+    table.sort(entries, function(a, b) return a.mtime < b.mtime end)
+    for _, entry in ipairs(entries) do
+        if total <= STORE_MAX then
+            break
+        end
+        os.remove(entry.path)
+        total = total - entry.size
+    end
+    Log.info("images", "store_pruned", { left_bytes = total })
+end
+
 local function recent_miss(stem)
     local file = io.open(store_dir() .. "/" .. base_name(stem) .. ".miss", "r")
     if not file then
@@ -236,6 +279,7 @@ local function save_image_body(stem, body)
         return nil, "rename failed"
     end
     copy_file(path, store_dir() .. "/" .. base_name(stem) .. "." .. ext)
+    prune_store()
     return path
 end
 
