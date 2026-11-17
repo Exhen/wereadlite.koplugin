@@ -170,6 +170,65 @@ local function merge_chapters(state)
     state.chapters = list
 end
 
+-- The chapter a chapter file belongs to ("<uid>_<start>-<end>.html").  Taken
+-- from the file rather than Reading.state: while a chapter switch is opening,
+-- the state already describes the new chapter but the document on screen is
+-- still the old one.
+local function uid_from_html_path(path)
+    return tostring(path or ""):match("/([^/_]+)_%d+%-%d+%.html$")
+end
+
+-- Remember the exact page on screen.  WeRead's own progress only catches up when
+-- the reading progress syncs, so a couple of page turns are otherwise lost when
+-- the book is closed and reopened.
+function Reading.save_reader_position(ui)
+    if not ui then
+        local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+        ui = ok and ReaderUI and ReaderUI.instance
+    end
+    local document = ui and ui.document
+    local file = document and document.file
+    local book_id = file and Reading.book_id_from_path(file)
+    local uid = uid_from_html_path(file)
+    if not book_id or not uid then
+        return false
+    end
+    -- CreDocument:getXPointer() reports the page actually on screen; the rolling
+    -- widget's record is the fallback.
+    local xpointer
+    if type(document.getXPointer) == "function" then
+        pcall(function()
+            xpointer = document:getXPointer()
+        end)
+    end
+    if (not xpointer or xpointer == "") and ui.rolling
+        and type(ui.rolling.getLastProgress) == "function" then
+        pcall(function()
+            xpointer = ui.rolling:getLastProgress()
+        end)
+    end
+    if not xpointer or xpointer == "" then
+        return false
+    end
+    return Settings.set_reader_position(book_id, uid, xpointer)
+end
+
+-- The saved page is only meaningful for the chapter it was taken from.
+local function saved_resume(state)
+    if not state then
+        return nil
+    end
+    local ok, saved = pcall(Settings.reader_position, state.book_id)
+    if not ok or not saved then
+        return nil
+    end
+    local uid = state.cur and tostring(state.cur.uid or "") or ""
+    if uid == "" or saved.uid ~= uid then
+        return nil
+    end
+    return { xpointer = saved.xpointer }
+end
+
 local function current_uid()
     local state = Reading.state
     if not state then
@@ -477,7 +536,8 @@ local RESUME_DELAYS = { 0.35, 0.9, 1.6 }
 local function has_resume_target(resume)
     return type(resume) == "table"
         and ((tonumber(resume.percent) or 0) > 0
-            or (resume.anchor ~= nil and resume.anchor ~= ""))
+            or (resume.anchor ~= nil and resume.anchor ~= "")
+            or (type(resume.xpointer) == "string" and resume.xpointer ~= ""))
 end
 
 -- Fallback when the jump could not be made while the reader was opening.
@@ -638,6 +698,38 @@ function Reading.goto_resume(resume, expected_path, expected_state, ui_override)
             current = current_path,
         })
         return false
+    end
+    local xpointer = type(resume.xpointer) == "string" and resume.xpointer or ""
+    if xpointer ~= "" and ui.document then
+        local valid = false
+        if type(ui.document.isXPointerInDocument) == "function" then
+            pcall(function()
+                valid = ui.document:isXPointerInDocument(xpointer)
+            end)
+        end
+        if valid then
+            -- Our books are reflowable, so the rolling widget owns pagination in
+            -- both modes and is the one that knows how to land on an xpointer.
+            local jumped = false
+            if ui.rolling and type(ui.rolling.onGotoXPointer) == "function" then
+                jumped = pcall(function()
+                    ui.rolling:onGotoXPointer(xpointer)
+                end)
+            else
+                local Event = require("ui/event")
+                jumped = pcall(function()
+                    ui:handleEvent(Event:new("GotoXPointer", xpointer))
+                end)
+            end
+            if jumped then
+                Log.dbg("reading", "resume_xpointer")
+                return true
+            end
+        else
+            -- The chapter markup changed (another plugin version, a different
+            -- section window): fall back to the percentages below.
+            Log.info("reading", "resume_xpointer_stale")
+        end
     end
     local percent = tonumber(resume.percent) or 0
     local anchor = resume.anchor
@@ -838,7 +930,8 @@ function Reading.open_url(url, book, opts)
         end
         local resume
         if opts.resume == true then
-            resume = { percent = state.resume_percent, anchor = state.resume_anchor }
+            resume = saved_resume(state)
+                or { percent = state.resume_percent, anchor = state.resume_anchor }
         elseif opts.at_end then
             -- Turning back into the previous chapter shows its last page.
             resume = { percent = 100 }
@@ -1554,6 +1647,7 @@ local function install_close_hook()
         local file = self.document and self.document.file
         local ours = Reading.is_ours(file)
         if ours then
+            Reading.save_reader_position(self)
             Reading.save_reader_font_size_if_changed(self)
             Heartbeat.stop(false)
         end
@@ -1571,6 +1665,17 @@ local function install_close_hook()
             end
         end
         return result
+    end
+    -- Suspend and explicit "save settings" flushes go through this, and the
+    -- document is still alive: keep the page for a resume after a power-off.
+    local original_flush = ReaderUI.onFlushSettings
+    function ReaderUI:onFlushSettings(show_notification)
+        if self.document and Reading.is_ours(self.document.file) then
+            Reading.save_reader_position(self)
+        end
+        if original_flush then
+            return original_flush(self, show_notification)
+        end
     end
     Log.dbg("reading", "hook", { name = "reader_close" })
 end

@@ -1022,6 +1022,47 @@ function Settings.set_reader_font_size(book_id, value)
     return value
 end
 
+-- Where the reader stood inside a chapter is only known locally: the chapter page
+-- WeRead returns carries its own `chapterOffset`, which only catches up when the
+-- reading progress syncs, so a couple of page turns are lost when reopening a
+-- book.  Keep the CRE xpointer of the last page shown, per book.
+function Settings.reader_position(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        return nil
+    end
+    local data = Settings.load()
+    local positions = data:readSetting("reader_positions")
+    local entry = type(positions) == "table" and positions[book_id] or nil
+    if type(entry) ~= "table" or type(entry.xpointer) ~= "string" or entry.xpointer == "" then
+        return nil
+    end
+    return { uid = tostring(entry.uid or ""), xpointer = entry.xpointer }
+end
+
+function Settings.set_reader_position(book_id, uid, xpointer)
+    book_id = tostring(book_id or "")
+    uid = tostring(uid or "")
+    xpointer = tostring(xpointer or "")
+    if book_id == "" or xpointer == "" then
+        return false
+    end
+    local data = Settings.load()
+    local positions = data:readSetting("reader_positions")
+    if type(positions) ~= "table" then
+        positions = {}
+    end
+    local previous = positions[book_id]
+    if type(previous) == "table" and previous.uid == uid and previous.xpointer == xpointer then
+        return false
+    end
+    positions[book_id] = { uid = uid, xpointer = xpointer }
+    data:saveSetting("reader_positions", positions)
+    data:flush()
+    Log.dbg("settings", "reader_position", { book_id = book_id, uid = uid })
+    return true
+end
+
 -- kind: "meta" | "body" | "title"
 function Settings.grid_face(kind)
     local Font = require("ui/font")
