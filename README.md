@@ -18,6 +18,8 @@
 * 查看其他用户的划线和想法（使用微信读书官方SKILL）
 * 可与其他三方桌面/美化/插件等共存（如遇兼容性问题请在issue区提供crash.log）
 
+> 插件内实现的微信读书 SKILL 接口跟随官方 [Tencent/WeChatReading](https://github.com/Tencent/WeChatReading) 的 `SKILL.md` 版本（当前 v1.0.5）。
+
 ## 温馨提示
 
 安卓版Koreader不支持使用，后续也不会维护安卓版，理由是安卓版可以安装官方微信读书apk，不需要使用koreader微信读书这种脱裤子穿麻袋放屁的方式。

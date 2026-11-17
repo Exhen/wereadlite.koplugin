@@ -157,9 +157,10 @@ local function key_from(data)
     end
 end
 
-local function reader_url_from_deep_link(deep_link)
-    deep_link = tostring(deep_link or "")
-    local bc = deep_link:match("[?&]v=([%w_%-]+)")
+-- Both the reader link and the detail link carry the book code, as "v=" or "bc=".
+local function reader_url_from_link(link)
+    link = tostring(link or "")
+    local bc = link:match("[?&]v=([%w_%-]+)") or link:match("[?&]bc=([^&]+)")
     if bc and bc ~= "" then
         return Config.READER_URL .. "?bc=" .. bc
     end
@@ -289,6 +290,37 @@ local function unwrap_payload(data)
     return data
 end
 
+-- The gateway asks every caller to upgrade when the skill version it reports is
+-- older than the published SKILL.md (https://github.com/Tencent/WeChatReading).
+-- Keep the info for the UI and log it once per session: it is attached to every
+-- response, so logging each call would bury the rest of the log.
+local upgrade_logged = false
+
+local function note_upgrade_info(data, payload)
+    local info = type(data) == "table" and data.upgrade_info
+    if type(info) ~= "table" then
+        return payload
+    end
+    payload.upgrade_info = info
+    if not upgrade_logged then
+        upgrade_logged = true
+        local fields = {}
+        for key in pairs(info) do
+            if type(key) == "string" then
+                fields[#fields + 1] = key
+            end
+        end
+        table.sort(fields)
+        Log.warn("skill", "upgrade_needed", {
+            version = tostring(info.version or info.latest_version or ""),
+            url = tostring(info.upgrade_url or info.url or ""),
+            fields = table.concat(fields, ","),
+            message = tostring(info.message or ""),
+        })
+    end
+    return payload
+end
+
 function Skill.call(api_name, params, retried)
     local key, status, err = Skill.ensure_key(retried)
     if not key then
@@ -348,14 +380,7 @@ function Skill.call(api_name, params, retried)
     if gw_status then
         return nil, gw_status, gw_err
     end
-    local payload = unwrap_payload(data)
-    if type(data.upgrade_info) == "table" then
-        payload.upgrade_info = data.upgrade_info
-        Log.warn("skill", "upgrade", {
-            message = tostring(data.upgrade_info.message or ""),
-        })
-    end
-    return payload
+    return note_upgrade_info(data, unwrap_payload(data))
 end
 
 function Skill.call_async(api_name, params, callback, retried)
@@ -428,14 +453,7 @@ function Skill.call_async(api_name, params, callback, retried)
                 callback(nil, gw_status, gw_err)
                 return
             end
-            local payload = unwrap_payload(data)
-            if type(data.upgrade_info) == "table" then
-                payload.upgrade_info = data.upgrade_info
-                Log.warn("skill", "upgrade", {
-                    message = tostring(data.upgrade_info.message or ""),
-                })
-            end
-            callback(payload, "ok")
+            callback(note_upgrade_info(data, unwrap_payload(data)), "ok")
         end)
     end, retried)
 end
@@ -456,6 +474,9 @@ local function add_book(books, seen, item)
         return
     end
     seen[key] = true
+    -- skill 1.0.5 splits the links: readerLink opens the reader, deepLink the
+    -- book detail page. Prefer the former and fall back to the old field.
+    local reader_link = tostring(info.readerLink or info.readerlink or item.readerLink or "")
     local deep_link = tostring(info.deepLink or info.deeplink or "")
     books[#books + 1] = {
         bookId = book_id,
@@ -466,7 +487,7 @@ local function add_book(books, seen, item)
         category = tostring(info.category or ""),
         publisher = tostring(info.publisher or ""),
         deepLink = deep_link,
-        reader_url = reader_url_from_deep_link(deep_link),
+        reader_url = reader_url_from_link(reader_link) or reader_url_from_link(deep_link),
         soldout = tonumber(info.soldout or item.soldout) or 0,
         rating = tonumber(item.newRating or info.newRating) or 0,
         rating_count = tonumber(item.newRatingCount or info.newRatingCount) or 0,
